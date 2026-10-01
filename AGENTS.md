@@ -1,18 +1,13 @@
-# 项目开发约定
+# 开发约定
 
-- 使用 Git 管理项目，采用 `master` / `develop` / `feat/*` 分支模型。`master` 保存稳定版本，`develop` 集成开发改动。
-- 仅在需要隔离独立功能、复杂修复或并行开发时创建 `feat/<主题>`；日常文档、开发约定和小型维护直接在 `develop` 提交。按切片提交不意味着每个提交都要新建分支。
-- `feat/*` 验证后合入 `develop`，及时清理已合入的临时分支，保留提交和合并历史。
-- 按可独立审查的切片提交；每次提交只包含对应切片已完成并验证的改动。不要将多个无关切片混成一次提交。
-- 持续推进开发时，根据任务类型和难度调用 subagents，并自行选择模型和推理力度。独立检查可以并行；涉及同一段代码的修改按依赖顺序执行。
-- 文档、定位和小改动优先使用 GPT-6.1 Sol 的低或中等推理力度；复杂对账、恢复流程和数据一致性问题使用高推理力度，必要时使用 GPT-6 Astra。实现后由独立 subagent 审查关键改动。
+- `master` 保存稳定版本，日常开发在 `develop`。需要隔离功能、复杂修复或并行开发时使用 `feat/*`，优先快进合并，完成后删除临时分支。
+- 按独立切片提交，提交前完成相关验证。文档保留必要操作与结论，不提交生成日志，避免重复解释和警告。
+- 根据任务类型、难度调用 subagents 并选择模型与推理力度：文档/小改动使用 GPT-6.1 Sol 低或中等力度；复杂对账/恢复使用高力度，必要时使用 GPT-6 Astra。关键实现由独立 subagent 审查。
 
-# 开发与验证
+# 项目与验证
 
-- 项目是 Python 3.12+ 本地 CLI，入口为 `hg`，主程序为 `health_garmin.py`，完整历史替换逻辑在 `replace_history.py`。
-- 离线回归：`.venv/bin/python -m unittest discover -s tests -v`。无虚拟环境时可使用满足版本要求的 Python 运行离线测试。
-- Shell 语法检查：`bash -n setup.sh hg`。提交前运行 `git diff --check`。
-- 用临时目录和模拟 Garmin API 验证行为。日常开发不修改真实 `config.json`、`state/` 或 iCloud 导出，也不执行真实上传、删除、历史替换或后台任务注册；设备验收与线上操作需要用户明确指定。
-- 保持 `config.json`、`state/`、`.venv/` 和凭据不受 Git 跟踪。
-- 未确定的请求不能自动重发；判断缺失前必须取得完整称重明细。瘦体重仅本地保存，不映射为 Garmin 肌肉量。
-- 文档应区分当前离线验证与历史设备验收，不把模拟测试写成真实账号验证。
+- Python 3.12+；入口 `hg`，主程序 `health_garmin.py`，历史替换 `replace_history.py`。
+- 回归：`.venv/bin/python -m unittest discover -s tests -v`；Shell：`bash -n setup.sh hg`；提交检查：`git diff --check`。
+- 开发测试使用临时目录和模拟 API。真实 Garmin 操作、源数据修改与后台任务注册按用户明确需求执行。
+- `config.json`、`state/`、`.venv/`、凭据不进入 Git。未确定请求不自动重发，判断缺失使用完整称重明细，瘦体重仅本地保留。
+- 验证记录区分离线测试与设备验收。
