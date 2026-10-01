@@ -274,6 +274,7 @@ tail -n 80 state/agent.err.log
 | 显式命令返回 2、提示未执行 | run.lock 被占用，等进程结束；定时 run 遇锁跳过并返回 0 |
 | 定时任务卸载失败 | 运行 doctor 核对服务；未确认卸载时保留任务文件，配置损坏时也可运行 uninstall-agent |
 | 401/403/验证码失败 | 检查中国区账号、网络，重新 login，避免连续快速重试 |
+| 令牌续期保存失败 | 核对 state/tokens 权限和磁盘，恢复后重新 login |
 | 429 | 暂停重试，稍后查询 |
 | 上传超时 | 查询 uncertain，核对后 resolve |
 | 手动成功、定时失败 | 检查用户登录、解释器、iCloud 下载和权限，查看 agent.err.log |
