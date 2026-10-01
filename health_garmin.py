@@ -1050,6 +1050,13 @@ def load_local_comparison(cfg: dict[str, Any], records: list[Measurement], api: 
         bmi_changed = previous is not None and r.bmi is not None and json.loads(previous["payload"]).get("bmi") != r.bmi
         if first or r.at.date() >= recent or previous is None or previous["status"] not in ("verified", "verified_manual", "ignored") or previous["core"] != r.core or bmi_changed:
             selected.append(r)
+        elif r.lbm is not None:
+            payload = json.loads(previous["payload"])
+            if payload.get("lbm") != r.lbm:
+                # LBM is local-only; preserve the existing verification evidence.
+                payload["lbm"] = r.lbm
+                db.execute("UPDATE uploads SET payload=? WHERE record_id=?",
+                           (json.dumps(payload, ensure_ascii=False), r.key))
     if not selected:
         return {"entries": [], "counts": {}, "extra_remote": []}
     start, end = min(r.at.date() for r in selected), max(r.at.date() for r in selected)

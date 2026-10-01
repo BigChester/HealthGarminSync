@@ -181,6 +181,64 @@ class ReconciliationTests(unittest.TestCase):
         summary = json.loads((self.state / 'last_run.json').read_text())
         self.assertEqual(summary['results'][self.r.key], 'repair')
 
+    def test_old_completed_record_retains_late_lbm_without_changing_verification(self):
+        original = h.Measurement(AT, 70, 23.5, 'PICOOC', 22)
+        h.write_json(self.state / 'last_sync_comparison.json', {})
+        for status in ('verified', 'verified_manual', 'ignored'):
+            with self.subTest(status=status):
+                h.set_status(self.db, original, status, 'previous decision')
+                before = dict(h.state_row(self.db, original))
+                payload = json.loads(before['payload'])
+                for lbm in (53.55, 54.0):
+                    enriched = h.Measurement(AT, 70, 23.5, 'PICOOC', lbm=lbm)
+                    self.write_export([enriched])
+                    source = (self.inbox / 'health.json').read_bytes()
+                    api = API([row(original)])
+                    self.sync(api)
+                    payload['lbm'] = lbm
+                    after = dict(h.state_row(self.db, original))
+                    self.assertEqual(json.loads(after.pop('payload')), payload)
+                    self.assertEqual(after, {key: value for key, value in before.items() if key != 'payload'})
+                    self.assertFalse(api.reads)
+                    self.assertFalse(api.posts)
+                    self.assertFalse(api.deletes)
+                    self.assertEqual((self.inbox / 'health.json').read_bytes(), source)
+                    summary = json.loads((self.state / 'last_run.json').read_text())
+                    self.assertEqual(summary['results'], {})
+                    self.assertEqual(summary['local_status_counts'], {status: 1})
+
+    def test_missing_or_unchanged_lbm_preserves_existing_local_evidence(self):
+        original = h.Measurement(AT, 70, 23.5, 'PICOOC', 22, 53.55)
+        h.write_json(self.state / 'last_sync_comparison.json', {})
+        for status in ('verified', 'verified_manual', 'ignored'):
+            for lbm in (None, 53.55):
+                with self.subTest(status=status, lbm=lbm):
+                    h.set_status(self.db, original, status, 'previous decision')
+                    before = dict(h.state_row(self.db, original))
+                    self.write_export([h.Measurement(AT, 70, 23.5, 'PICOOC', lbm=lbm)])
+                    api = API([row(original)])
+                    self.sync(api)
+                    self.assertEqual(dict(h.state_row(self.db, original)), before)
+                    self.assertFalse(api.reads)
+                    self.assertFalse(api.posts)
+                    self.assertFalse(api.deletes)
+
+    def test_late_lbm_with_remote_field_change_still_requires_comparison(self):
+        for weight, bmi, action in ((71, None, 'replace'), (70, 22, 'repair')):
+            with self.subTest(weight=weight, bmi=bmi):
+                h.set_status(self.db, self.r, 'verified')
+                h.write_json(self.state / 'last_sync_comparison.json', {})
+                changed = h.Measurement(AT, weight, 23.5, 'PICOOC', bmi, 53.55)
+                self.write_export([changed])
+                api = API([row(self.r)])
+                self.sync(api)
+                self.assertTrue(api.reads)
+                self.assertFalse(api.posts)
+                self.assertFalse(api.deletes)
+                self.assertEqual(h.get_status(self.db, changed), 'verified_conflict')
+                summary = json.loads((self.state / 'last_run.json').read_text())
+                self.assertEqual(summary['results'], {self.r.key: action})
+
     def test_previously_verified_is_queried_and_detects_change(self):
         h.set_status(self.db, self.r, 'verified')
         wrong = row(self.r); wrong['bodyFat'] = 24
