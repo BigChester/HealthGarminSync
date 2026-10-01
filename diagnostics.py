@@ -17,6 +17,8 @@ SCOPE = "仅检查当前进程访问与本地证据；后台执行和 macOS 权�
 RESULTS = frozenset(('pending', 'verified', 'verified_manual', 'verified_conflict',
                      'remote_missing', 'repair_uncertain', 'uncertain', 'inflight',
                      'ignored', 'repair', 'replace', 'conflict', 'deferred'))
+UNCERTAIN_RESULTS = frozenset(('inflight', 'uncertain', 'repair_uncertain'))
+REVIEW_RESULTS = frozenset(('repair', 'replace', 'conflict', 'verified_conflict', 'remote_missing'))
 PHASES = frozenset(('verified', 'deleted_verified', 'closed_partial', 'uncertain',
                     'deleting', 'deleted', 'uploading', 'replacing'))
 TERMINAL_PHASES = frozenset(('verified', 'deleted_verified', 'closed_partial'))
@@ -185,8 +187,27 @@ def collect():
             ran_at = h.aware(last['run_at'])
             counts = dict(Counter(last['results'].values()))
             stale = cfg is not None and cfg['enabled'] and (h.now() - ran_at).total_seconds() > 7200
-            add('last_run', 'warn' if stale else 'info',
-                '最近运行距今超过两小时；请核对任务与设备状态。' if stale else '最近运行摘要可读取。',
+            if UNCERTAIN_RESULTS.intersection(counts):
+                status = 'error'
+                message = '最近运行摘要包含请求结果未确定的记录。'
+                hint = '先用 ./hg compare 查询并人工核对；结果未确定时不要重复提交。'
+                if 'repair_uncertain' in counts:
+                    hint += ' 有修复操作日志时用 ./hg verify-operation 核对。'
+            elif REVIEW_RESULTS.intersection(counts):
+                status = 'warn'
+                message = '最近运行摘要包含需要人工处理的差异。'
+                hint = '运行 ./hg compare 并人工核对；修复或冲突按对账清单处理。'
+                if 'remote_missing' in counts:
+                    hint += ' 已确认缺失的记录按 resolve --absent 流程处理。'
+            else:
+                status = 'info'
+                message = '最近运行摘要可读取；所列结果不代表当前记录已核验。'
+                hint = None
+            if stale:
+                if status == 'info':
+                    status = 'warn'
+                hint = (hint + ' ' if hint else '') + '最近运行摘要距今超过两小时；请核对任务与设备状态。'
+            add('last_run', status, message, hint,
                 data={'run_at': ran_at.isoformat(), 'results': counts})
         except FileNotFoundError:
             add('last_run', 'warn', '尚无最近运行摘要。')

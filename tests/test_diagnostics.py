@@ -320,9 +320,62 @@ class DoctorTests(unittest.TestCase):
         self.last.write_text(json.dumps({'run_at': h.now().isoformat(),
             'results': {str(index): result for index, result in enumerate(results)}}))
         result, _, checks = self.report()
-        self.assertEqual(result, 0)
+        self.assertEqual(result, 2)
         self.assertEqual(checks['operations']['data'], {'total': 8, 'unfinished': 5})
         self.assertEqual(checks['last_run']['data']['results'], {result: 1 for result in results})
+
+    def test_recent_run_result_severity_and_safe_counts(self):
+        groups = {'error': ('inflight', 'uncertain', 'repair_uncertain'),
+                  'warn': ('repair', 'replace', 'conflict', 'verified_conflict', 'remote_missing'),
+                  'info': ('verified', 'verified_manual', 'ignored', 'deferred', 'pending')}
+        for severity, outcomes in groups.items():
+            for outcome in outcomes:
+                with self.subTest(outcome=outcome):
+                    self.last.write_text(json.dumps({'run_at': h.now().isoformat(),
+                        'results': {SECRET: outcome}, 'error': SECRET}))
+                    code, report, checks = self.report()
+                    check = checks['last_run']
+                    self.assertEqual(code, 2 if severity == 'error' else 0)
+                    self.assertEqual(report['status'],
+                                     {'error': 'error', 'warn': 'warning', 'info': 'ok'}[severity])
+                    self.assertEqual(check['status'], severity)
+                    self.assertIn('最近运行摘要', check['message'])
+                    self.assertEqual(check['data']['results'], {outcome: 1})
+                    if severity != 'info':
+                        self.assertIn('核对', check['hint'])
+
+    def test_mixed_recent_results_keep_highest_severity(self):
+        for outcomes, severity in ((('verified', 'repair', 'uncertain'), 'error'),
+                                   (('pending', 'conflict'), 'warn'),
+                                   (('ignored', 'deferred', 'verified_manual'), 'info')):
+            with self.subTest(outcomes=outcomes):
+                self.last.write_text(json.dumps({'run_at': h.now().isoformat(),
+                    'results': {str(index): value for index, value in enumerate(outcomes)}}))
+                code, _, checks = self.report()
+                self.assertEqual(code, 2 if severity == 'error' else 0)
+                self.assertEqual(checks['last_run']['status'], severity)
+                self.assertEqual(checks['last_run']['data']['results'], {value: 1 for value in outcomes})
+
+    def test_stale_summary_keeps_uncertain_error_and_task_hint(self):
+        self.last.write_text(json.dumps({'run_at': (h.now() - timedelta(hours=3)).isoformat(),
+                                        'results': {SECRET: 'uncertain'}}))
+        code, _, checks = self.report()
+        self.assertEqual(code, 2)
+        self.assertEqual(checks['last_run']['status'], 'error')
+        self.assertIn('超过两小时', checks['last_run']['hint'])
+        self.assertIn('核对', checks['last_run']['hint'])
+        self.assertEqual(checks['last_run']['data']['results'], {'uncertain': 1})
+
+    def test_disabled_sync_keeps_recent_uncertain_summary_visible(self):
+        self.cfg['enabled'] = False
+        self.save_config()
+        for outcome in ('inflight', 'uncertain', 'repair_uncertain'):
+            with self.subTest(outcome=outcome):
+                self.last.write_text(json.dumps({'run_at': h.now().isoformat(), 'results': {SECRET: outcome}}))
+                code, report, checks = self.report()
+                self.assertEqual(code, 2)
+                self.assertEqual(report['status'], 'error')
+                self.assertEqual(checks['last_run']['status'], 'error')
 
     def test_excessively_nested_local_json_is_reported_without_traceback(self):
         nested = '[' * 2000 + '0' + ']' * 2000

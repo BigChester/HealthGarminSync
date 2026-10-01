@@ -123,8 +123,9 @@ class RunAttemptTests(unittest.TestCase):
         self.assertEqual(len(api.posts), 1)
         self.assertEqual(self.attempt()['outcome'], 'completed')
         code, _, checks = self.report()
-        self.assertEqual(code, 0)
+        self.assertEqual(code, 2)
         self.assertIn('不代表全部记录已验证', checks['last_attempt']['message'])
+        self.assertEqual(checks['last_run']['status'], 'error')
         self.assertEqual(checks['last_run']['data']['results'], {'uncertain': 1})
 
     def test_disabled_preview_is_separate_and_does_not_replace_last_run(self):
