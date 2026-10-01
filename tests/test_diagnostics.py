@@ -53,6 +53,8 @@ class DoctorTests(unittest.TestCase):
         self.python.parent.mkdir(parents=True)
         self.python.write_text('synthetic executable')
         self.python.chmod(0o700)
+        self.entry = self.base / 'agent_runner.py'
+        self.entry.write_text('# synthetic background entry\n')
         self.export = self.inbox / (SECRET + '.json')
         self.export.write_text(json.dumps({'schema_version': 2,
             'exported_at': '2020-02-20T09:00:00+08:00', 'metrics': {
@@ -192,6 +194,28 @@ class DoctorTests(unittest.TestCase):
         result, _, checks = self.report()
         self.assertEqual(result, 2)
         self.assertEqual(checks['interpreter']['status'], 'error')
+
+    def test_missing_or_unreadable_background_entry_is_error(self):
+        original = d.os.access
+        with patch.object(d.os, 'access', side_effect=lambda path, mode: False if path == self.entry else original(path, mode)):
+            result, _, checks = self.report()
+        self.assertEqual(result, 2)
+        self.assertEqual(checks['agent_entry']['status'], 'error')
+        self.entry.unlink()
+        result, _, checks = self.report()
+        self.assertEqual(result, 2)
+        self.assertEqual(checks['agent_entry']['status'], 'error')
+
+    def test_old_direct_output_plist_requires_update(self):
+        doc = h.agent_plist()
+        doc['ProgramArguments'] = [str(self.python), str(self.base / 'health_garmin.py'), 'run']
+        doc['StandardOutPath'] = str(self.state / 'agent.out.log')
+        doc['StandardErrorPath'] = str(self.state / 'agent.err.log')
+        self.plist.write_bytes(plistlib.dumps(doc))
+        result, _, checks = self.report()
+        self.assertEqual(result, 2)
+        self.assertEqual(checks['agent_plist']['status'], 'error')
+        self.assertIn('./hg install-agent', checks['agent_plist']['hint'])
 
     def test_old_python_and_nonexecutable_interpreter_are_errors(self):
         self.python.chmod(0o600)

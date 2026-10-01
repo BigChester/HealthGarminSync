@@ -83,6 +83,11 @@ def collect():
         add('interpreter', 'ok', '项目虚拟环境解释器可执行。')
     else:
         add('interpreter', 'error', '项目虚拟环境解释器缺失或不可执行。', '运行 bash setup.sh。')
+    entry = h.BASE / 'agent_runner.py'
+    if entry.is_file() and os.access(entry, os.R_OK):
+        add('agent_entry', 'ok', '后台入口存在且当前进程可读取。')
+    else:
+        add('agent_entry', 'error', '后台入口缺失或当前进程无法读取。', '检查项目文件是否完整。')
     try:
         installed = version('garminconnect')
     except PackageNotFoundError:

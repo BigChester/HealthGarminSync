@@ -216,7 +216,9 @@ class PlatformTests(unittest.TestCase):
         doc=plistlib.loads(plistlib.dumps(h.agent_plist()))
         self.assertEqual(doc['StartInterval'],1800)
         self.assertTrue(Path(doc['ProgramArguments'][0]).is_absolute())
-        self.assertEqual(doc['ProgramArguments'][-1],'run')
+        self.assertEqual(doc['ProgramArguments'][-1],str(h.BASE / 'agent_runner.py'))
+        self.assertEqual(doc['StandardOutPath'],'/dev/null')
+        self.assertEqual(doc['StandardErrorPath'],'/dev/null')
 
 
 if __name__=='__main__':unittest.main()

@@ -1316,12 +1316,12 @@ def inspect_files(cfg: dict[str, Any]) -> None:
 
 def agent_plist() -> dict[str, Any]:
     return {"Label": LABEL,
-            "ProgramArguments": [str(BASE / ".venv/bin/python"), str(BASE / "health_garmin.py"), "run"],
+            "ProgramArguments": [str(BASE / ".venv/bin/python"), str(BASE / "agent_runner.py")],
             "WorkingDirectory": str(BASE), "StartInterval": 1800, "RunAtLoad": True,
             "ProcessType": "Background",
             "EnvironmentVariables": {"PYTHONUNBUFFERED": "1", "HOME": str(Path.home())},
-            "StandardOutPath": str(STATE / "agent.out.log"),
-            "StandardErrorPath": str(STATE / "agent.err.log")}
+            "StandardOutPath": "/dev/null",
+            "StandardErrorPath": "/dev/null"}
 
 
 def manage_agent(install: bool, cfg: dict[str, Any]) -> None:
