@@ -33,7 +33,7 @@ bash setup.sh
 
 已有 Python 3.12+ 可跳过 `brew install`。`setup.sh` 创建 `.venv/`，安装固定 `garminconnect==0.3.16` 和 `curl_cffi`，运行离线测试并保存 `requirements.lock.txt`。找不到 Homebrew 时按其官方说明安装或恢复 shell 环境；依赖升级需手动验证。
 
-主要文件：`hg` 为命令入口，`health_garmin.py` 为主程序，`replace_history.py` 处理完整历史替换，`tests/` 为离线测试，`samples/health.example.json` 为禁止上传的演示数据。
+主要文件：`hg` 为命令入口，`health_garmin.py` 为主程序，`agent_runner.py` 为后台日志入口，`replace_history.py` 处理完整历史替换，`tests/` 为离线测试，`samples/health.example.json` 为禁止上传的演示数据。
 
 运行生成的 `config.json`、`state/`、`.venv/` 和依赖锁文件不随包交付。`state/tokens/`、备份及导出含凭据或健康数据，应留在本机并保持私密。
 
@@ -255,7 +255,7 @@ tail -n 80 state/agent.err.log
 
 最近一次取得锁的 `run` 尝试保存在 `state/last_attempt.json`，覆盖更新；失败和中断会由 `doctor` 报告。缺少结束记录时只提示待核查，进程可能仍在运行。`state/last_run.json` 保留最近完成的同步摘要。
 
-`sync.log` 自动轮换；LaunchAgent 输出日志需自行归档。预览、查询和日志应留在本机账户下；失败通知通过本地状态和日志查看。
+`sync.log` 自动轮换。后台的 `agent.out.log` 和 `agent.err.log` 每文件最多 1 MB，各保留 3 份备份；旧超大日志保留尾部。已有任务运行 `./hg install-agent` 切换到新入口。预览、查询和日志留在本机账户下，失败通过本地状态和日志查看。
 
 | 现象 | 排查方式 |
 |---|---|
