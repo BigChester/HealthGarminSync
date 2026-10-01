@@ -110,13 +110,18 @@ def verify(path, api=None):
     job = h.read_operation(path)
     start, end = date.fromisoformat(job['start']), date.fromisoformat(job['end'])
     targets = [h.Measurement(**{**r, 'at': h.aware(r['at'])}) for r in job['targets']]
-    api = api or h.api_client()
-    obj = h.fetch_remote_snapshot(api, start, end)
-    index = h.RemoteIndex(obj)
-    with contextlib.closing(h.database()) as db, db:
-        plan = h.comparison_plan(db, targets, obj, start, end)
+    backup = Path(job['backup'])
+    try:
+        api = api or h.api_client()
+        obj = h.fetch_remote_snapshot(api, start, end)
+        index = h.RemoteIndex(obj)
         decisions = [index.decide(r) for r in targets]
         scoped = [row for row in index.rows if start.isoformat() <= row['calendarDate'] <= end.isoformat()]
+    except Exception:
+        h.record_failed_check(path, job)
+        raise
+    with contextlib.closing(h.database()) as db, db:
+        plan = h.comparison_plan(db, targets, obj, start, end)
         owners = {indices[0] for kind, indices, _ in decisions if kind == 'matched'}
         matched = (all(kind == 'matched' for kind, _, _ in decisions)
                    and len(owners) == len(targets) == len(scoped)
@@ -131,7 +136,7 @@ def verify(path, api=None):
                                'target_count': len(targets), 'remote_count': len(scoped),
                                'extra': len(plan['extra_remote'])}
         h.write_json(path, job)
-        h.write_json(Path(job['backup']) / 'remote-after.json', obj)
+        h.write_json(backup / 'remote-after.json', obj)
     print('本次完整历史只读核验：', '匹配' if matched else '未匹配',
           job['verification'], '；操作历史阶段：', job['phase'], flush=True)
     return matched

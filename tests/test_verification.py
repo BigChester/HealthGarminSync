@@ -5,6 +5,7 @@ import io
 import json
 import logging
 import os
+from pathlib import Path
 import sys
 import unittest
 from unittest.mock import patch
@@ -144,17 +145,22 @@ class OperationVerificationTests(unittest.TestCase):
                     with self.assertRaises(h.SafeError):
                         h.verify_operation(argparse.Namespace(operation=str(path)))
                 self.assertEqual(output.getvalue(), '')
-                self.assertEqual(path.read_bytes(), before)
+                after = json.loads(path.read_text())
+                previous = json.loads(before)
+                self.assertIs(after.pop('last_check_passed'), False)
+                self.assertNotEqual(after.pop('last_checked_at'), previous.pop('last_checked_at'))
+                previous.pop('last_check_passed')
+                self.assertEqual(after, previous)
                 self.assertFalse(api.posts)
                 self.assertFalse(api.deletes)
 
-    def invoke_cli(self, path, api):
+    def invoke_cli(self, path, api, login_error=None):
         output, errors = io.StringIO(), io.StringIO()
         previous_umask = os.umask(0o077)
         try:
             with patch.object(sys, 'argv', ['health_garmin.py', 'verify-operation', str(path)]), \
                     patch.object(h, 'config', return_value=self.cfg), \
-                    patch.object(h, 'api_client', return_value=api), \
+                    patch.object(h, 'api_client', return_value=api, side_effect=login_error), \
                     patch.object(h, 'RotatingFileHandler', return_value=logging.NullHandler()), \
                     patch.object(h.logging, 'basicConfig'), patch.object(h.LOG, 'error'), \
                     contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
@@ -227,6 +233,7 @@ class OperationDiagnosticTests(unittest.TestCase):
     journal = OperationVerificationTests.journal
     check_single = OperationVerificationTests.check_single
     check_bulk = OperationVerificationTests.check_bulk
+    invoke_cli = OperationVerificationTests.invoke_cli
 
     def setUp(self):
         doctor_fixtures.DoctorTests.setUp(self)
@@ -280,6 +287,136 @@ class OperationDiagnosticTests(unittest.TestCase):
                 self.assert_diagnosis(path, 'verified', failed=False)
                 self.assertFalse(api.posts)
                 self.assertFalse(api.deletes)
+
+    def test_query_failures_reach_doctor_and_recovery_clears_them_without_reopening_history(self):
+        for kind, phase in (('single', 'verified'), ('deletion', 'deleted_verified'),
+                            ('full', 'verified'), ('full', 'closed_partial')):
+            for fault in ('login', 'timeout', 'incomplete'):
+                with self.subTest(kind=kind, phase=phase, fault=fault):
+                    full = kind == 'full'
+                    path = self.journal(phase=phase, deletion=kind == 'deletion', full=full)
+                    job = json.loads(path.read_text())
+                    backup = None
+                    if full:
+                        job['verification'] = {'matched': 1, 'target_count': 1, 'remote_count': 1, 'extra': 0}
+                        backup = Path(job['backup']) / 'remote-after.json'
+                        h.write_json(backup, {'dateWeightList': [row(self.r, 201)]})
+                        h.write_json(path, job)
+                    before = path.read_bytes()
+                    backup_bytes = backup.read_bytes() if backup else None
+                    source = self.export.read_bytes()
+                    api = API()
+                    primary = h.SafeError('模拟登录失败。') if fault == 'login' else TimeoutError(doctor_fixtures.SECRET)
+                    if fault == 'timeout':
+                        api.get_body_composition = lambda *args: (_ for _ in ()).throw(primary)
+                    elif fault == 'incomplete':
+                        api.fail_chunk = 1
+                    output = io.StringIO()
+                    login_error = primary if fault == 'login' else None
+                    with patch.object(h, 'api_client', return_value=api, side_effect=login_error), \
+                            contextlib.redirect_stdout(output), self.assertRaises(Exception) as caught:
+                        h.verify_operation(argparse.Namespace(operation=str(path)))
+                    if fault != 'incomplete':
+                        self.assertIs(caught.exception, primary)
+                    else:
+                        self.assertIsInstance(caught.exception, h.SafeError)
+                    self.assertEqual(output.getvalue(), '')
+                    after = json.loads(path.read_text())
+                    self.assertIs(after.pop('last_check_passed'), False)
+                    h.aware(after.pop('last_checked_at'))
+                    historical = json.loads(before)
+                    historical.pop('last_check_passed')
+                    historical.pop('last_checked_at')
+                    self.assertEqual(after, historical)
+                    if backup:
+                        self.assertEqual(backup.read_bytes(), backup_bytes)
+                    self.assert_diagnosis(path, phase, failed=True)
+                    api.reads.clear()
+                    code, output, errors = self.invoke_cli(path, api, login_error)
+                    self.assertEqual(code, 2)
+                    self.assertEqual(output, '')
+                    self.assertNotIn(doctor_fixtures.SECRET, errors)
+                    self.assertFalse(api.posts)
+                    self.assertFalse(api.deletes)
+                    restored = API([] if kind == 'deletion' else [row(self.r, 201)])
+                    code, output, errors = self.invoke_cli(path, restored)
+                    self.assertEqual(code, 0)
+                    self.assertEqual(errors, '')
+                    self.assertIn('匹配' if kind != 'deletion' else '原记录已不存在', output)
+                    self.assert_diagnosis(path, 'deleted_verified' if kind == 'deletion' else 'verified', failed=False)
+                    self.assertEqual(self.export.read_bytes(), source)
+                    self.assertFalse(restored.posts)
+                    self.assertFalse(restored.deletes)
+
+    def test_failure_evidence_save_error_does_not_replace_the_query_exception(self):
+        for full in (False, True):
+            with self.subTest(full=full):
+                path = self.journal(full=full)
+                before = path.read_bytes()
+                primary = TimeoutError(doctor_fixtures.SECRET)
+                api = API()
+                api.get_body_composition = lambda *args: (_ for _ in ()).throw(primary)
+                errors = io.StringIO()
+                with patch.object(h, 'api_client', return_value=api), \
+                        patch.object(h, 'write_json', side_effect=OSError(doctor_fixtures.SECRET)), \
+                        patch.object(h.LOG, 'error'), contextlib.redirect_stderr(errors), \
+                        self.assertRaises(TimeoutError) as caught:
+                    h.verify_operation(argparse.Namespace(operation=str(path)))
+                self.assertIs(caught.exception, primary)
+                self.assertEqual(path.read_bytes(), before)
+                self.assertIn('核对失败证据未保存', errors.getvalue())
+                self.assertIn('OSError', errors.getvalue())
+                self.assertNotIn(doctor_fixtures.SECRET, errors.getvalue())
+                self.assertFalse(api.posts)
+                self.assertFalse(api.deletes)
+
+    def test_invalid_local_journal_is_not_rewritten_or_queried(self):
+        for kind in ('single', 'deletion', 'full'):
+            with self.subTest(kind=kind):
+                path = self.journal(deletion=kind == 'deletion', full=kind == 'full')
+                job = json.loads(path.read_text())
+                if kind == 'single':
+                    job['measurement']['at'] = 'invalid time'
+                elif kind == 'deletion':
+                    job['original'].pop('samplePk')
+                else:
+                    job['targets'][0]['at'] = 'invalid time'
+                h.write_json(path, job)
+                before = path.read_bytes()
+                with patch.object(h, 'api_client') as api, patch.object(h, 'record_failed_check') as failed, \
+                        self.assertRaises((h.SafeError, KeyError)):
+                    h.verify_operation(argparse.Namespace(operation=str(path)))
+                api.assert_not_called()
+                failed.assert_not_called()
+                self.assertEqual(path.read_bytes(), before)
+
+    def test_successful_read_local_save_errors_are_not_recorded_as_query_failures(self):
+        for full in (False, True):
+            for stage in ('database', 'journal', 'backup') if full else ('database', 'journal'):
+                with self.subTest(full=full, stage=stage):
+                    path = self.journal(full=full)
+                    job = json.loads(path.read_text())
+                    backup = Path(job['backup']) / 'remote-after.json' if full else None
+                    primary = OSError(doctor_fixtures.SECRET)
+                    original_write = h.write_json
+
+                    def write(target, value):
+                        if target == (backup if stage == 'backup' else path):
+                            raise primary
+                        return original_write(target, value)
+
+                    with contextlib.ExitStack() as stack:
+                        stack.enter_context(patch.object(h, 'api_client', return_value=API([row(self.r, 201)])))
+                        failed = stack.enter_context(patch.object(h, 'record_failed_check'))
+                        if stage == 'database':
+                            stack.enter_context(patch.object(h, 'database', side_effect=primary))
+                        else:
+                            stack.enter_context(patch.object(h, 'write_json', side_effect=write))
+                        with self.assertRaises(OSError) as caught:
+                            h.verify_operation(argparse.Namespace(operation=str(path)))
+                    self.assertIs(caught.exception, primary)
+                    failed.assert_not_called()
+                    self.assertIs(json.loads(path.read_text())['last_check_passed'], True)
 
 
 if __name__ == '__main__':

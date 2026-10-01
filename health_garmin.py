@@ -1012,6 +1012,20 @@ def read_operation(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text())
 
 
+def record_failed_check(path: Path, journal: dict[str, Any]) -> None:
+    """Record an unsuccessful query without replacing its original exception."""
+    try:
+        write_json(path, {**journal, "last_checked_at": now().isoformat(),
+                          "last_check_passed": False})
+    except Exception as exc:
+        detail = type(exc).__name__
+        try:
+            print("本次核对失败证据未保存：", detail, file=sys.stderr)
+            LOG.error("Operation check failure evidence not saved: %s", detail)
+        except Exception:
+            pass
+
+
 def verify_operation(args: argparse.Namespace) -> bool:
     path = Path(args.operation).expanduser()
     journal = read_operation(path)
@@ -1019,21 +1033,27 @@ def verify_operation(args: argparse.Namespace) -> bool:
         from replace_history import verify
         return verify(path)
     day = date.fromisoformat(journal["original"]["calendarDate"])
-    obj = fetch_remote_snapshot(api_client(), day, day)
     payload = journal.get("replacement") or journal.get("measurement")
-    if payload:
-        r = Measurement(**{**payload, "at": aware(payload["at"])})
-        classification = classify_remote(r, obj)
-        matched = classification == "matched"
-        result = {"matched": "匹配", "absent": "目标缺失", "conflict": "目标冲突"}[classification]
+    r = Measurement(**{**payload, "at": aware(payload["at"])}) if payload else None
+    original_pk = str(journal["original"]["samplePk"]) if r is None else None
+    try:
+        obj = fetch_remote_snapshot(api_client(), day, day)
+        if r is not None:
+            classification = classify_remote(r, obj)
+            matched = classification == "matched"
+            result = {"matched": "匹配", "absent": "目标缺失", "conflict": "目标冲突"}[classification]
+        else:
+            matched = not any(str(row.get("samplePk")) == original_pk for row in obj["dateWeightList"])
+            result = "原记录已不存在" if matched else "原记录仍存在"
+    except Exception:
+        record_failed_check(path, journal)
+        raise
+    if r is not None:
         if matched:
             with contextlib.closing(database()) as db, db:
                 set_status(db, r, "verified", "Delayed reviewed-operation verification matched")
             journal["phase"] = "verified"
     else:
-        matched = not any(str(row.get("samplePk")) == str(journal["original"]["samplePk"])
-                          for row in obj["dateWeightList"])
-        result = "原记录已不存在" if matched else "原记录仍存在"
         if matched:
             journal["phase"] = "deleted_verified"
     journal["last_checked_at"] = now().isoformat()
