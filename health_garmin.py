@@ -706,10 +706,11 @@ def print_comparison(plan: dict[str, Any]) -> None:
               remote_time(row).isoformat(), row.get("weight"), row.get("bodyFat"))
 
 
-def save_comparison(plan: dict[str, Any], cfg: dict[str, Any]) -> Path:
+def save_comparison(plan: dict[str, Any], cfg: dict[str, Any], *, automatic: bool = False) -> Path:
     plan["config"] = {key: cfg.get(key) for key in
                       ("inbox", "allowed_sources", "weight_bare_unit", "fat_bare_unit", "pair_window_seconds")}
-    path = STATE / "plans" / ("compare-" + now().strftime("%Y%m%dT%H%M%S%fZ") + ".json")
+    name = "sync-latest.json" if automatic else "compare-" + now().strftime("%Y%m%dT%H%M%S%fZ") + ".json"
+    path = STATE / "plans" / name
     write_json(path, plan)
     write_json(STATE / "last_compare.json", {"created_at": plan["created_at"], "path": str(path),
                                              "counts": plan["counts"], "extra_remote": len(plan["extra_remote"])})
@@ -1041,7 +1042,7 @@ def load_local_comparison(cfg: dict[str, Any], records: list[Measurement], api: 
     start, end = min(r.at.date() for r in selected), max(r.at.date() for r in selected)
     obj = fetch_remote_snapshot(api, start, end)
     plan = comparison_plan(db, selected, obj, start, end)
-    save_comparison(plan, cfg)
+    save_comparison(plan, cfg, automatic=True)
     return plan
 
 

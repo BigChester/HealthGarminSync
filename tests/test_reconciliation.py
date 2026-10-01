@@ -211,6 +211,72 @@ class ReconciliationTests(unittest.TestCase):
         self.assertTrue(api.reads)
         self.assertFalse(api.posts)
 
+    def test_repeated_sync_reuses_latest_plan_and_updates_snapshot(self):
+        self.r = h.Measurement(h.now() - timedelta(days=1), 70, 23.5, 'PICOOC')
+        self.write_export([self.r])
+        source = (self.inbox / 'health.json').read_bytes()
+        api = API([row(self.r)])
+        self.sync(api)
+        path = self.state / 'plans' / 'sync-latest.json'
+        first = json.loads(path.read_text())
+        self.assertEqual(first['counts'], {'matched': 1})
+        api.rows[0]['bodyFat'] = 24
+        self.sync(api)
+        latest = json.loads(path.read_text())
+        self.assertEqual(list((self.state / 'plans').iterdir()), [path])
+        self.assertEqual(latest['counts'], {'replace': 1})
+        self.assertEqual(latest['remote_snapshot']['dateWeightList'], api.rows)
+        summary = json.loads((self.state / 'last_compare.json').read_text())
+        self.assertEqual(summary['path'], str(path))
+        self.assertEqual(summary['created_at'], latest['created_at'])
+        self.assertEqual(summary['counts'], latest['counts'])
+        self.assertEqual(h.get_status(self.db, self.r), 'verified_conflict')
+        self.assertFalse(api.posts)
+        self.assertFalse(api.deletes)
+        self.assertEqual((self.inbox / 'health.json').read_bytes(), source)
+
+    def test_manual_comparisons_survive_later_automatic_sync(self):
+        api = API([row(self.r)])
+        args = argparse.Namespace(since='2020-02-20', until='2020-02-20', inbox=None)
+        with patch.object(h, 'api_client', return_value=api), contextlib.redirect_stdout(io.StringIO()):
+            h.compare_exports(args, self.cfg)
+            h.compare_exports(args, self.cfg)
+        saved = {p: p.read_bytes() for p in (self.state / 'plans').glob('compare-*.json')}
+        self.assertEqual(len(saved), 2)
+        api.rows[0]['bodyFat'] = None
+        self.sync(api)
+        self.assertEqual({p: p.read_bytes() for p in saved}, saved)
+        summary = json.loads((self.state / 'last_compare.json').read_text())
+        self.assertEqual(Path(summary['path']), self.state / 'plans' / 'sync-latest.json')
+        self.reviewed(api, Path(summary['path']))
+        self.assertEqual(len(api.deletes), 1)
+        self.assertEqual(len(api.posts), 1)
+        self.assertEqual(h.get_status(self.db, self.r), 'verified')
+        self.assertEqual({p: p.read_bytes() for p in saved}, saved)
+
+    def test_latest_plan_replace_failure_preserves_evidence_and_stops_upload(self):
+        api = API([row(self.r)])
+        self.sync(api)
+        paths = [self.state / 'plans' / 'sync-latest.json', self.state / 'last_compare.json',
+                 self.state / 'last_sync_comparison.json']
+        saved = {p: p.read_bytes() for p in paths}
+        other = h.Measurement(AT + timedelta(hours=1), 71, 24, 'PICOOC')
+        self.write_export([self.r, other])
+        original_replace = Path.replace
+
+        def fail_latest(path, target):
+            if Path(target) == paths[0]:
+                raise OSError('simulated disk failure')
+            return original_replace(path, target)
+
+        with patch.object(Path, 'replace', fail_latest), self.assertRaises(OSError):
+            self.sync(api)
+        self.assertEqual({p: p.read_bytes() for p in paths}, saved)
+        self.assertIsNone(h.state_row(self.db, other))
+        self.assertEqual(h.get_status(self.db, self.r), 'verified')
+        self.assertFalse(api.posts)
+        self.assertFalse(api.deletes)
+
     def test_explicit_historical_compare_ignores_incremental_marker(self):
         h.set_status(self.db, self.r, 'verified')
         h.write_json(self.state / 'last_sync_comparison.json', {})
