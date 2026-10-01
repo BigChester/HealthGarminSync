@@ -999,6 +999,55 @@ class ReconciliationTests(unittest.TestCase):
         self.assertEqual(len({post['timestamp'] for post in api.posts}), 3)
         self.assertFalse(api.deletes)
 
+    def test_late_v1_fat_export_restarts_settling_before_single_complete_upload(self):
+        current = h.aware('2026-10-02T10:00:00+08:00')
+        self.r = h.Measurement(current - timedelta(minutes=5), 70, 23.5, 'PICOOC')
+        self.cfg['settle_seconds'] = 120
+        (self.inbox / 'health.json').unlink()
+        weight = self.inbox / 'weight.json'
+        weight.write_text(json.dumps({'schema_version': 1, 'metric': 'weight',
+            'exported_at': current.isoformat(),
+            'samples': [{'at': self.r.at.isoformat(), 'value': '70 kg', 'source': 'PICOOC'}]}))
+        originals = {weight: weight.read_bytes()}
+        api = API()
+        for elapsed in (119, 120, 239, 240, 241):
+            with self.subTest(elapsed=elapsed):
+                if elapsed == 120:
+                    fat = self.inbox / 'body_fat.json'
+                    fat.write_text(json.dumps({'schema_version': 1, 'metric': 'body_fat',
+                        'exported_at': (current + timedelta(seconds=120)).isoformat(),
+                        'samples': [{'at': self.r.at.isoformat(), 'value': '23.5%', 'source': 'PICOOC'}]}))
+                    originals[fat] = fat.read_bytes()
+                with patch.object(h, 'now', return_value=current + timedelta(seconds=elapsed)):
+                    self.sync(api)
+                summary = json.loads((self.state / 'last_run.json').read_text())
+                self.assertEqual(summary['complete_measurements'], 1)
+                self.assertEqual(summary['waiting_pairs'], 0)
+                self.assertEqual(summary['exports']['weight'], current.isoformat())
+                if elapsed >= 120:
+                    self.assertEqual(summary['exports']['body_fat'],
+                                     (current + timedelta(seconds=120)).isoformat())
+                else:
+                    self.assertNotIn('body_fat', summary['exports'])
+                if elapsed < 240:
+                    self.assertEqual(summary['deferred'], 'settling')
+                    self.assertEqual(summary['results'], {self.r.key: 'deferred'})
+                    self.assertEqual(summary['local_status_counts'], {})
+                    self.assertIsNone(h.state_row(self.db, self.r))
+                    self.assertFalse(api.posts)
+                else:
+                    self.assertNotIn('deferred', summary)
+                    self.assertEqual(summary['results'], {self.r.key: 'verified'})
+                    self.assertEqual(summary['comparison'], {'missing': 1} if elapsed == 240 else {'matched': 1})
+                    self.assertEqual(summary['local_status_counts'], {'verified': 1})
+                    self.assertEqual(h.get_status(self.db, self.r), 'verified')
+                    self.assertEqual(json.loads(h.state_row(self.db, self.r)['payload'])['fat'], 23.5)
+                    self.assertEqual(len(api.posts), 1)
+                    self.assertEqual(api.posts[0]['weight'], 70)
+                    self.assertEqual(api.posts[0]['percent_fat'], 23.5)
+                self.assertFalse(api.deletes)
+                self.assertEqual({path: path.read_bytes() for path in originals}, originals)
+
     def test_zero_settling_allows_small_export_clock_skew(self):
         current = h.now()
         source = self.inbox / 'health.json'
