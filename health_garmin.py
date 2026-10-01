@@ -1433,10 +1433,12 @@ def main() -> int:
             sys.dont_write_bytecode = previous_bytecode
     os.umask(0o077)
     private_dir(STATE)
-    logging.basicConfig(level=logging.INFO, handlers=[
-        RotatingFileHandler(STATE / "sync.log", maxBytes=1_000_000, backupCount=3, encoding="utf-8")],
-        format="%(asctime)s %(levelname)s %(message)s")
+    owned_handler = None
     try:
+        owned_handler = RotatingFileHandler(
+            STATE / "sync.log", maxBytes=1_000_000, backupCount=3, encoding="utf-8")
+        logging.basicConfig(level=logging.INFO, handlers=[owned_handler],
+                            format="%(asctime)s %(levelname)s %(message)s")
         with (STATE / "run.lock").open("a") as lock:
             try:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -1504,6 +1506,13 @@ def main() -> int:
         print("错误：", detail, "。请检查配置/网络；先核对 Garmin 再重试。", file=sys.stderr)
         LOG.error("Unhandled %s", detail)
         return 2
+    finally:
+        if owned_handler is not None:
+            logging.getLogger().removeHandler(owned_handler)
+            try:
+                owned_handler.close()
+            except Exception as exc:
+                print("日志关闭失败：", type(exc).__name__, file=sys.stderr)
 
 
 if __name__ == "__main__":

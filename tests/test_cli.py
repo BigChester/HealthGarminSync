@@ -206,5 +206,98 @@ class CliTests(ConfigFixture):
                     api.assert_not_called()
 
 
+class LoggingOwnershipTests(ConfigFixture):
+    def setUp(self):
+        super().setUp()
+        self.root_logger = logging.getLogger()
+        self.previous_handlers = list(self.root_logger.handlers)
+        self.previous_level = self.root_logger.level
+        self.root_logger.handlers = []
+        self.addCleanup(self.restore_logging)
+
+    def restore_logging(self):
+        for handler in self.root_logger.handlers:
+            if handler not in self.previous_handlers:
+                handler.close()
+        self.root_logger.handlers = self.previous_handlers
+        self.root_logger.setLevel(self.previous_level)
+
+    def invoke(self):
+        errors = io.StringIO()
+        previous_umask = os.umask(0o077)
+        try:
+            with patch.object(sys, "argv", ["health_garmin.py", "run"]), \
+                    contextlib.redirect_stderr(errors):
+                result = h.main()
+        finally:
+            os.umask(previous_umask)
+        return result, errors.getvalue()
+
+    def test_repeated_commands_close_real_owned_handlers(self):
+        handlers = []
+        factory = h.RotatingFileHandler
+
+        def create(*args, **kwargs):
+            handler = factory(*args, **kwargs)
+            handlers.append(handler)
+            return handler
+
+        with patch.object(h, "RotatingFileHandler", side_effect=create), \
+                patch.object(h, "run_with_attempt"):
+            for _ in range(3):
+                self.assertEqual(self.invoke(), (0, ""))
+                self.assertEqual(self.root_logger.handlers, [])
+        self.assertEqual(len(handlers), 3)
+        self.assertTrue(all(handler.stream is None for handler in handlers))
+
+    def test_existing_handler_survives_basic_config_ignored_owned_handler(self):
+        existing = logging.FileHandler(self.root / "caller.log")
+        self.addCleanup(existing.close)
+        self.root_logger.addHandler(existing)
+        factory = h.RotatingFileHandler
+        owned = factory(self.state / "owned.log")
+        with patch.object(h, "RotatingFileHandler", return_value=owned), \
+                patch.object(h, "run_with_attempt"):
+            self.assertEqual(self.invoke(), (0, ""))
+        self.assertEqual(self.root_logger.handlers, [existing])
+        self.assertFalse(existing.stream.closed)
+        self.assertIsNone(owned.stream)
+        existing.emit(logging.LogRecord("caller", logging.INFO, "", 0, "still open", (), None))
+        self.assertIn("still open", (self.root / "caller.log").read_text())
+
+    def test_logging_initialization_failure_is_safe_and_closes_owned_handler(self):
+        owned = h.RotatingFileHandler(self.state / "owned.log")
+        with patch.object(h, "RotatingFileHandler", return_value=owned), \
+                patch.object(h.logging, "basicConfig", side_effect=OSError("private-secret")), \
+                patch.object(h.LOG, "error"), patch.object(h, "run_with_attempt") as run:
+            result, errors = self.invoke()
+        self.assertEqual(result, 2)
+        self.assertIn("OSError", errors)
+        self.assertNotIn("private-secret", errors)
+        self.assertIsNone(owned.stream)
+        run.assert_not_called()
+        self.assertEqual(self.root_logger.handlers, [])
+
+    def test_close_failure_preserves_error_and_interruption_results(self):
+        for exc, expected in ((h.SafeError("controlled"), 2), (KeyboardInterrupt(), 130)):
+            with self.subTest(expected=expected):
+                owned = h.RotatingFileHandler(self.state / "owned.log")
+                close = owned.close
+
+                def failing_close():
+                    close()
+                    raise OSError("private-secret")
+
+                with patch.object(h, "RotatingFileHandler", return_value=owned), \
+                        patch.object(owned, "close", side_effect=failing_close), \
+                        patch.object(h, "run_with_attempt", side_effect=exc):
+                    result, errors = self.invoke()
+                self.assertEqual(result, expected)
+                self.assertIn("日志关闭失败： OSError", errors)
+                self.assertNotIn("private-secret", errors)
+                self.assertIsNone(owned.stream)
+                self.assertEqual(self.root_logger.handlers, [])
+
+
 if __name__ == "__main__":
     unittest.main()
