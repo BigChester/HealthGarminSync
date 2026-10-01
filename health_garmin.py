@@ -1038,8 +1038,8 @@ def resume_operation(args: argparse.Namespace) -> None:
         raise SafeError("恢复请求尚未读回验证，请使用 verify-operation 继续只读核对。")
 
 
-def load_local_comparison(cfg: dict[str, Any], records: list[Measurement], api: Any,
-                          db: sqlite3.Connection, full: bool = False) -> dict[str, Any]:
+def select_comparison_records(records: list[Measurement], db: sqlite3.Connection,
+                              full: bool = False) -> list[Measurement]:
     # The first run checks all retained history. Later runs recheck recent data
     # and every pending, uncertain, changed or remotely missing older record.
     recent = now().astimezone().date() - timedelta(days=30)
@@ -1057,11 +1057,16 @@ def load_local_comparison(cfg: dict[str, Any], records: list[Measurement], api: 
                 payload["lbm"] = r.lbm
                 db.execute("UPDATE uploads SET payload=? WHERE record_id=?",
                            (json.dumps(payload, ensure_ascii=False), r.key))
-    if not selected:
+    return selected
+
+
+def load_local_comparison(cfg: dict[str, Any], records: list[Measurement], api: Any,
+                          db: sqlite3.Connection) -> dict[str, Any]:
+    if not records:
         return {"entries": [], "counts": {}, "extra_remote": []}
-    start, end = min(r.at.date() for r in selected), max(r.at.date() for r in selected)
+    start, end = min(r.at.date() for r in records), max(r.at.date() for r in records)
     obj = fetch_remote_snapshot(api, start, end)
-    plan = comparison_plan(db, selected, obj, start, end)
+    plan = comparison_plan(db, records, obj, start, end)
     save_comparison(plan, cfg, automatic=True)
     return plan
 
@@ -1218,8 +1223,9 @@ def run_sync(cfg: dict[str, Any], record_id: str | None = None) -> None:
         write_json(STATE / "last_run.json", summary)
         return
     with contextlib.closing(database()) as db, db:
-        api = api_client()
-        plan = load_local_comparison(cfg, records, api, db, full=record_id is not None)
+        selected = select_comparison_records(records, db, full=record_id is not None)
+        api = api_client() if selected else None
+        plan = load_local_comparison(cfg, selected, api, db)
         summary["comparison"] = plan["counts"]
         print_comparison(plan) if plan["entries"] else print("近期没有需要复核的测量。")
         by_id = {r.key: r for r in records}

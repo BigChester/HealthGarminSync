@@ -248,6 +248,31 @@ class RunAttemptTests(unittest.TestCase):
         self.assertFalse(api.posts)
         self.assertFalse(api.deletes)
 
+    def test_idle_historical_run_completes_offline_and_retains_local_lbm(self):
+        record = h.load_measurements(self.cfg)[1][0]
+        with contextlib.closing(h.database()) as db:
+            h.set_status(db, record, 'verified')
+        h.write_json(self.state / 'last_sync_comparison.json', {})
+        data = json.loads(self.export.read_text())
+        data['metrics']['lbm'] = [{'at': record.at.isoformat(), 'value': '53.55 kg', 'source': record.source}]
+        self.export.write_text(json.dumps(data))
+        source = self.export.read_bytes()
+        with patch.object(h, 'api_client', side_effect=TimeoutError(SECRET)) as api:
+            self.assertEqual(self.run_main()[0], 0)
+        api.assert_not_called()
+        self.assertEqual(self.attempt()['outcome'], 'completed')
+        summary = json.loads(self.last.read_text())
+        self.assertEqual(summary['results'], {})
+        self.assertEqual(summary['local_status_counts'], {'verified': 1})
+        with contextlib.closing(h.database()) as db:
+            self.assertEqual(json.loads(h.state_row(db, record)['payload'])['lbm'], 53.55)
+        code, _, checks = self.report()
+        self.assertEqual(code, 0)
+        self.assertEqual(checks['last_run']['data']['results'], {})
+        self.assertEqual(checks['last_run']['data']['local_status_counts'], {'verified': 1})
+        self.assertIn('不代表当前记录已核验', checks['last_run']['message'])
+        self.assertEqual(self.export.read_bytes(), source)
+
     def test_empty_export_cannot_mask_unreadable_existing_database(self):
         self.export.write_text(json.dumps({'schema_version': 2,
             'exported_at': h.now().isoformat(), 'metrics': {'weight': []}}))

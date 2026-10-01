@@ -193,15 +193,14 @@ class ReconciliationTests(unittest.TestCase):
                     enriched = h.Measurement(AT, 70, 23.5, 'PICOOC', lbm=lbm)
                     self.write_export([enriched])
                     source = (self.inbox / 'health.json').read_bytes()
-                    api = API([row(original)])
-                    self.sync(api)
+                    with patch.object(h, 'api_client', side_effect=AssertionError('No remote work expected')) as api, \
+                            contextlib.redirect_stdout(io.StringIO()):
+                        h.run_sync(self.cfg)
                     payload['lbm'] = lbm
                     after = dict(h.state_row(self.db, original))
                     self.assertEqual(json.loads(after.pop('payload')), payload)
                     self.assertEqual(after, {key: value for key, value in before.items() if key != 'payload'})
-                    self.assertFalse(api.reads)
-                    self.assertFalse(api.posts)
-                    self.assertFalse(api.deletes)
+                    api.assert_not_called()
                     self.assertEqual((self.inbox / 'health.json').read_bytes(), source)
                     summary = json.loads((self.state / 'last_run.json').read_text())
                     self.assertEqual(summary['results'], {})
@@ -238,6 +237,87 @@ class ReconciliationTests(unittest.TestCase):
                 self.assertEqual(h.get_status(self.db, changed), 'verified_conflict')
                 summary = json.loads((self.state / 'last_run.json').read_text())
                 self.assertEqual(summary['results'], {self.r.key: action})
+
+    def test_idle_historical_sync_finishes_without_login_or_overwriting_review_plan(self):
+        h.write_json(self.state / 'last_sync_comparison.json', {})
+        for status in ('verified', 'verified_manual', 'ignored'):
+            with self.subTest(status=status):
+                h.set_status(self.db, self.r, status)
+                plan = self.plan([row(self.r)], save=True)
+                previous = plan.read_bytes(), (self.state / 'last_compare.json').read_bytes()
+                with patch.object(h, 'api_client', side_effect=TimeoutError('Unavailable login')) as api, \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    h.run_sync(self.cfg)
+                api.assert_not_called()
+                summary = json.loads((self.state / 'last_run.json').read_text())
+                self.assertEqual(summary['results'], {})
+                self.assertEqual(summary['comparison'], {})
+                self.assertEqual(summary['local_status_counts'], {status: 1})
+                self.assertEqual((plan.read_bytes(), (self.state / 'last_compare.json').read_bytes()), previous)
+
+    def test_required_comparison_still_logs_in_for_initial_recent_changed_or_pending_records(self):
+        recent = h.Measurement(h.now() - timedelta(days=1), 70, 23.5, 'PICOOC')
+        cases = [('first', self.r, self.r, 'verified', True),
+                 ('recent', recent, recent, 'verified', False),
+                 ('BMI', self.r, h.Measurement(AT, 70, 23.5, 'PICOOC', 22), 'verified', False),
+                 ('core', self.r, h.Measurement(AT, 71, 23.5, 'PICOOC'), 'verified', False)]
+        cases += [(status, self.r, self.r, status, False) for status in
+                  ('pending', 'inflight', 'uncertain', 'repair_uncertain', 'verified_conflict', 'remote_missing')]
+        for name, previous, current, status, first in cases:
+            with self.subTest(name=name):
+                h.set_status(self.db, previous, status)
+                marker = self.state / 'last_sync_comparison.json'
+                if first:
+                    marker.unlink(missing_ok=True)
+                else:
+                    h.write_json(marker, {})
+                self.write_export([current])
+                remote = API([row(previous)])
+                with patch.object(h, 'api_client', return_value=remote) as api, \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    h.run_sync(self.cfg)
+                api.assert_called_once_with()
+                self.assertTrue(remote.reads)
+                self.assertFalse(remote.posts)
+                self.assertFalse(remote.deletes)
+
+    def test_explicit_upload_of_old_verified_record_still_checks_remote(self):
+        h.set_status(self.db, self.r, 'verified')
+        h.write_json(self.state / 'last_sync_comparison.json', {})
+        remote = API([row(self.r)])
+        with patch.object(h, 'api_client', return_value=remote) as api, \
+                patch('builtins.input', return_value='UPLOAD'), contextlib.redirect_stdout(io.StringIO()):
+            h.run_sync(self.cfg, self.r.key)
+        api.assert_called_once_with()
+        self.assertTrue(remote.reads)
+        self.assertFalse(remote.posts)
+        self.assertFalse(remote.deletes)
+        summary = json.loads((self.state / 'last_run.json').read_text())
+        self.assertEqual(summary['results'], {self.r.key: 'verified'})
+
+    def test_login_failure_rolls_back_local_lbm_merge_and_allows_later_recovery(self):
+        h.set_status(self.db, self.r, 'verified', 'previous verification')
+        before = dict(h.state_row(self.db, self.r))
+        h.write_json(self.state / 'last_sync_comparison.json', {})
+        h.write_json(self.state / 'last_run.json', {'previous': 'summary'})
+        old_summary = (self.state / 'last_run.json').read_bytes()
+        enriched = h.Measurement(AT, 70, 23.5, 'PICOOC', lbm=53.55)
+        other = h.Measurement(AT + timedelta(hours=1), 71, 24, 'PICOOC')
+        self.write_export([enriched, other])
+        source = (self.inbox / 'health.json').read_bytes()
+        with patch.object(h, 'api_client', side_effect=TimeoutError('Unavailable login')) as api, \
+                contextlib.redirect_stdout(io.StringIO()), self.assertRaises(TimeoutError):
+            h.run_sync(self.cfg)
+        api.assert_called_once_with()
+        self.assertEqual(dict(h.state_row(self.db, self.r)), before)
+        self.assertEqual((self.state / 'last_run.json').read_bytes(), old_summary)
+        remote = API([row(other)])
+        self.sync(remote)
+        self.assertEqual(json.loads(h.state_row(self.db, self.r)['payload'])['lbm'], 53.55)
+        self.assertEqual(h.get_status(self.db, other), 'verified')
+        self.assertFalse(remote.posts)
+        self.assertFalse(remote.deletes)
+        self.assertEqual((self.inbox / 'health.json').read_bytes(), source)
 
     def test_previously_verified_is_queried_and_detects_change(self):
         h.set_status(self.db, self.r, 'verified')
