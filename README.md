@@ -6,7 +6,7 @@
 
 ## 验证状态
 
-当前版本包含 161 项离线单元测试，涵盖合并 JSON、单位转换、时区、时间配对、重复数据、已存在记录、上传超时、完整明细查询及历史替换。离线测试及 Python/Shell 语法检查结果见 `TEST_REPORT.md`。
+当前版本包含 182 项离线单元测试，涵盖合并 JSON、单位转换、时区、时间配对、重复数据、已存在记录、上传超时、完整明细查询、历史替换、SQLite 连接生命周期、配置校验和 CLI 锁冲突。2026-10-02 开发回归与 2026-09-29 历史设备验证分别记录在 [TEST_REPORT.md](TEST_REPORT.md)，最新离线输出见 [docs/development-test-output.txt](docs/development-test-output.txt)。
 
 当前数据来源仅为 Apple 健康。最新真实 JSON 已包含 PICOOC 写入的体重、体脂率、BMI 和瘦体重；其中前三项上传 Garmin，瘦体重保留在原始文件、本地测量状态及备份中。水分、骨量、肌肉量等缺少原始数据时无法补齐。四字段快捷指令及获取范围见 [SHORTCUTS.md](SHORTCUTS.md)。预览会显示每个可用指标的覆盖条数，BMI 和瘦体重后到仍使用原测量 ID，对账后按指定记录补 BMI。
 
@@ -34,12 +34,15 @@ HealthGarminSync/
 │   ├── test_exports.py      合并导出与数据兼容测试
 │   ├── test_reconciliation.py 远端对账、修复与恢复测试
 │   ├── test_replace_history.py 完整历史替换与中断保护测试
-│   └── test_remote_details.py 完整明细与每日汇总区分测试
+│   ├── test_remote_details.py 完整明细与每日汇总区分测试
+│   ├── test_cli.py          配置校验与 CLI 锁冲突测试
+│   └── test_database.py     SQLite 连接生命周期测试
 ├── samples/health.example.json  带 demo 标记，禁止上传
 ├── docs/
 │   ├── SOURCES.md          实现依据
-│   ├── offline-test-output.txt  当前离线测试输出
-│   └── offline-cli-smoke.txt    当前 CLI 冒烟测试输出
+│   ├── offline-test-output.txt  2026-09-29 离线测试输出
+│   ├── offline-cli-smoke.txt    2026-09-29 CLI 冒烟测试输出
+│   └── development-test-output.txt 最新开发离线回归输出
 └── TEST_REPORT.md           当前版本验证报告
 ```
 
@@ -396,6 +399,8 @@ tail -n 80 state/agent.err.log
 | 体脂输出 0.x 报错 | 与健康显示对照后，明确选择 fraction；不要盲目乘 100 |
 | 缺少体脂 | 可作为纯体重历史同步；出现 WAIT 时检查多候选配对歧义 |
 | BMI 后到 | compare 列为 repair；按指定记录修复，自动 run 不删除原记录 |
+| 配置类型错误或 settings 被拒绝 | enabled 必须是 JSON 布尔值 true/false，不能是字符串；类型错误会在远端处理前被拒绝，settings 校验失败保留原配置 |
+| 显式命令提示“未执行”并返回 2 | run.lock 已被其他进程持有，等待该进程结束后再执行；定时 run 遇到同样冲突会跳过并返回 0 |
 | 401/403/验证码失败 | 检查中国区登录和网络；运行 login；不关闭双重验证、不连续快速重试 |
 | 429 | 停止主动重试，稍后再核对；不要增加轮询频率 |
 | 上传超时 | 检查 uncertain；先在 Garmin 查看，再决定 resolve，别删 SQLite 去“重置” |

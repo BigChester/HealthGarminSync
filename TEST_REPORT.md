@@ -1,10 +1,20 @@
 # 当前版本验证报告
 
-验证日期：2026-09-29。版本：完整明细对账与历史替换版。导出 schema_version 为 2，仍兼容 1。
+最新开发离线回归日期：2026-10-02；历史设备验证日期：2026-09-29。版本：完整明细对账与历史替换版。导出 schema_version 为 2，仍兼容 1。
 
 环境：macOS 27.0 / Python 3.14.7 / garminconnect 0.3.16。
 
-## 验证结果
+## 2026-10-02 开发离线回归
+
+此次开发验证使用临时目录与模拟 Garmin API，未执行新的真实 Garmin 操作、LaunchAgent 注册或后台 TCC 权限验收；下方 2026-09-29 的设备事实与证据保持历史记录。
+
+- 182 项离线单元测试全部通过，0 失败：原有 161 项，加 7 项 SQLite 连接生命周期、1 项 uncertain 不重发回归及 13 项配置/CLI 测试。最新输出见 [docs/development-test-output.txt](docs/development-test-output.txt)；原 docs/offline-test-output.txt 和 docs/offline-cli-smoke.txt 保留为历史证据。
+- 显式垃圾回收后 SQLite ResourceWarning 为 0，正常、异常及提前返回路径均关闭连接。
+- 配置类型错误在远端处理前拒绝；enabled 仅接受 JSON 布尔值，settings 校验失败保留原配置。
+- run.lock 冲突时，显式命令返回 2 并提示“未执行”；定时 run 跳过并返回 0。
+- 关键可靠性改动已由独立 subagent 审查。本轮结果不代表新的真实账号或设备验收。
+
+## 2026-09-29 历史验证结果
 
 - 161 项离线单元测试通过，0 失败；输出见 docs/offline-test-output.txt。
 - 主程序、完整替换模块和所有测试的 Python 语法检查通过；bash -n setup.sh hg 通过。
