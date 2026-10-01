@@ -467,6 +467,14 @@ def api_client(interactive: bool = False):
         # Do not print raw exception text: upstream URLs can contain tickets.
         code = safe_exception(exc)
         raise SafeError(f"Garmin 登录/令牌恢复失败：{code}。网络正常后运行 ./hg login。") from exc
+    if interactive:
+        if not api.client.di_token:
+            raise SafeError("Garmin 登录未取得可恢复的令牌；请稍后重新运行 ./hg login。")
+        try:
+            api.client.dump(str(token_dir))
+        except Exception as exc:
+            raise SafeError(f"Garmin 令牌保存失败：{safe_exception(exc)}。"
+                            "检查 state/tokens 权限和磁盘后运行 ./hg login。") from exc
     return GarminMeasurementAPI(api)
 
 
