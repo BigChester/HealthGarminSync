@@ -1235,6 +1235,35 @@ def show_preview(cfg: dict[str, Any]) -> list[Measurement]:
     return records
 
 
+def guard_command_logging(handler):
+    """Defer this owned handler's errors without exposing raw logging diagnostics."""
+    failure = None
+    original_emit = handler.emit
+
+    def failed(record=None):
+        nonlocal failure
+        if failure is None:
+            failure = type(sys.exc_info()[1]).__name__
+            try:
+                print("同步日志未保存：", failure, "；请检查 state/sync.log 和轮换文件。", file=sys.stderr)
+            except Exception:
+                pass
+
+    def emit(record):
+        if failure is None:
+            try:
+                original_emit(record)
+            except Exception:
+                failed()
+
+    def check():
+        if failure is not None:
+            raise SafeError(f"同步日志写入/轮换失败：{failure}；请检查 state/sync.log 和轮换文件。")
+
+    handler.handleError, handler.emit = failed, emit
+    return check
+
+
 def finish_run_attempt(attempt: dict[str, Any], preserve_error: bool = False) -> None:
     attempt["finished_at"] = now().isoformat()
     try:
@@ -1242,12 +1271,15 @@ def finish_run_attempt(attempt: dict[str, Any], preserve_error: bool = False) ->
     except BaseException as exc:
         if not preserve_error:
             raise
-        detail = safe_exception(exc)
-        print("运行结束证据未保存：", detail, file=sys.stderr)
-        LOG.error("Run attempt evidence not saved: %s", detail)
+        detail = type(exc).__name__
+        try:
+            print("运行结束证据未保存：", detail, file=sys.stderr)
+            LOG.error("Run attempt evidence not saved: %s", detail)
+        except Exception:
+            pass
 
 
-def run_with_attempt() -> None:
+def run_with_attempt(*, check_logging=None) -> None:
     """Record only a CLI run whose caller already holds the exclusive run lock."""
     attempt = {"outcome": "running", "started_at": now().isoformat(),
                "finished_at": None, "stage": "config", "error_type": None}
@@ -1257,6 +1289,8 @@ def run_with_attempt() -> None:
         attempt["stage"] = "sync"
         write_json(STATE / "last_attempt.json", attempt)
         run_sync(cfg)
+        if check_logging is not None:
+            check_logging()
     except KeyboardInterrupt as exc:
         attempt.update(outcome="interrupted", error_type=safe_exception(exc))
         finish_run_attempt(attempt, preserve_error=True)
@@ -1595,20 +1629,30 @@ def main() -> int:
 
     def report_error(exc: BaseException, *, log: bool = False) -> int:
         if isinstance(exc, KeyboardInterrupt):
-            print("已中断。上传中断的记录不会盲目重发。", file=sys.stderr)
+            try:
+                print("已中断。上传中断的记录不会盲目重发。", file=sys.stderr)
+            except Exception:
+                pass
             return 130
         if isinstance(exc, SafeError):
-            print("停止：", exc, file=sys.stderr)
+            text = ("停止：", exc)
             message, values = "%s", (exc,)
         else:
             detail = safe_exception(exc)
-            print("错误：", detail, "。请检查配置/网络；先核对 Garmin 再重试。", file=sys.stderr)
+            text = ("错误：", detail, "。请检查配置/网络；先核对 Garmin 再重试。")
             message, values = "Unhandled %s", (detail,)
+        try:
+            print(*text, file=sys.stderr)
+        except Exception:
+            pass
         if log:
             try:
                 LOG.error(message, *values)
             except Exception as failure:
-                print("错误日志未保存：", type(failure).__name__, file=sys.stderr)
+                try:
+                    print("错误日志未保存：", type(failure).__name__, file=sys.stderr)
+                except Exception:
+                    pass
         return 2
 
     primary_result = None
@@ -1627,16 +1671,19 @@ def main() -> int:
             try:
                 owned_handler = RotatingFileHandler(
                     STATE / "sync.log", maxBytes=1_000_000, backupCount=3, encoding="utf-8")
+                check_logging = guard_command_logging(owned_handler)
                 logging.basicConfig(level=logging.INFO, handlers=[owned_handler],
                                     format="%(asctime)s %(levelname)s %(message)s")
                 if args.command == "init":
                     init_config(args)
+                    check_logging()
                     return 0
                 if args.command == "run":
-                    run_with_attempt()
+                    run_with_attempt(check_logging=check_logging)
                     return 0
                 if args.command == "uninstall-agent":
                     manage_agent(False)
+                    check_logging()
                     return 0
                 cfg = config()
                 if args.command == "inspect": inspect_files(cfg)
@@ -1677,6 +1724,7 @@ def main() -> int:
                     print("仅查询，响应保存到：", p)
                     print(json.dumps(obj, ensure_ascii=False, indent=2))
                 elif args.command == "resolve": resolve_record(args)
+                check_logging()
             except (Exception, KeyboardInterrupt) as exc:
                 primary_result = report_error(exc, log=owned_handler is not None)
                 return primary_result

@@ -10,13 +10,28 @@ import subprocess
 import sys
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import health_garmin as h
 import test_diagnostics as fixtures
 from test_reconciliation import API, row
 
 SECRET = fixtures.SECRET
+
+
+@contextlib.contextmanager
+def isolated_logging():
+    root = logging.getLogger()
+    handlers, level = list(root.handlers), root.level
+    root.handlers = []
+    try:
+        yield
+    finally:
+        for handler in root.handlers:
+            if handler not in handlers:
+                handler.close()
+        root.handlers = handlers
+        root.setLevel(level)
 
 
 class RunAttemptTests(unittest.TestCase):
@@ -38,6 +53,125 @@ class RunAttemptTests(unittest.TestCase):
         finally:
             os.umask(old_umask)
         return result, output.getvalue(), errors.getvalue()
+
+    def run_with_logging(self, command='run'):
+        output, errors = io.StringIO(), io.StringIO()
+        old_umask = os.umask(0o077)
+        try:
+            with isolated_logging(), patch.object(sys, 'argv', ['health_garmin.py', command]), \
+                    contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
+                result = h.main()
+        finally:
+            os.umask(old_umask)
+        return result, output.getvalue(), errors.getvalue()
+
+    def test_command_log_guard_safely_latches_write_and_flush_errors_but_preserves_interrupt(self):
+        record = logging.LogRecord('health_garmin', logging.INFO, '', 0, '%s', (SECRET,), None)
+        previous_raise = logging.raiseExceptions
+        for method in ('write', 'flush'):
+            with self.subTest(method=method):
+                handler = h.RotatingFileHandler(self.state / 'guard.log', encoding='utf-8')
+                check = h.guard_command_logging(handler)
+                errors = io.StringIO()
+                with contextlib.closing(handler), patch.object(handler.stream, method, side_effect=OSError(SECRET)) as failed, \
+                        contextlib.redirect_stderr(errors):
+                    handler.emit(record)
+                    handler.emit(record)
+                    self.assertEqual(failed.call_count, 1)
+                    with self.assertRaises(h.SafeError) as raised:
+                        check()
+                    self.assertIn('OSError', str(raised.exception))
+                    self.assertNotIn(SECRET, str(raised.exception))
+                self.assertEqual(errors.getvalue().count('同步日志未保存：'), 1)
+                self.assertNotIn(SECRET, errors.getvalue())
+                self.assertNotIn('Traceback', errors.getvalue())
+                self.assertNotIn('Arguments:', errors.getvalue())
+        handler = h.RotatingFileHandler(self.state / 'guard.log', encoding='utf-8')
+        check = h.guard_command_logging(handler)
+        primary = KeyboardInterrupt()
+        with contextlib.closing(handler), patch.object(handler.stream, 'write', side_effect=primary):
+            with self.assertRaises(KeyboardInterrupt) as raised:
+                handler.emit(record)
+            self.assertIs(raised.exception, primary)
+            check()
+        self.assertEqual(logging.raiseExceptions, previous_raise)
+
+    def test_command_log_failure_and_broken_notice_preserve_primary_exit_results(self):
+        factory = h.RotatingFileHandler
+
+        def create(*args, **kwargs):
+            handler = factory(*args, **kwargs)
+            handler.stream.write = Mock(side_effect=OSError(SECRET))
+            return handler
+
+        for primary, expected in ((h.SafeError('Controlled original failure'), 2), (KeyboardInterrupt(), 130)):
+            with self.subTest(expected=expected):
+                def sync(cfg):
+                    h.LOG.info('PRIVATE %s', SECRET)
+                    raise primary
+
+                with patch.object(h, 'RotatingFileHandler', side_effect=create), patch.object(h, 'run_sync', side_effect=sync):
+                    result, _, errors = self.run_with_logging()
+                self.assertEqual(result, expected)
+                self.assertEqual(self.attempt()['error_type'], type(primary).__name__)
+                self.assertEqual(self.attempt()['outcome'], 'interrupted' if expected == 130 else 'failed')
+                self.assertNotIn(SECRET, errors)
+                self.assertNotIn('Traceback', errors)
+                self.assertEqual(errors.count('同步日志未保存：'), 1)
+                broken_errors = Mock()
+                broken_errors.write.side_effect = BrokenPipeError(SECRET)
+                with isolated_logging(), patch.object(sys, 'argv', ['health_garmin.py', 'run']), \
+                        patch.object(sys, 'stderr', broken_errors), patch.object(h, 'RotatingFileHandler', side_effect=create), \
+                        patch.object(h, 'run_sync', side_effect=sync):
+                    old_umask = os.umask(0o077)
+                    try:
+                        self.assertEqual(h.main(), expected)
+                    finally:
+                        os.umask(old_umask)
+                self.assertEqual(self.attempt()['error_type'], type(primary).__name__)
+
+    def test_late_log_failure_survives_terminal_save_and_notice_failure(self):
+        primary = h.SafeError('Controlled log failure')
+        original_write = h.write_json
+
+        def write(path, value):
+            if path == self.state / 'last_attempt.json' and value['outcome'] == 'failed':
+                raise OSError(SECRET)
+            return original_write(path, value)
+
+        broken_errors = Mock()
+        broken_errors.write.side_effect = BrokenPipeError(SECRET)
+        for enabled in (False, True):
+            with self.subTest(enabled=enabled):
+                self.cfg['enabled'] = enabled
+                self.save_config()
+                with patch.object(h, 'run_sync'), patch.object(h, 'write_json', side_effect=write), \
+                        patch.object(h.LOG, 'error', side_effect=OSError(SECRET)), \
+                        patch.object(sys, 'stderr', broken_errors), self.assertRaises(h.SafeError) as raised:
+                    h.run_with_attempt(check_logging=Mock(side_effect=primary))
+                self.assertIs(raised.exception, primary)
+                self.assertEqual(json.loads((self.state / 'last_attempt.json').read_text())['outcome'], 'running')
+
+    def test_other_successful_commands_check_owned_logging_before_returning(self):
+        factory = h.RotatingFileHandler
+
+        def create(*args, **kwargs):
+            handler = factory(*args, **kwargs)
+            handler.stream.write = Mock(side_effect=OSError(SECRET))
+            return handler
+
+        def command(*args):
+            h.LOG.info('PRIVATE %s', SECRET)
+
+        for name, helper in (('init', 'init_config'), ('uninstall-agent', 'manage_agent'), ('status', 'show_status')):
+            with self.subTest(command=name), patch.object(h, 'RotatingFileHandler', side_effect=create), \
+                    patch.object(h, helper, side_effect=command):
+                result, _, errors = self.run_with_logging(name)
+                self.assertEqual(result, 2)
+                self.assertNotIn(SECRET, errors)
+                self.assertNotIn('Traceback', errors)
+                self.assertEqual(errors.count('同步日志未保存：'), 1)
+                self.assertFalse((self.state / 'last_attempt.json').exists())
 
     def attempt(self):
         value = json.loads((self.state / 'last_attempt.json').read_text())

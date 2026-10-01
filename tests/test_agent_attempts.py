@@ -20,7 +20,8 @@ import agent_runner as r
 import diagnostics as d
 import health_garmin as h
 import test_diagnostics as fixtures
-from test_reconciliation import API
+import test_run_attempts as run_fixtures
+from test_reconciliation import API, row
 
 
 class AgentAttemptTests(unittest.TestCase):
@@ -128,6 +129,93 @@ class AgentAttemptTests(unittest.TestCase):
         self.assertEqual(self.value()['outcome'], 'completed')
         self.assertEqual(json.loads((self.state / 'last_attempt.json').read_text())['outcome'], 'preview')
         self.assertEqual(self.last.read_bytes(), old_last)
+
+    def test_sync_log_rollover_failure_finishes_batch_but_reports_failed_evidence(self):
+        first = h.load_measurements(self.cfg)[1][0]
+        second = h.Measurement(first.at + timedelta(hours=1), 74, 27, first.source)
+        data = json.loads(self.export.read_text())
+        for metric, value in (('weight', second.weight), ('body_fat', f'{second.fat}%')):
+            data['metrics'][metric].append({'at': second.at.isoformat(), 'value': value, 'source': second.source})
+        self.export.write_text(json.dumps(data))
+        source, tokens = self.export.read_bytes(), (self.tokens / 'oauth.json').read_bytes()
+        log = self.state / 'sync.log'
+        log.write_bytes(b'x' * 1_000_000)
+        (self.state / 'sync.log.2').write_text('Retained older log')
+        (self.state / 'sync.log.3').mkdir()
+        api = API([row(first)])
+        original_write = h.write_json
+        terminal = []
+
+        def write(path, value):
+            if path == self.state / 'last_attempt.json' and value['outcome'] == 'failed':
+                with (self.state / 'run.lock').open('a') as probe, self.assertRaises(BlockingIOError):
+                    fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                terminal.append(value['outcome'])
+            return original_write(path, value)
+
+        with run_fixtures.isolated_logging(), patch.object(h, 'api_client', return_value=api), \
+                patch.object(h, 'write_json', side_effect=write):
+            self.assertEqual(self.run_agent()[0], 2)
+        self.assertEqual(terminal, ['failed'])
+        self.assertEqual(self.value()['outcome'], 'failed')
+        self.assertEqual(json.loads((self.state / 'last_attempt.json').read_text())['outcome'], 'failed')
+        self.assertEqual(log.stat().st_size, 1_000_000)
+        self.assertEqual(len(api.posts), 1)
+        self.assertFalse(api.deletes)
+        with contextlib.closing(h.database()) as db:
+            self.assertEqual(h.get_status(db, first), 'verified')
+            self.assertEqual(h.get_status(db, second), 'verified')
+        summary = json.loads(self.last.read_text())
+        self.assertEqual(summary['results'], {first.key: 'verified', second.key: 'verified'})
+        self.assertEqual(summary['local_status_counts'], {'verified': 2})
+        error_log = (self.state / 'agent.err.log').read_text()
+        self.assertEqual(error_log.count('同步日志未保存：'), 1)
+        self.assertNotIn('Traceback', error_log)
+        self.assertNotIn('Arguments:', error_log)
+        self.assertNotIn(fixtures.SECRET, error_log)
+        code, _, checks = self.report()
+        self.assertEqual(code, 2)
+        self.assertEqual(checks['last_attempt']['status'], 'error')
+        self.assertEqual(checks['last_agent_attempt']['status'], 'error')
+        self.assertEqual(checks['last_run']['status'], 'info')
+        self.assertEqual((self.export.read_bytes(), (self.tokens / 'oauth.json').read_bytes()), (source, tokens))
+
+    def test_sync_log_failure_does_not_retry_an_uncertain_upload_and_recovers(self):
+        measurement = h.load_measurements(self.cfg)[1][0]
+        source, tokens = self.export.read_bytes(), (self.tokens / 'oauth.json').read_bytes()
+        (self.state / 'sync.log').write_bytes(b'x' * 1_000_000)
+        (self.state / 'sync.log.2').write_text('Retained older log')
+        obstacle = self.state / 'sync.log.3'
+        obstacle.mkdir()
+        api = API()
+        api.visible = False
+        native_process = h.process_record
+
+        def process(*args, **kwargs):
+            return native_process(*args, **kwargs, sleep=lambda _: None)
+
+        for _ in range(2):
+            with run_fixtures.isolated_logging(), patch.object(h, 'api_client', return_value=api), \
+                    patch.object(h, 'process_record', side_effect=process):
+                self.assertEqual(self.run_agent()[0], 2)
+            self.assertEqual(len(api.posts), 1)
+            self.assertFalse(api.deletes)
+            self.assertEqual(self.value()['outcome'], 'failed')
+            with contextlib.closing(h.database()) as db:
+                self.assertEqual(h.get_status(db, measurement), 'uncertain')
+            self.assertEqual(json.loads(self.last.read_text())['local_status_counts'], {'uncertain': 1})
+            self.assertEqual(self.report()[0], 2)
+        obstacle.rmdir()
+        api.rows.append(row(measurement))
+        with run_fixtures.isolated_logging(), patch.object(h, 'api_client', return_value=api):
+            self.assertEqual(self.run_agent()[0], 0)
+        self.assertEqual(len(api.posts), 1)
+        self.assertFalse(api.deletes)
+        self.assertEqual(self.value()['outcome'], 'completed')
+        with contextlib.closing(h.database()) as db:
+            self.assertEqual(h.get_status(db, measurement), 'verified')
+        self.assertEqual(self.report()[0], 0)
+        self.assertEqual((self.export.read_bytes(), (self.tokens / 'oauth.json').read_bytes()), (source, tokens))
 
     def test_post_interruption_and_next_read_preserve_inflight_without_repeating_post(self):
         class InterruptedAPI(API):

@@ -209,7 +209,7 @@ class RunnerTests(TemporaryRunner):
 
     def test_manual_run_keeps_stdout_and_does_not_create_agent_logs(self):
         with patch.object(sys, 'argv', ['hg', 'run']), \
-                patch.object(h, 'run_with_attempt', side_effect=lambda: print('manual output')):
+                patch.object(h, 'run_with_attempt', side_effect=lambda **kwargs: print('manual output')):
             output = io.StringIO()
             previous_umask = os.umask(0o077)
             try:
