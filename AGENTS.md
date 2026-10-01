@@ -1,0 +1,16 @@
+# 项目开发约定
+
+- 使用 Git 管理项目，采用 `master` / `develop` / `feature/*` 分支模型。`master` 保存稳定版本，`develop` 集成开发改动，独立切片在 `feature/<主题>` 上开发、验证和提交，再合入 `develop`。
+- 按可独立审查的切片提交；每次提交只包含对应切片已完成并验证的改动。不要将多个无关切片混成一次提交。
+- 持续推进开发时，根据任务类型和难度调用 subagents，并自行选择模型和推理力度。独立检查可以并行；涉及同一段代码的修改按依赖顺序执行。
+- 文档、定位和小改动优先使用 GPT-6.1 Sol 的低或中等推理力度；复杂对账、恢复流程和数据一致性问题使用高推理力度，必要时使用 GPT-6 Astra。实现后由独立 subagent 审查关键改动。
+
+# 开发与验证
+
+- 项目是 Python 3.12+ 本地 CLI，入口为 `hg`，主程序为 `health_garmin.py`，完整历史替换逻辑在 `replace_history.py`。
+- 离线回归：`.venv/bin/python -m unittest discover -s tests -v`。无虚拟环境时可使用满足版本要求的 Python 运行离线测试。
+- Shell 语法检查：`bash -n setup.sh hg`。提交前运行 `git diff --check`。
+- 用临时目录和模拟 Garmin API 验证行为。日常开发不修改真实 `config.json`、`state/` 或 iCloud 导出，也不执行真实上传、删除、历史替换或后台任务注册；设备验收与线上操作需要用户明确指定。
+- 保持 `config.json`、`state/`、`.venv/` 和凭据不受 Git 跟踪。
+- 未确定的请求不能自动重发；判断缺失前必须取得完整称重明细。瘦体重仅本地保存，不映射为 Garmin 肌肉量。
+- 文档应区分当前离线验证与历史设备验收，不把模拟测试写成真实账号验证。
