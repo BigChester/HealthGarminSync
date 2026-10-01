@@ -382,6 +382,66 @@ class DoctorTests(unittest.TestCase):
                 self.assertEqual(report['status'], 'error')
                 self.assertEqual(checks['last_run']['status'], 'error')
 
+    def test_fresh_manual_run_does_not_hide_stale_background_entry(self):
+        current = h.now()
+        self.last.write_text(json.dumps({'run_at': current.isoformat(), 'results': {SECRET: 'verified'}}))
+        for age, severity in ((timedelta(hours=2), 'info'),
+                              (timedelta(hours=2, seconds=1), 'warn')):
+            with self.subTest(age=age):
+                stamp = (current - age).isoformat()
+                self.agent_attempt.write_text(json.dumps({'outcome': 'completed', 'started_at': stamp,
+                    'finished_at': stamp, 'stage': 'run', 'error_type': None}))
+                with patch.object(h, 'now', return_value=current):
+                    code, report, checks = self.report()
+                self.assertEqual(code, 0)
+                self.assertEqual(checks['agent_service']['status'], 'ok')
+                self.assertEqual(checks['last_run']['status'], 'info')
+                self.assertEqual(checks['last_agent_attempt']['status'], severity)
+                self.assertEqual(report['status'], 'warning' if severity == 'warn' else 'ok')
+                if severity == 'warn':
+                    self.assertIn('超过两小时', checks['last_agent_attempt']['hint'])
+
+    def test_stale_background_failure_keeps_error_and_disabled_entry_has_no_age_reminder(self):
+        stamp = (h.now() - timedelta(days=2)).isoformat()
+        for enabled in (True, False):
+            self.cfg['enabled'] = enabled
+            self.save_config()
+            for outcome in ('completed', 'failed', 'interrupted'):
+                with self.subTest(enabled=enabled, outcome=outcome):
+                    self.agent_attempt.write_text(json.dumps({'outcome': outcome, 'started_at': stamp,
+                        'finished_at': stamp, 'stage': 'run',
+                        'error_type': {'completed': None, 'failed': 'OSError',
+                                       'interrupted': 'KeyboardInterrupt'}[outcome]}))
+                    code, _, checks = self.report()
+                    check = checks['last_agent_attempt']
+                    self.assertEqual(code, 0 if outcome == 'completed' else 2)
+                    self.assertEqual(check['status'], 'warn' if enabled and outcome == 'completed'
+                                     else 'info' if outcome == 'completed' else 'error')
+                    self.assertEqual('hint' in check, enabled)
+
+    def test_stale_unfinished_entry_only_reminds_without_claiming_it_stopped(self):
+        stamp = (h.now() - timedelta(hours=3)).isoformat()
+        self.agent_attempt.write_text(json.dumps({'outcome': 'running', 'started_at': stamp,
+            'finished_at': None, 'stage': 'run', 'error_type': None}))
+        code, _, checks = self.report()
+        check = checks['last_agent_attempt']
+        self.assertEqual(code, 0)
+        self.assertEqual(check['status'], 'warn')
+        self.assertIn('可能仍在运行或曾被中断', check['message'])
+        self.assertIn('超过两小时', check['hint'])
+
+    def test_recent_entry_finish_is_fresh_even_when_it_started_hours_ago(self):
+        current = h.now()
+        self.agent_attempt.write_text(json.dumps({'outcome': 'completed',
+            'started_at': (current - timedelta(hours=3)).isoformat(),
+            'finished_at': current.isoformat(), 'stage': 'run', 'error_type': None}))
+        with patch.object(h, 'now', return_value=current):
+            code, report, checks = self.report()
+        self.assertEqual(code, 0)
+        self.assertEqual(report['status'], 'ok')
+        self.assertEqual(checks['last_agent_attempt']['status'], 'info')
+        self.assertNotIn('hint', checks['last_agent_attempt'])
+
     def test_excessively_nested_local_json_is_reported_without_traceback(self):
         nested = '[' * 2000 + '0' + ']' * 2000
         for path, identifier in ((self.config_path, 'config'), (self.last, 'last_run'), (self.export, 'inbox')):

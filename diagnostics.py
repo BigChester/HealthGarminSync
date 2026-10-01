@@ -22,6 +22,7 @@ REVIEW_RESULTS = frozenset(('repair', 'replace', 'conflict', 'verified_conflict'
 PHASES = frozenset(('verified', 'deleted_verified', 'closed_partial', 'uncertain',
                     'deleting', 'deleted', 'uploading', 'replacing'))
 TERMINAL_PHASES = frozenset(('verified', 'deleted_verified', 'closed_partial'))
+STALE_SECONDS = 7200
 
 
 def _json(path, reject_symlink=True):
@@ -189,7 +190,7 @@ def collect():
                 raise ValueError('invalid last run')
             ran_at = h.aware(last['run_at'])
             counts = dict(Counter(last['results'].values()))
-            stale = cfg is not None and cfg['enabled'] and (h.now() - ran_at).total_seconds() > 7200
+            stale = cfg is not None and cfg['enabled'] and (h.now() - ran_at).total_seconds() > STALE_SECONDS
             if UNCERTAIN_RESULTS.intersection(counts):
                 status = 'error'
                 message = '最近运行摘要包含请求结果未确定的记录。'
@@ -241,7 +242,14 @@ def collect():
                         'completed': '最近后台入口阶段已结束；不代表同步完成或全部记录已验证。',
                         'failed': '最近后台入口失败；请查看本地日志并核对运行摘要。',
                         'interrupted': '最近后台入口已中断；先核对运行摘要与 Garmin，不要直接重发。'}
-            add('last_agent_attempt', status, messages[outcome], data=attempt)
+            latest = h.aware(attempt['finished_at'] or attempt['started_at'])
+            stale = cfg is not None and cfg['enabled'] and (h.now() - latest).total_seconds() > STALE_SECONDS
+            hint = None
+            if stale:
+                if status == 'info':
+                    status = 'warn'
+                hint = '后台入口摘要距今超过两小时；请核对定时任务、设备状态与本地日志。'
+            add('last_agent_attempt', status, messages[outcome], hint, data=attempt)
         except FileNotFoundError:
             enabled = cfg is not None and cfg['enabled']
             add('last_agent_attempt', 'warn' if enabled else 'info',
