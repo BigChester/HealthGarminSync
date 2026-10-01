@@ -28,6 +28,7 @@ import re
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import time
 from typing import Any
 
@@ -1325,25 +1326,69 @@ def agent_plist() -> dict[str, Any]:
             "StandardErrorPath": "/dev/null"}
 
 
-def manage_agent(install: bool, cfg: dict[str, Any]) -> None:
+def agent_service_command(action: str, *arguments: str, checked: bool = True) -> int:
+    try:
+        result = subprocess.run(["/bin/launchctl", action, *arguments],
+                                capture_output=True, timeout=5)
+    except subprocess.TimeoutExpired as exc:
+        raise SafeError(f"任务 {action} 超时（5 秒）；未确认操作完成。") from exc
+    except OSError as exc:
+        raise SafeError(f"任务 {action} 无法执行：{type(exc).__name__}。") from exc
+    if checked and result.returncode != 0:
+        raise SafeError(f"任务 {action} 失败（返回码 {result.returncode}）；未确认操作完成。")
+    return result.returncode
+
+
+def manage_agent(install: bool, cfg: dict[str, Any] | None = None) -> None:
     if sys.platform != "darwin":
         raise SafeError("LaunchAgent 仅能在 macOS 安装。")
     path = Path.home() / "Library/LaunchAgents" / f"{LABEL}.plist"
     domain = f"gui/{os.getuid()}"
-    if install and not cfg.get("enabled"):
+    if install and (cfg is None or not cfg.get("enabled")):
         raise SafeError("先完成试传并运行 ./hg enable，然后安装定时任务。")
     # Only this tool's known service label is affected; no system-wide changes.
-    subprocess.run(["/bin/launchctl", "bootout", f"{domain}/{LABEL}"], capture_output=True)
     if not install:
+        agent_service_command("bootout", f"{domain}/{LABEL}")
         path.unlink(missing_ok=True)
         print("已卸载本工具的定时任务；本地状态、导出和 Garmin 数据均保留。")
         return
-    path.parent.mkdir(parents=True, exist_ok=True)
+    document = plistlib.dumps(agent_plist())
     if path.is_symlink():
         raise SafeError("拒绝覆盖符号链接 plist。")
-    path.write_bytes(plistlib.dumps(agent_plist()))
-    path.chmod(0o600)
-    subprocess.run(["/bin/launchctl", "bootstrap", domain, str(path)], check=True)
+    if path.exists() and not path.is_file():
+        raise SafeError("拒绝覆盖非普通文件 plist。")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    draft = None
+    try:
+        stream = tempfile.NamedTemporaryFile(mode="wb", dir=path.parent,
+                                             prefix=f".{LABEL}.", suffix=".tmp", delete=False)
+        try:
+            draft = Path(stream.name)
+            os.fchmod(stream.fileno(), 0o600)
+            stream.write(document)
+            stream.flush()
+        finally:
+            preserve_error = sys.exc_info()[0] is not None
+            try:
+                stream.close()
+            except BaseException as exc:
+                if not preserve_error:
+                    raise
+                print("临时任务配置关闭失败：", type(exc).__name__, file=sys.stderr)
+        if agent_service_command("print", f"{domain}/{LABEL}", checked=False) == 0:
+            agent_service_command("bootout", f"{domain}/{LABEL}")
+        draft.replace(path)
+        draft = None
+        agent_service_command("bootstrap", domain, str(path))
+    finally:
+        if draft is not None:
+            preserve_error = sys.exc_info()[0] is not None
+            try:
+                draft.unlink(missing_ok=True)
+            except BaseException as exc:
+                if not preserve_error:
+                    raise
+                print("临时任务配置清理失败：", type(exc).__name__, file=sys.stderr)
     print("定时任务已注册：当前用户登录时，每 30 分钟尝试处理。")
     print("首次检查可能与本命令的锁重叠。稍后可手动运行 ./hg run 验证。")
 
@@ -1454,6 +1499,9 @@ def main() -> int:
             if args.command == "run":
                 run_with_attempt()
                 return 0
+            if args.command == "uninstall-agent":
+                manage_agent(False)
+                return 0
             cfg = config()
             if args.command == "inspect": inspect_files(cfg)
             elif args.command == "preview": show_preview(cfg)
@@ -1473,8 +1521,7 @@ def main() -> int:
             elif args.command == "resume-operation": resume_operation(args)
             elif args.command == "settings": update_settings(args, cfg)
             elif args.command == "status": show_status(cfg)
-            elif args.command in ("install-agent", "uninstall-agent"):
-                manage_agent(args.command == "install-agent", cfg)
+            elif args.command == "install-agent": manage_agent(True, cfg)
             elif args.command == "disable":
                 cfg["enabled"] = False; write_json(CONFIG, cfg)
                 print("自动写入已关闭。要停掉定时检查，再运行 ./hg uninstall-agent。")
