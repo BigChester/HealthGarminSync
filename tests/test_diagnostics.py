@@ -92,6 +92,7 @@ class DoctorTests(unittest.TestCase):
         stdout, stderr = io.StringIO(), io.StringIO()
         original_import = builtins.__import__
         original_read = Path.read_text
+        original_open = h.open_regular_text
 
         def offline_import(name, *args, **kwargs):
             if name.split('.')[0] in ('garminconnect', 'requests', 'curl_cffi', 'garth'):
@@ -102,6 +103,12 @@ class DoctorTests(unittest.TestCase):
             if self.tokens in path.parents:
                 raise AssertionError('token content read')
             return original_read(path, *args, **kwargs)
+
+        def open_readonly_without_tokens(path, mode, *args, **kwargs):
+            path = Path(path)
+            if mode != 'r' or path == self.tokens or self.tokens in path.parents:
+                raise AssertionError('unsafe JSON file access')
+            return original_open(path, mode, *args, **kwargs)
 
         with contextlib.ExitStack() as stack:
             stack.enter_context(patch.object(sys, 'argv', ['health_garmin.py', *arguments]))
@@ -115,6 +122,7 @@ class DoctorTests(unittest.TestCase):
             for name in ('mkdir', 'chmod', 'write_text', 'write_bytes', 'replace', 'touch', 'unlink'):
                 stack.enter_context(patch.object(Path, name, side_effect=AssertionError('filesystem mutation')))
             stack.enter_context(patch.object(Path, 'read_text', read_without_tokens))
+            stack.enter_context(patch.object(h, 'open_regular_text', open_readonly_without_tokens))
             stack.enter_context(patch('builtins.__import__', side_effect=offline_import))
             stack.enter_context(contextlib.redirect_stdout(stdout))
             stack.enter_context(contextlib.redirect_stderr(stderr))
@@ -134,6 +142,86 @@ class DoctorTests(unittest.TestCase):
         report = json.loads(output)
         self.assertEqual(result, 2 if report['summary']['error'] else 0)
         return result, report, {item['id']: item for item in report['checks']}
+
+    def test_fifo_json_reads_finish_with_safe_errors_in_real_cli(self):
+        script = '''import os, pathlib, socket, sys
+from unittest.mock import patch
+sys.path[:0] = [sys.argv[1], str(pathlib.Path(sys.argv[1]) / 'tests')]
+from test_diagnostics import DoctorTests
+import health_garmin as h
+fixture = DoctorTests()
+fixture.setUp()
+try:
+    name, identifier = sys.argv[2:]
+    path = fixture.config_path if name == 'config.json' else fixture.state / name
+    path.parent.mkdir(exist_ok=True)
+    if path.exists():
+        path.unlink()
+    os.mkfifo(path, 0o600)
+    stamp = h.now()
+    with patch.object(h, 'now', return_value=stamp), \\
+         patch.object(socket, 'create_connection', side_effect=AssertionError('network called')), \\
+         patch.object(socket.socket, 'connect', side_effect=AssertionError('network called')):
+        code, _, checks = fixture.report()
+        fixture.assertEqual(code, 2)
+        fixture.assertEqual(checks[identifier]['status'], 'error')
+        text_code, _ = fixture.invoke('doctor')
+        fixture.assertEqual(text_code, 2)
+        if identifier != 'last_run':
+            fixture.assertEqual(checks['last_run']['status'], 'info')
+        fixture.assertEqual(checks['last_agent_attempt']['status'], 'info')
+finally:
+    fixture.doCleanups()
+'''
+        for name, identifier in (('config.json', 'config'), ('last_attempt.json', 'last_attempt'),
+                                 ('last_run.json', 'last_run'), ('operations/test.json', 'operations')):
+            with self.subTest(path=name), tempfile.TemporaryDirectory() as isolated:
+                child = subprocess.Popen([sys.executable, '-B', '-c', script,
+                    str(Path(__file__).resolve().parents[1]), name, identifier], cwd=isolated,
+                    env={'HOME': isolated, 'TMPDIR': isolated}, stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE, text=True)
+                try:
+                    try:
+                        stdout, stderr = child.communicate(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        child.kill()
+                        child.communicate(timeout=2)
+                        self.fail('FIFO JSON read blocked the doctor command')
+                    self.assertEqual(child.returncode, 0, stdout + stderr)
+                finally:
+                    if child.poll() is None:
+                        child.kill()
+                    child.communicate(timeout=2)
+                    for pipe in (child.stdout, child.stderr):
+                        pipe.close()
+
+    def test_regular_config_symlink_remains_supported_without_writes(self):
+        target = self.root / 'linked-config.json'
+        self.config_path.replace(target)
+        self.config_path.symlink_to(target)
+        self.assertEqual(self.report()[0], 0)
+        self.assertEqual(self.invoke('doctor')[0], 0)
+
+    def test_nonregular_evidence_temporary_files_do_not_hide_healthy_completed_evidence(self):
+        for name in ('last_attempt.json.tmp', 'last_agent_attempt.json.tmp', 'last_run.json.tmp'):
+            path = self.state / name
+            path.write_text(SECRET)
+            self.assertEqual(self.report()[0], 0)
+            path.unlink()
+            for kind in ('fifo', 'directory'):
+                with self.subTest(path=name, kind=kind):
+                    os.mkfifo(path, 0o600) if kind == 'fifo' else path.mkdir()
+                    try:
+                        code, _, checks = self.report()
+                        text_code, output = self.invoke('doctor')
+                        self.assertEqual((code, text_code), (2, 2))
+                        self.assertEqual(checks['state']['status'], 'error')
+                        self.assertIn('state/' + name, checks['state']['hint'])
+                        self.assertIn('state/' + name, output)
+                        self.assertEqual(checks['last_run']['status'], 'info')
+                        self.assertEqual(checks['last_agent_attempt']['status'], 'info')
+                    finally:
+                        path.unlink() if kind == 'fifo' else path.rmdir()
 
     def test_healthy_setup_returns_parseable_safe_report_and_only_queries_service(self):
         result, report, checks = self.report()

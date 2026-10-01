@@ -30,7 +30,7 @@ def _json(path, reject_symlink=True):
     if reject_symlink and path.is_symlink():
         raise ValueError('symlink')
     try:
-        return json.loads(path.read_text(encoding='utf-8'))
+        return json.loads(h.read_regular_text(path, encoding='utf-8', reject_symlink=reject_symlink))
     except RecursionError as exc:
         raise ValueError('JSON nesting too deep') from exc
 
@@ -170,7 +170,8 @@ def collect():
             list(h.STATE.iterdir())
             state_available = True
             invalid_file = None
-            for name in ('run.lock', 'agent-log.lock', 'sync.log'):
+            for name in ('run.lock', 'agent-log.lock', 'sync.log', 'last_attempt.json.tmp',
+                         'last_agent_attempt.json.tmp', 'last_run.json.tmp'):
                 path = h.STATE / name
                 try:
                     mode = path.lstat().st_mode

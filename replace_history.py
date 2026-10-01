@@ -78,7 +78,7 @@ def close_verified_partial(path, cfg, api):
         if kind != 'matched':
             raise h.SafeError('此前上传无法读回匹配，不能关闭批次。')
         added.add(indices[0])
-    before = json.loads((Path(job['backup']) / 'remote-before.json').read_text())
+    before = json.loads(h.read_regular_text(Path(job['backup']) / 'remote-before.json'))
     untouched = [r for r in before['dateWeightList'] if str(r['samplePk']) not in removed]
     remaining = [r for i, r in enumerate(index.rows) if i not in added]
     # Older versions backed up dateRange's last-per-day response. A paused batch
@@ -152,7 +152,7 @@ def execute(args, cfg, api=None):
         path.resolve().relative_to((h.STATE / 'plans').resolve())
     except ValueError:
         raise h.SafeError('清单必须位于本项目 state/plans。')
-    saved = json.loads(path.read_text())
+    saved = json.loads(h.read_regular_text(path))
     for key in ('inbox', 'allowed_sources', 'weight_bare_unit', 'fat_bare_unit', 'pair_window_seconds'):
         if saved['config'].get(key) != cfg.get(key):
             raise h.SafeError('来源目录、单位或配对设置已改变，请重新对账。')

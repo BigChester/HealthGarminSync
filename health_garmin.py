@@ -72,13 +72,19 @@ def private_dir(path: Path) -> None:
     path.chmod(0o700)
 
 
-def open_regular_append(path, *, encoding=None, errors=None):
-    """Append only to a regular, non-symlink file without waiting for readers."""
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NONBLOCK | os.O_NOFOLLOW, 0o600)
+def open_regular_text(path, mode, *, encoding=None, errors=None, reject_symlink=True):
+    """Open a regular file without blocking or truncating an unchecked path."""
+    flags = {"r": os.O_RDONLY, "w": os.O_WRONLY | os.O_CREAT,
+             "a": os.O_WRONLY | os.O_CREAT | os.O_APPEND}[mode] | os.O_NONBLOCK
+    if reject_symlink:
+        flags |= os.O_NOFOLLOW
+    fd = os.open(path, flags, 0o600)
     try:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
-            raise SafeError("本地运行文件必须是普通文件；请运行 ./hg doctor 检查。")
-        return os.fdopen(fd, "a", encoding=encoding, errors=errors)
+            raise SafeError("本地文件必须是普通文件。")
+        if mode == "w":
+            os.ftruncate(fd, 0)
+        return os.fdopen(fd, mode, encoding=encoding, errors=errors)
     except BaseException:
         try:
             os.close(fd)
@@ -88,6 +94,15 @@ def open_regular_append(path, *, encoding=None, errors=None):
             except Exception:
                 pass
         raise
+
+
+def open_regular_append(path, *, encoding=None, errors=None):
+    return open_regular_text(path, "a", encoding=encoding, errors=errors)
+
+
+def read_regular_text(path, *, encoding="utf-8", reject_symlink=True):
+    with open_regular_text(path, "r", encoding=encoding, reject_symlink=reject_symlink) as stream:
+        return stream.read()
 
 
 def open_run_lock(path: Path):
@@ -106,9 +121,21 @@ def write_json(path: Path, data: Any) -> None:
     tmp = path.with_name(path.name + ".tmp")
     if tmp.is_symlink() or path.is_symlink():
         raise SafeError("拒绝写入符号链接。")
-    with tmp.open("w", encoding="utf-8") as f:
+    f = open_regular_text(tmp, "w", encoding="utf-8")
+    try:
         json.dump(data, f, ensure_ascii=False, indent=2, allow_nan=False)
         f.write("\n")
+    except BaseException:
+        try:
+            f.close()
+        except Exception as exc:
+            try:
+                print("JSON 临时文件关闭失败：", type(exc).__name__, file=sys.stderr)
+            except Exception:
+                pass
+        raise
+    else:
+        f.close()
     tmp.chmod(0o600)
     tmp.replace(path)
 
@@ -117,7 +144,7 @@ def config() -> dict[str, Any]:
     if not CONFIG.exists():
         raise SafeError("尚未初始化，请先运行 ./hg init。")
     try:
-        cfg = json.loads(CONFIG.read_text(encoding="utf-8"))
+        cfg = json.loads(read_regular_text(CONFIG, reject_symlink=False))
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise SafeError("config.json 无法读取为完整 UTF-8 JSON，请检查本地配置。") from exc
     return validate_config(cfg)
@@ -357,7 +384,7 @@ def load_exports(cfg: dict[str, Any]) -> tuple[list[Sample], dict[str, str]]:
         if before.st_size == 0 or before.st_size > 4 * 1024 * 1024:
             raise SafeError(f"{p.name} 为空或超过 4 MB，请检查 iCloud 文件下载。")
         try:
-            obj = json.loads(p.read_text(encoding="utf-8-sig"))
+            obj = json.loads(read_regular_text(p, encoding="utf-8-sig"))
         except (OSError, UnicodeError, json.JSONDecodeError) as exc:
             raise SafeError(f"{p.name} 不是完整 UTF-8 JSON，或尚未下载完毕。") from exc
         after = p.stat()
@@ -704,7 +731,7 @@ def active_operations() -> set[str]:
     for path in (STATE / "operations").glob("*.json"):
         if path.is_symlink():
             raise SafeError("操作记录不能是符号链接。")
-        journal = json.loads(path.read_text())
+        journal = json.loads(read_regular_text(path))
         if journal.get("phase") not in ("verified", "deleted_verified", "closed_partial"):
             active.add(journal["key"])
             active.update(journal.get("record_ids", []))
@@ -898,7 +925,7 @@ def reviewed_operation(args: argparse.Namespace, cfg: dict[str, Any], delete_ext
         path.resolve().relative_to((STATE / "plans").resolve())
     except ValueError:
         raise SafeError("清单必须位于本项目 state/plans 目录。")
-    saved = json.loads(path.read_text())
+    saved = json.loads(read_regular_text(path))
     for key in ("allowed_sources", "weight_bare_unit", "fat_bare_unit", "pair_window_seconds"):
         if saved["config"].get(key) != cfg.get(key):
             raise SafeError("来源、单位或配对设置已改变，请重新对账。")
@@ -959,7 +986,7 @@ def reviewed_operation(args: argparse.Namespace, cfg: dict[str, Any], delete_ext
             replacement_preflight(obj, remote_row, replacement, records, saved)
         operation_dir = STATE / "operations"
         for existing in operation_dir.glob("*.json"):
-            history = json.loads(existing.read_text())
+            history = json.loads(read_regular_text(existing))
             if history.get("key") == operation_key and history.get("phase") not in ("verified", "deleted_verified"):
                 raise SafeError("此记录有未完成的修改，请先核对 state/operations 中的操作记录，不重复删除。")
         print("选定原记录：", json.dumps(remote_row, ensure_ascii=False))
@@ -1043,7 +1070,7 @@ def read_operation(path: Path) -> dict[str, Any]:
         path.resolve().relative_to((STATE / "operations").resolve())
     except ValueError:
         raise SafeError("操作记录必须位于本项目 state/operations 目录。")
-    return json.loads(path.read_text())
+    return json.loads(read_regular_text(path))
 
 
 def record_failed_check(path: Path, journal: dict[str, Any]) -> None:
@@ -1485,7 +1512,7 @@ def inspect_files(cfg: dict[str, Any]) -> None:
         if not 0 < p.stat().st_size <= 4 * 1024 * 1024:
             raise SafeError(f"{p.name} 为空或超过 4 MB。")
         try:
-            obj = json.loads(p.read_text(encoding="utf-8-sig"))
+            obj = json.loads(read_regular_text(p, encoding="utf-8-sig"))
         except (OSError, UnicodeError, json.JSONDecodeError) as exc:
             raise SafeError(f"{p.name} 不是完整 UTF-8 JSON，或尚未下载完毕。") from exc
         print("\n文件：", p.name)
@@ -1591,7 +1618,7 @@ def show_status(cfg: dict[str, Any]) -> None:
             print(dict(row))
     p = STATE / "last_run.json"
     if p.exists():
-        print(p.read_text(encoding="utf-8"))
+        print(read_regular_text(p))
     if sys.platform == "darwin":
         code = agent_service_command("print", f"gui/{os.getuid()}/{LABEL}", checked=False)
         if code != 0:

@@ -544,7 +544,7 @@ class AgentAttemptTests(unittest.TestCase):
         self.assertEqual(self.report()[0], 2)
         self.marker.unlink()
         self.marker.write_text(json.dumps(self.completed()))
-        original = Path.read_text
+        original = h.read_regular_text
 
         def read(path, *args, **kwargs):
             if path == self.marker:
@@ -553,7 +553,7 @@ class AgentAttemptTests(unittest.TestCase):
 
         # invoke snapshots files before/after; collect is the read-only check under test here.
         before = self.snapshot()
-        with patch.object(Path, 'read_text', read):
+        with patch.object(h, 'read_regular_text', read):
             report = d.collect()
         self.assertEqual(report['status'], 'error')
         self.assertNotIn(fixtures.SECRET, json.dumps(report))
