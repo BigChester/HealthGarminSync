@@ -161,7 +161,7 @@ bash setup.sh
 | ignored | 保留人工忽略决定 |
 | EXTRA | 选定日期内的远端多余记录，自动同步保留 |
 
-清单保存到 `state/plans/compare-时间戳.json`，摘要在 `state/last_compare.json`。匹配按绝对时间（允许 1 秒编码误差）和数值：体重/体脂误差 0.021，BMI 误差 0.11。同日多次称重分别核对；60 秒内无法唯一对应时为 conflict。判断缺失使用完整称重明细，不能用每日最后值代替。
+手动清单保存到 `state/plans/compare-时间戳.json`；同步清单覆盖保存到 `state/plans/sync-latest.json`，最近摘要在 `state/last_compare.json`。匹配按绝对时间（允许 1 秒编码误差）和数值：体重/体脂误差 0.021，BMI 误差 0.11。同日多次称重分别核对；60 秒内无法唯一对应时为 conflict。判断缺失使用完整称重明细，不能用每日最后值代替。
 
 ### 修复指定记录
 
