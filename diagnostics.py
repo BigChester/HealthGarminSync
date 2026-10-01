@@ -304,6 +304,8 @@ def collect():
             if not isinstance(actual, dict):
                 raise ValueError('invalid plist')
             mismatches = [key for key, value in expected.items() if actual.get(key) != value]
+            if 'Program' in actual and actual['Program'] != expected['ProgramArguments'][0]:
+                mismatches.append('Program')
             if mismatches:
                 add('agent_plist', 'error', '任务配置不匹配：' + '、'.join(mismatches) + '。',
                     '运行 ./hg install-agent 更新任务。')

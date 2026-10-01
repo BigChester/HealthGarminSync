@@ -566,6 +566,37 @@ class DoctorTests(unittest.TestCase):
                 self.assertEqual(result, 2)
                 self.assertIn(field, checks['agent_plist']['message'])
 
+    def test_plist_program_override_is_reported_without_private_values(self):
+        for program in ('/bin/false', SECRET, False, 0, [], {}):
+            with self.subTest(program=program):
+                document = h.agent_plist()
+                document['Program'] = program
+                self.plist.write_bytes(plistlib.dumps(document))
+                code, _, checks = self.report()
+                self.assertEqual(code, 2)
+                self.assertEqual(checks['agent_plist']['status'], 'error')
+                self.assertIn('Program', checks['agent_plist']['message'])
+                self.assertIn('./hg install-agent', checks['agent_plist']['hint'])
+                code, output = self.invoke('doctor')
+                self.assertEqual(code, 2)
+                self.assertIn('任务配置不匹配：Program', output)
+                self.assertNotIn('/bin/false', output)
+
+    def test_plist_program_default_or_explicit_expected_interpreter_is_valid(self):
+        for explicit in (False, True):
+            with self.subTest(explicit=explicit):
+                document = h.agent_plist()
+                if explicit:
+                    document['Program'] = document['ProgramArguments'][0]
+                document['Comment'] = SECRET
+                self.plist.write_bytes(plistlib.dumps(document))
+                code, _, checks = self.report()
+                self.assertEqual(code, 0)
+                self.assertEqual(checks['agent_plist']['status'], 'ok')
+                code, output = self.invoke('doctor')
+                self.assertEqual(code, 0)
+                self.assertIn('LaunchAgent 配置与当前项目匹配', output)
+
     def test_enabled_missing_plist_or_unloaded_service_is_error_with_install_hint(self):
         self.plist.unlink()
         result, _, checks = self.report()
