@@ -56,7 +56,7 @@ bash setup.sh
 | weight_bare_unit | kg | 裸体重数字按公斤 |
 | fat_bare_unit | percent | 裸体脂数字按百分数 |
 | pair_window_seconds | 0 | 仅配对相同测量时刻 |
-| settle_seconds | 120 | 自动处理等待批次合并两分钟 |
+| settle_seconds | 120 | 自动处理等待批次合并两分钟；0 关闭等待 |
 | max_records_per_run | 10 | 单次处理数量上限 |
 
 已有配置用 `settings` 修改；启用后须先 `./hg disable`，修改完重新预览。例如更新导出目录：
@@ -266,6 +266,7 @@ tail -n 80 state/agent.err.log
 | metrics 或样本变成字符串 | 快捷指令用“设定词典值”放入词典和列表，仅保存前转整份 Payload 为文本 |
 | 体脂 0.x 报错 | 对照健康显示后选择 fraction |
 | 缺体脂 / WAIT | 无体脂可同步纯体重；WAIT 需解决多候选歧义 |
+| 未来时间被拒绝 | 核对 at / exported_at、时区及手机时间，重新导出 |
 | BMI 后到 | compare 生成 repair，手动修复指定记录 |
 | 配置或 settings 被拒绝 | enabled 必须为 JSON 布尔值；校验失败保留原配置 |
 | 显式命令返回 2、提示未执行 | run.lock 被占用，等进程结束；定时 run 遇锁跳过并返回 0 |
