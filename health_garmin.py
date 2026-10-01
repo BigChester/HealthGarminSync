@@ -1074,7 +1074,14 @@ def run_sync(cfg: dict[str, Any], record_id: str | None = None) -> None:
                 set_status(db, r, "remote_missing", entry["reason"])
                 result = "remote_missing"
             elif action in ("repair", "replace", "conflict"):
-                blocked = "verified_conflict" if entry["local_status"] in ("verified", "verified_manual", "verified_conflict", "remote_missing") else "conflict"
+                previous = entry["local_status"]
+                # Source overlap can override an uncertain comparison action.
+                # Resolving that overlap must never authorize retrying a request
+                # whose outcome is still unknown.
+                if previous in ("inflight", "uncertain", "repair_uncertain"):
+                    blocked = previous
+                else:
+                    blocked = "verified_conflict" if previous in ("verified", "verified_manual", "verified_conflict", "remote_missing") else "conflict"
                 set_status(db, r, blocked, entry["reason"])
                 result = action
             elif action == "uncertain":

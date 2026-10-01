@@ -250,6 +250,24 @@ class ReconciliationTests(unittest.TestCase):
         self.assertEqual(h.get_status(self.db, self.r), 'uncertain')
         self.assertFalse(api.posts)
 
+    def test_source_overlap_cannot_clear_uncertain_upload_protection(self):
+        overlapping = h.Measurement(AT + timedelta(milliseconds=500), 71, 24, 'PICOOC')
+        for status in ('uncertain', 'inflight', 'repair_uncertain'):
+            with self.subTest(status=status):
+                h.set_status(self.db, self.r, status)
+                self.write_export([self.r, overlapping])
+                api = API()
+                self.sync(api)
+                self.assertFalse(api.posts)
+                self.assertEqual(h.get_status(self.db, self.r), status)
+
+                # A corrected export removes the ambiguity, but an empty read
+                # still cannot prove that the previous request did not succeed.
+                self.write_export([self.r])
+                self.sync(api)
+                self.assertFalse(api.posts)
+                self.assertEqual(h.get_status(self.db, self.r), 'uncertain')
+
     def test_every_chunk_is_validated_before_first_write(self):
         other = h.Measurement(AT + timedelta(days=60), 71, 24, 'PICOOC')
         self.write_export([self.r, other]); api = API(); api.fail_chunk = 2
