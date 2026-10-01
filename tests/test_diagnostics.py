@@ -17,6 +17,7 @@ import unittest
 from unittest.mock import patch
 
 import diagnostics as d
+import agent_runner as runner
 import health_garmin as h
 
 
@@ -132,6 +133,9 @@ class DoctorTests(unittest.TestCase):
     def test_healthy_setup_returns_parseable_safe_report_and_only_queries_service(self):
         result, report, checks = self.report()
         self.assertEqual(result, 0)
+        self.assertEqual(checks['state']['status'], 'info')
+        for name in ('run.lock', 'agent-log.lock'):
+            self.assertFalse((self.state / name).exists())
         self.assertEqual(report['status'], 'ok')
         self.assertEqual(checks['inbox']['data']['measurements'], 1)
         self.assertEqual(checks['last_run']['data']['results'], {'verified': 1})
@@ -174,10 +178,84 @@ class DoctorTests(unittest.TestCase):
                 self.assertFalse(self.state.exists())
 
     def test_real_busy_lock_does_not_block_doctor(self):
-        with (self.state / 'run.lock').open('a') as holder:
-            fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            result, _, _ = self.report()
+        with contextlib.ExitStack() as stack:
+            for name in ('run.lock', 'agent-log.lock'):
+                holder = stack.enter_context((self.state / name).open('a'))
+                fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            result, _, checks = self.report()
         self.assertEqual(result, 0)
+        self.assertEqual(checks['state']['status'], 'info')
+
+    def test_unusable_agent_lock_cannot_be_hidden_by_old_completed_evidence(self):
+        (self.state / 'agent-log.lock').mkdir()
+        previous = self.agent_attempt.read_bytes()
+        errors = io.StringIO()
+        with patch.object(h, 'main') as main, contextlib.redirect_stderr(errors):
+            self.assertEqual(runner.entrypoint(), 2)
+        main.assert_not_called()
+        self.assertEqual(self.agent_attempt.read_bytes(), previous)
+        self.assertNotIn(SECRET, errors.getvalue())
+        code, _, checks = self.report()
+        self.assertEqual(code, 2)
+        self.assertEqual(checks['state']['status'], 'error')
+        self.assertIn('state/agent-log.lock', checks['state']['hint'])
+        self.assertEqual(checks['last_agent_attempt']['status'], 'info')
+        text_code, output = self.invoke('doctor')
+        self.assertEqual(text_code, 2)
+        self.assertIn('state/agent-log.lock', output)
+
+    def test_nonregular_lock_paths_are_readonly_errors(self):
+        outside = self.root / 'outside-lock'
+        outside.write_text(SECRET)
+        for name in ('run.lock', 'agent-log.lock'):
+            path = self.state / name
+            for kind in ('directory', 'symlink'):
+                with self.subTest(name=name, kind=kind):
+                    if kind == 'directory':
+                        path.mkdir()
+                    else:
+                        path.symlink_to(outside)
+                    try:
+                        code, _, checks = self.report()
+                        self.assertEqual(code, 2)
+                        self.assertEqual(checks['state']['status'], 'error')
+                        self.assertIn('state/' + name, checks['state']['hint'])
+                        self.assertEqual(checks['last_run']['status'], 'info')
+                        text_code, output = self.invoke('doctor')
+                        self.assertEqual(text_code, 2)
+                        self.assertIn('state/' + name, output)
+                    finally:
+                        path.rmdir() if kind == 'directory' else path.unlink()
+
+    def test_lock_permission_or_metadata_errors_keep_other_evidence_and_private_details_safe(self):
+        original_access, original_lstat = os.access, Path.lstat
+        for name in ('run.lock', 'agent-log.lock'):
+            path = self.state / name
+            path.write_text('synthetic lock')
+            for failure in ('permission', 'metadata'):
+                with self.subTest(name=name, failure=failure):
+                    def access(target, mode, *args, **kwargs):
+                        if Path(target) == path and mode == os.W_OK:
+                            return False
+                        return original_access(target, mode, *args, **kwargs)
+
+                    def lstat(target, *args, **kwargs):
+                        if target == path:
+                            raise OSError(SECRET)
+                        return original_lstat(target, *args, **kwargs)
+
+                    patcher = patch.object(os, 'access', access) if failure == 'permission' else patch.object(Path, 'lstat', lstat)
+                    with patcher:
+                        code, _, checks = self.report()
+                        text_code, output = self.invoke('doctor')
+                    self.assertEqual(code, 2)
+                    self.assertEqual(text_code, 2)
+                    self.assertEqual(checks['state']['status'], 'error')
+                    self.assertIn('state/' + name, checks['state']['hint'])
+                    self.assertIn('state/' + name, output)
+                    self.assertEqual(checks['last_run']['status'], 'info')
+                    self.assertEqual(checks['last_agent_attempt']['status'], 'info')
+            path.unlink()
 
     def test_help_does_not_create_runtime_files(self):
         for args in (('--help',), ('doctor', '--help')):

@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import plistlib
 import re
+import stat
 import subprocess
 import sys
 from xml.parsers.expat import ExpatError
@@ -168,7 +169,24 @@ def collect():
         else:
             list(h.STATE.iterdir())
             state_available = True
-            add('state', 'info', '当前进程可访问 state。')
+            invalid_lock = None
+            for name in ('run.lock', 'agent-log.lock'):
+                path = h.STATE / name
+                try:
+                    mode = path.lstat().st_mode
+                    if not stat.S_ISREG(mode) or not os.access(path, os.W_OK):
+                        invalid_lock = name
+                        break
+                except FileNotFoundError:
+                    continue
+                except OSError:
+                    invalid_lock = name
+                    break
+            if invalid_lock:
+                add('state', 'error', '本地锁文件无效或当前进程无法写入。',
+                    f'检查 state/{invalid_lock} 的文件类型和权限。')
+            else:
+                add('state', 'info', '当前进程可访问 state。')
     except OSError:
         add('state', 'error', '当前进程无法访问 state。', '检查本地目录权限。')
 

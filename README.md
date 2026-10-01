@@ -251,7 +251,7 @@ tail -n 80 state/agent.out.log
 tail -n 80 state/agent.err.log
 ```
 
-`doctor` 离线只读检查环境、配置、导出、运行摘要和 LaunchAgent，配置损坏或进程锁被占用时也可运行。未确定请求、操作最近核对失败等错误返回 2，冲突、待修复和远端缺失报告为提醒，其余返回 0；后台执行与权限需实际验收。虚拟环境缺失时，用 Python 3.12+ 执行 `python3 health_garmin.py doctor`。
+`doctor` 离线只读检查环境、配置、导出、锁路径、运行摘要和 LaunchAgent，配置损坏或进程锁被占用时也可运行。未确定请求、操作最近核对失败等错误返回 2，冲突、待修复和远端缺失报告为提醒，其余返回 0；后台执行与权限需实际验收。虚拟环境缺失时，用 Python 3.12+ 执行 `python3 health_garmin.py doctor`。
 
 `status` 显示详细本地状态；LaunchAgent 查询限时 5 秒，查询失败返回 2。
 
