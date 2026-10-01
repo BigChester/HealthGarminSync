@@ -855,10 +855,61 @@ class ReconciliationTests(unittest.TestCase):
             h.run_sync(self.cfg)
 
     def test_settling_and_limit_defer_new_writes(self):
-        records = [self.r, h.Measurement(AT+timedelta(hours=1), 71, 24, 'PICOOC')]
-        self.write_export(records); self.cfg['max_records_per_run'] = 1
-        api = API(); self.sync(api)
-        self.assertEqual(len(api.posts), 1)
+        current = h.aware('2026-10-02T10:00:00+08:00')
+        ignored = self.r
+        missing = h.Measurement(AT + timedelta(hours=1), 71, 24, 'PICOOC')
+        repair = h.Measurement(AT + timedelta(hours=2), 72, 25, 'PICOOC')
+        pending = [h.Measurement(AT + timedelta(hours=3), 73, 26, 'PICOOC'),
+                   h.Measurement(AT + timedelta(hours=4), 74, 27, 'PICOOC'),
+                   h.Measurement(current - timedelta(days=1), 75, 28, 'PICOOC')]
+        self.write_export([ignored, missing, repair, *pending])
+        source = self.inbox / 'health.json'
+        data = json.loads(source.read_text())
+        data['exported_at'] = current.isoformat()
+        source.write_text(json.dumps(data))
+        original_source = source.read_bytes()
+        self.cfg.update(settle_seconds=120, max_records_per_run=1)
+        for record, status in ((ignored, 'ignored'), (missing, 'remote_missing'),
+                               (repair, 'repair_uncertain')):
+            h.set_status(self.db, record, status)
+        journal = self.state / 'operations' / 'repair.json'
+        h.write_json(journal, {'key': repair.key, 'phase': 'uncertain'})
+        original_journal = journal.read_bytes()
+        api = API()
+        native_process = h.process_record
+
+        def process_without_wait(*args, **kwargs):
+            return native_process(*args, **kwargs, sleep=lambda _: None)
+
+        for elapsed, total_posts in ((119, 0), (120, 1), (121, 2), (122, 3), (123, 3), (124, 3)):
+            with self.subTest(elapsed=elapsed):
+                api.visible = elapsed != 120
+                if elapsed == 123:
+                    api.rows.append(row(pending[0], 900))
+                with patch.object(h, 'now', return_value=current + timedelta(seconds=elapsed)), \
+                        patch.object(h, 'process_record', side_effect=process_without_wait):
+                    self.sync(api)
+                summary = json.loads((self.state / 'last_run.json').read_text())
+                self.assertEqual(len(api.posts), total_posts)
+                self.assertEqual(summary.get('deferred'), 'settling' if elapsed == 119 else None)
+                for record, status in ((ignored, 'ignored'), (missing, 'remote_missing'),
+                                       (repair, 'repair_uncertain')):
+                    self.assertEqual(h.get_status(self.db, record), status)
+                self.assertEqual(summary['results'][missing.key], 'remote_missing')
+                self.assertEqual(summary['results'][repair.key], 'repair_uncertain')
+                expected = ['pending', 'pending', 'pending'] if elapsed == 119 else [
+                    'verified' if elapsed >= 123 else 'uncertain',
+                    'verified' if elapsed >= 121 else 'pending',
+                    'verified' if elapsed >= 122 else 'pending']
+                for record, status in zip(pending, expected):
+                    self.assertEqual(h.get_status(self.db, record), status)
+                    if status != 'verified' or record.key in summary['results']:
+                        self.assertEqual(summary['results'][record.key],
+                                         'deferred' if status == 'pending' else status)
+                self.assertEqual(source.read_bytes(), original_source)
+                self.assertEqual(journal.read_bytes(), original_journal)
+        self.assertEqual(len({post['timestamp'] for post in api.posts}), 3)
+        self.assertFalse(api.deletes)
 
     def test_zero_settling_allows_small_export_clock_skew(self):
         current = h.now()
