@@ -217,6 +217,53 @@ class AgentAttemptTests(unittest.TestCase):
         self.assertEqual(self.report()[0], 0)
         self.assertEqual((self.export.read_bytes(), (self.tokens / 'oauth.json').read_bytes()), (source, tokens))
 
+    def test_native_log_close_failure_keeps_uploaded_state_and_recovers_without_reposting(self):
+        measurement = h.load_measurements(self.cfg)[1][0]
+        source, tokens = self.export.read_bytes(), (self.tokens / 'oauth.json').read_bytes()
+        api = API()
+        native_write = h.write_json
+        terminal = []
+
+        def write(path, value):
+            if path == self.state / 'last_attempt.json' and value['outcome'] == 'failed':
+                self.assertEqual(observed[0]['close_calls'], 1)
+                self.assertIsNone(observed[0]['handler'].stream)
+                with (self.state / 'run.lock').open('a') as probe, self.assertRaises(BlockingIOError):
+                    fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                terminal.append(value['outcome'])
+            return native_write(path, value)
+
+        with run_fixtures.isolated_logging(), run_fixtures.failing_log_close(self) as observed, \
+                patch.object(h, 'api_client', return_value=api), patch.object(h, 'write_json', side_effect=write):
+            self.assertEqual(self.run_agent()[0], 2)
+        self.assertEqual(terminal, ['failed'])
+        self.assertEqual(observed[0]['close_calls'], 1)
+        self.assertEqual(self.value()['outcome'], 'failed')
+        self.assertEqual(json.loads((self.state / 'last_attempt.json').read_text())['outcome'], 'failed')
+        self.assertEqual(len(api.posts), 1)
+        self.assertFalse(api.deletes)
+        with contextlib.closing(h.database()) as db:
+            self.assertEqual(h.get_status(db, measurement), 'verified')
+        summary = json.loads(self.last.read_text())
+        self.assertEqual(summary['results'], {measurement.key: 'verified'})
+        self.assertEqual(summary['local_status_counts'], {'verified': 1})
+        errors = (self.state / 'agent.err.log').read_text()
+        self.assertNotIn(fixtures.SECRET, errors)
+        self.assertNotIn('Traceback', errors)
+        code, _, checks = self.report()
+        self.assertEqual(code, 2)
+        self.assertEqual(checks['last_attempt']['status'], 'error')
+        self.assertEqual(checks['last_agent_attempt']['status'], 'error')
+        self.assertEqual(checks['last_run']['status'], 'info')
+        with run_fixtures.isolated_logging(), patch.object(h, 'api_client', return_value=api) as login:
+            self.assertEqual(self.run_agent()[0], 0)
+        login.assert_not_called()
+        self.assertEqual(len(api.posts), 1)
+        self.assertFalse(api.deletes)
+        self.assertEqual(self.value()['outcome'], 'completed')
+        self.assertEqual(self.report()[0], 0)
+        self.assertEqual((self.export.read_bytes(), (self.tokens / 'oauth.json').read_bytes()), (source, tokens))
+
     def test_post_interruption_and_next_read_preserve_inflight_without_repeating_post(self):
         class InterruptedAPI(API):
             def add_body_composition(self, **kwargs):

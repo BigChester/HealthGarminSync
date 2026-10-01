@@ -1238,7 +1238,8 @@ def show_preview(cfg: dict[str, Any]) -> list[Measurement]:
 def guard_command_logging(handler):
     """Defer this owned handler's errors without exposing raw logging diagnostics."""
     failure = None
-    original_emit = handler.emit
+    closed = False
+    original_emit, original_close = handler.emit, handler.close
 
     def failed(record=None):
         nonlocal failure
@@ -1250,17 +1251,26 @@ def guard_command_logging(handler):
                 pass
 
     def emit(record):
-        if failure is None:
+        if not closed and failure is None:
             try:
                 original_emit(record)
             except Exception:
                 failed()
 
+    def close():
+        nonlocal closed
+        if not closed:
+            closed = True
+            try:
+                original_close()
+            except Exception:
+                failed()
+
     def check():
         if failure is not None:
-            raise SafeError(f"同步日志写入/轮换失败：{failure}；请检查 state/sync.log 和轮换文件。")
+            raise SafeError(f"同步日志保存失败：{failure}；请检查 state/sync.log 和轮换文件。")
 
-    handler.handleError, handler.emit = failed, emit
+    handler.handleError, handler.emit, handler.close = failed, emit, close
     return check
 
 
@@ -1672,18 +1682,24 @@ def main() -> int:
                 owned_handler = RotatingFileHandler(
                     STATE / "sync.log", maxBytes=1_000_000, backupCount=3, encoding="utf-8")
                 check_logging = guard_command_logging(owned_handler)
+
+                def finish_logging():
+                    logging.getLogger().removeHandler(owned_handler)
+                    owned_handler.close()
+                    check_logging()
+
                 logging.basicConfig(level=logging.INFO, handlers=[owned_handler],
                                     format="%(asctime)s %(levelname)s %(message)s")
                 if args.command == "init":
                     init_config(args)
-                    check_logging()
+                    finish_logging()
                     return 0
                 if args.command == "run":
-                    run_with_attempt(check_logging=check_logging)
+                    run_with_attempt(check_logging=finish_logging)
                     return 0
                 if args.command == "uninstall-agent":
                     manage_agent(False)
-                    check_logging()
+                    finish_logging()
                     return 0
                 cfg = config()
                 if args.command == "inspect": inspect_files(cfg)
@@ -1724,7 +1740,7 @@ def main() -> int:
                     print("仅查询，响应保存到：", p)
                     print(json.dumps(obj, ensure_ascii=False, indent=2))
                 elif args.command == "resolve": resolve_record(args)
-                check_logging()
+                finish_logging()
             except (Exception, KeyboardInterrupt) as exc:
                 primary_result = report_error(exc, log=owned_handler is not None)
                 return primary_result

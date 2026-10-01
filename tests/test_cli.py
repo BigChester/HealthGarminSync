@@ -444,7 +444,7 @@ raise SystemExit(h.main())
                         patch.object(h, "run_with_attempt", side_effect=exc):
                     result, errors = self.invoke()
                 self.assertEqual(result, expected)
-                self.assertIn("日志关闭失败： OSError", errors)
+                self.assertIn("同步日志未保存： OSError", errors)
                 self.assertNotIn("private-secret", errors)
                 self.assertIsNone(owned.stream)
                 self.assertEqual(self.root_logger.handlers, [])

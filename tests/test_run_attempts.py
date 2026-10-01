@@ -34,6 +34,50 @@ def isolated_logging():
         root.setLevel(level)
 
 
+@contextlib.contextmanager
+def failing_log_close(case, error=None):
+    """Fail only the final flush inside native FileHandler.close, with real fds."""
+    factory = h.RotatingFileHandler
+    observed = []
+    failure = error if error is not None else OSError(SECRET)
+
+    def create(*args, **kwargs):
+        handler = factory(*args, **kwargs)
+        native_flush, native_close = handler.flush, handler.close
+        state = {'handler': handler, 'close_calls': 0, 'flush': native_flush}
+        observed.append(state)
+        closing = False
+
+        def flush():
+            if closing:
+                raise failure
+            return native_flush()
+
+        def close():
+            nonlocal closing
+            state['close_calls'] += 1
+            with (case.state / 'run.lock').open('a') as probe, case.assertRaises(BlockingIOError):
+                fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fd = handler.stream.fileno()
+            closing = True
+            try:
+                return native_close()
+            finally:
+                case.assertIsNone(handler.stream)
+                with case.assertRaises(OSError):
+                    os.fstat(fd)
+
+        handler.flush, handler.close = flush, close
+        return handler
+
+    try:
+        with patch.object(h, 'RotatingFileHandler', side_effect=create):
+            yield observed
+    finally:
+        for state in observed:
+            state['handler'].flush = state['flush']
+
+
 class RunAttemptTests(unittest.TestCase):
     setUp = fixtures.DoctorTests.setUp
     save_config = fixtures.DoctorTests.save_config
@@ -171,6 +215,82 @@ class RunAttemptTests(unittest.TestCase):
                 self.assertNotIn(SECRET, errors)
                 self.assertNotIn('Traceback', errors)
                 self.assertEqual(errors.count('同步日志未保存：'), 1)
+                self.assertFalse((self.state / 'last_attempt.json').exists())
+
+    def test_native_log_close_flush_failure_precedes_manual_success_or_preview_marker(self):
+        measurement = h.load_measurements(self.cfg)[1][0]
+        source, tokens = self.export.read_bytes(), (self.tokens / 'oauth.json').read_bytes()
+        for enabled in (False, True):
+            with self.subTest(enabled=enabled):
+                self.cfg['enabled'] = enabled
+                self.save_config()
+                old_last = self.last.read_bytes()
+                api = API([row(measurement)])
+                with failing_log_close(self) as observed, patch.object(h, 'api_client', return_value=api):
+                    result, _, errors = self.run_with_logging()
+                self.assertEqual(result, 2)
+                self.assertEqual(observed[0]['close_calls'], 1)
+                self.assertIsNone(observed[0]['handler'].stream)
+                self.assertEqual(self.attempt()['outcome'], 'failed')
+                self.assertEqual(self.attempt()['stage'], 'sync')
+                self.assertNotIn(SECRET, errors)
+                self.assertNotIn('Traceback', errors)
+                self.assertFalse(api.posts)
+                self.assertFalse(api.deletes)
+                if enabled:
+                    with contextlib.closing(h.database()) as db:
+                        self.assertEqual(h.get_status(db, measurement), 'verified')
+                    self.assertEqual(json.loads(self.last.read_text())['local_status_counts'], {'verified': 1})
+                else:
+                    self.assertEqual(self.last.read_bytes(), old_last)
+                    self.assertFalse(api.reads)
+                self.assertEqual(self.report()[0], 2)
+                self.assertEqual((self.export.read_bytes(), (self.tokens / 'oauth.json').read_bytes()), (source, tokens))
+
+    def test_closed_log_handler_cannot_emit_or_reopen_and_only_closes_once(self):
+        record = logging.LogRecord('health_garmin', logging.ERROR, '', 0, '%s', (SECRET,), None)
+        errors = io.StringIO()
+        with (self.state / 'run.lock').open('a') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with failing_log_close(self) as observed, contextlib.redirect_stderr(errors):
+                handler = h.RotatingFileHandler(self.state / 'guard-close.log')
+                check = h.guard_command_logging(handler)
+                handler.close()
+                handler.close()
+                before = (self.state / 'guard-close.log').read_bytes()
+                handler.emit(record)
+                self.assertEqual((self.state / 'guard-close.log').read_bytes(), before)
+                self.assertIsNone(handler.stream)
+                self.assertEqual(observed[0]['close_calls'], 1)
+                with self.assertRaises(h.SafeError):
+                    check()
+        self.assertNotIn(SECRET, errors.getvalue())
+        self.assertNotIn('Traceback', errors.getvalue())
+
+    def test_log_close_failure_keeps_primary_results_and_does_not_swallow_interrupt(self):
+        cases = ((h.SafeError('Original controlled failure'), OSError(SECRET), 2),
+                 (KeyboardInterrupt(), OSError(SECRET), 130),
+                 (None, KeyboardInterrupt(), 130))
+        for primary, closing, expected in cases:
+            with self.subTest(primary=type(primary).__name__, closing=type(closing).__name__):
+                with failing_log_close(self, closing) as observed, \
+                        patch.object(h, 'run_sync', side_effect=primary):
+                    result, _, errors = self.run_with_logging()
+                self.assertEqual(result, expected)
+                self.assertEqual(observed[0]['close_calls'], 1)
+                self.assertEqual(self.attempt()['outcome'], 'failed' if expected == 2 else 'interrupted')
+                self.assertEqual(self.attempt()['error_type'], 'SafeError' if expected == 2 else 'KeyboardInterrupt')
+                self.assertNotIn(SECRET, errors)
+                self.assertNotIn('Traceback', errors)
+
+    def test_other_successful_commands_include_log_close_result(self):
+        for name, helper in (('init', 'init_config'), ('uninstall-agent', 'manage_agent'), ('status', 'show_status')):
+            with self.subTest(command=name), failing_log_close(self) as observed, patch.object(h, helper):
+                result, _, errors = self.run_with_logging(name)
+                self.assertEqual(result, 2)
+                self.assertEqual(observed[0]['close_calls'], 1)
+                self.assertNotIn(SECRET, errors)
+                self.assertNotIn('Traceback', errors)
                 self.assertFalse((self.state / 'last_attempt.json').exists())
 
     def attempt(self):
