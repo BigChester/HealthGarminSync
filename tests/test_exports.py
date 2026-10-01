@@ -257,7 +257,7 @@ class ExportBundleTests(unittest.TestCase):
     def test_db_status_survives_transition(self):
         x = bundle(); records, _ = h.pair_samples(h.decode_export(x, CFG)[0]); r = records[0]
         with tempfile.TemporaryDirectory() as temp, patch.object(h, 'STATE', Path(temp)):
-            with h.database() as db:
+            with contextlib.closing(h.database()) as db, db:
                 h.set_status(db, r, 'verified')
                 combined, _ = h.pair_samples(h.decode_export(bundle(), CFG)[0])
                 self.assertEqual(h.get_status(db, combined[0]), 'verified')

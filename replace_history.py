@@ -1,5 +1,6 @@
 """Explicit full-history replacement with a durable backup and no automatic retry."""
 from collections import defaultdict
+import contextlib
 from datetime import date
 import json
 from pathlib import Path
@@ -112,7 +113,7 @@ def verify(path, api=None):
     api = api or h.api_client()
     obj = h.fetch_remote_snapshot(api, start, end)
     index = h.RemoteIndex(obj)
-    with h.database() as db:
+    with contextlib.closing(h.database()) as db, db:
         plan = h.comparison_plan(db, targets, obj, start, end)
         decisions = [index.decide(r) for r in targets]
         scoped = [row for row in index.rows if start.isoformat() <= row['calendarDate'] <= end.isoformat()]
@@ -168,7 +169,7 @@ def execute(args, cfg, api=None):
             if not pk.isdigit() or int(pk) <= 0:
                 raise h.SafeError('Garmin 记录缺少有效 ID，未执行替换。')
             original_days[day].append(row)
-    with h.database() as db:
+    with contextlib.closing(h.database()) as db, db:
         for r in records:
             kind, candidates, _ = index.decide(r)
             old = h.state_row(db, r)
@@ -198,7 +199,7 @@ def execute(args, cfg, api=None):
         h.write_json(backup / 'plan.json', saved)
         h.write_json(backup / 'config.json', cfg)
         h.write_json(backup / 'targets.json', payloads)
-        with sqlite3.connect(backup / 'sync.sqlite3') as target:
+        with contextlib.closing(sqlite3.connect(backup / 'sync.sqlite3')) as target, target:
             db.backup(target)
         (backup / 'sync.sqlite3').chmod(0o600)
         for source in Path(cfg['inbox']).glob('*.json'):

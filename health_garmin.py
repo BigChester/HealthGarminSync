@@ -355,13 +355,17 @@ def database() -> sqlite3.Connection:
     if dbpath.is_symlink():
         raise SafeError("状态数据库不能是符号链接。")
     db = sqlite3.connect(dbpath, timeout=10)
-    db.row_factory = sqlite3.Row
-    db.execute("PRAGMA synchronous=FULL")
-    db.execute("""CREATE TABLE IF NOT EXISTS uploads (
-       record_id TEXT PRIMARY KEY, core TEXT NOT NULL, payload TEXT NOT NULL,
-       status TEXT NOT NULL, updated_at TEXT NOT NULL, detail TEXT NOT NULL)""")
-    db.commit()
-    dbpath.chmod(0o600)
+    try:
+        db.row_factory = sqlite3.Row
+        db.execute("PRAGMA synchronous=FULL")
+        db.execute("""CREATE TABLE IF NOT EXISTS uploads (
+           record_id TEXT PRIMARY KEY, core TEXT NOT NULL, payload TEXT NOT NULL,
+           status TEXT NOT NULL, updated_at TEXT NOT NULL, detail TEXT NOT NULL)""")
+        db.commit()
+        dbpath.chmod(0o600)
+    except BaseException:
+        db.close()
+        raise
     return db
 
 
@@ -689,7 +693,7 @@ def compare_exports(args: argparse.Namespace, cfg: dict[str, Any]) -> dict[str, 
         raise SafeError("选定范围没有可用 Apple 测量，不能据此生成清理清单。")
     api = api_client()
     obj = fetch_remote_snapshot(api, start, end)
-    with database() as db:
+    with contextlib.closing(database()) as db, db:
         plan = comparison_plan(db, records, obj, start, end)
     print_comparison(plan)
     path = save_comparison(plan, cfg)
@@ -718,7 +722,7 @@ def reviewed_operation(args: argparse.Namespace, cfg: dict[str, Any], delete_ext
         raise SafeError("Apple 导出为空或存在歧义，请重新对账。")
     api = api_client()
     obj = fetch_remote_snapshot(api, start, end)
-    with database() as db:
+    with contextlib.closing(database()) as db, db:
         fresh = comparison_plan(db, records, obj, start, end)
         if delete_extra:
             if not args.complete_export:
@@ -802,7 +806,7 @@ def reviewed_operation(args: argparse.Namespace, cfg: dict[str, Any], delete_ext
         write_json(backup / "plan.json", fresh)
         write_json(backup / "config.json", cfg)
         backup_db = backup / "sync.sqlite3"
-        with sqlite3.connect(backup_db) as target:
+        with contextlib.closing(sqlite3.connect(backup_db)) as target, target:
             db.backup(target)
         backup_db.chmod(0o600)
         journal = {"key": operation_key, "phase": "deleting", "created_at": now().isoformat(),
@@ -863,7 +867,7 @@ def verify_operation(args: argparse.Namespace) -> None:
         r = Measurement(**{**payload, "at": aware(payload["at"])})
         matched = classify_remote(r, obj) == "matched"
         if matched:
-            with database() as db:
+            with contextlib.closing(database()) as db, db:
                 set_status(db, r, "verified", "Delayed reviewed-operation verification matched")
             journal["phase"] = "verified"
     else:
@@ -889,7 +893,7 @@ def resume_operation(args: argparse.Namespace) -> None:
     obj = remote_for(api, r)
     original_pk = str(journal["original"]["samplePk"])
     if classify_remote(r, obj) == "matched":
-        with database() as db:
+        with contextlib.closing(database()) as db, db:
             set_status(db, r, "verified", "Reviewed operation already matched; no resume upload")
         journal["phase"] = "verified"
         write_json(path, journal)
@@ -910,7 +914,7 @@ def resume_operation(args: argparse.Namespace) -> None:
     journal["phase"] = "uploading"
     journal["resumed_at"] = now().isoformat()
     write_json(path, journal)
-    with database() as db:
+    with contextlib.closing(database()) as db, db:
         set_status(db, r, "pending", "User confirmed remote absence for reviewed operation resume")
         result = process_record(api, db, r, reviewed=True)
     journal["phase"] = "verified" if result == "verified" else "uncertain"
@@ -1014,7 +1018,7 @@ def show_preview(cfg: dict[str, Any]) -> list[Measurement]:
     print(f"字段覆盖：体重 {len(records)} 条；含体脂 {sum(r.fat is not None for r in records)} 条；"
           f"含 BMI {sum(r.bmi is not None for r in records)} 条；"
           f"含瘦体重 {sum(r.lbm is not None for r in records)} 条（仅本地保留）。缺失指标不会自动推算。")
-    with database() as db:
+    with contextlib.closing(database()) as db, db:
         for r in records:
             row = state_row(db, r)
             s = row["status"] if row else "pending"
@@ -1052,7 +1056,7 @@ def run_sync(cfg: dict[str, Any], record_id: str | None = None) -> None:
         print("没有可用测量，无须访问 Garmin。")
         write_json(STATE / "last_run.json", summary)
         return
-    with database() as db:
+    with contextlib.closing(database()) as db, db:
         api = api_client()
         plan = load_local_comparison(cfg, records, api, db, full=record_id is not None)
         summary["comparison"] = plan["counts"]
@@ -1210,7 +1214,7 @@ def show_status(cfg: dict[str, Any]) -> None:
     print("导出目录：", cfg["inbox"], "；上传起始日期：", cfg["since"])
     print("运行解释器：", sys.executable)
     print("登录令牌目录：", STATE / "tokens", "（不要共享）")
-    with database() as db:
+    with contextlib.closing(database()) as db, db:
         for row in db.execute("SELECT status,COUNT(*) AS n FROM uploads GROUP BY status"):
             print(row["status"], row["n"])
         for row in db.execute("SELECT record_id,status,updated_at,detail FROM uploads ORDER BY updated_at DESC LIMIT 10"):
@@ -1224,7 +1228,7 @@ def show_status(cfg: dict[str, Any]) -> None:
 
 
 def resolve_record(args: argparse.Namespace) -> None:
-    with database() as db:
+    with contextlib.closing(database()) as db, db:
         row = db.execute("SELECT * FROM uploads WHERE record_id=?", (args.record_id,)).fetchone()
         if not row:
             raise SafeError("没有这个 ID 的本地上传状态。")
@@ -1318,7 +1322,7 @@ def main() -> int:
                 cfg["enabled"] = False; write_json(CONFIG, cfg)
                 print("自动写入已关闭。要停掉定时检查，再运行 ./hg uninstall-agent。")
             elif args.command == "enable":
-                with database() as db:
+                with contextlib.closing(database()) as db, db:
                     n = db.execute("SELECT COUNT(*) FROM uploads WHERE status IN ('verified','verified_manual')").fetchone()[0]
                 if not n:
                     raise SafeError("先完成至少一条真实记录试传及核验，再启用自动写入。")
