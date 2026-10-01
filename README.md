@@ -253,7 +253,7 @@ tail -n 80 state/agent.err.log
 
 `doctor` 离线只读检查环境、配置、导出、运行摘要和 LaunchAgent，配置损坏或进程锁被占用时也可运行。最近摘要中的未确定请求等错误返回 2，冲突、待修复和远端缺失报告为提醒，其余返回 0；后台执行与权限需实际验收。虚拟环境缺失时，用 Python 3.12+ 执行 `python3 health_garmin.py doctor`。
 
-最近一次取得锁的 `run` 尝试保存在 `state/last_attempt.json`，覆盖更新；失败和中断会由 `doctor` 报告。缺少结束记录时只提示待核查，进程可能仍在运行。`state/last_run.json` 保留最近完成的同步摘要。
+最近一次取得锁的 `run` 尝试保存在 `state/last_attempt.json`，覆盖更新；失败和中断会由 `doctor` 报告。缺少结束记录时只提示待核查，进程可能仍在运行。`state/last_run.json` 保留最近完成的同步摘要及本地状态计数快照；测量不再出现在导出中时，未确定状态仍会提示核对。
 
 `state/last_agent_attempt.json` 同样覆盖更新，记录后台入口的日志初始化和主程序调用阶段，便于定位同步开始前的失败。自动写入启用时，入口摘要超过两小时会提示核查定时任务。
 
