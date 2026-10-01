@@ -11,6 +11,7 @@ from unittest.mock import patch
 
 import health_garmin as h
 import replace_history as bulk
+import test_diagnostics as doctor_fixtures
 import test_reconciliation as fixtures
 from test_reconciliation import API, row
 
@@ -216,6 +217,69 @@ class OperationVerificationTests(unittest.TestCase):
         self.assertIn('最终完整历史未匹配', job['reason'])
         self.assertFalse(api.posts)
         self.assertFalse(api.deletes)
+
+
+class OperationDiagnosticTests(unittest.TestCase):
+    save_config = doctor_fixtures.DoctorTests.save_config
+    snapshot = doctor_fixtures.DoctorTests.snapshot
+    invoke = doctor_fixtures.DoctorTests.invoke
+    report = doctor_fixtures.DoctorTests.report
+    journal = OperationVerificationTests.journal
+    check_single = OperationVerificationTests.check_single
+    check_bulk = OperationVerificationTests.check_bulk
+
+    def setUp(self):
+        doctor_fixtures.DoctorTests.setUp(self)
+        self.r = h.load_measurements(self.cfg)[1][0]
+
+    def assert_diagnosis(self, path, phase, failed):
+        before = path.read_bytes()
+        code, _, checks = self.report()
+        unfinished = int(phase not in ('verified', 'deleted_verified', 'closed_partial'))
+        self.assertEqual(code, 2 if failed else 0)
+        self.assertEqual(checks['operations']['status'], 'error' if failed else 'warn' if unfinished else 'ok')
+        self.assertEqual(checks['operations']['data'], {'total': 1, 'unfinished': unfinished,
+                                                      'failed_checks': int(failed)})
+        self.assertEqual(path.read_bytes(), before)
+        self.assertEqual(json.loads(before)['phase'], phase)
+        self.assertEqual(self.r.key in h.active_operations(), bool(unfinished))
+
+    def test_completed_deletion_failure_and_recovery_reach_offline_doctor(self):
+        path = self.journal(phase='deleted_verified', deletion=True)
+        api = API([row(self.r, 100)])
+        self.assertIs(self.check_single(path, api)[0], False)
+        self.assert_diagnosis(path, 'deleted_verified', failed=True)
+        api.rows = []
+        self.assertIs(self.check_single(path, api)[0], True)
+        self.assert_diagnosis(path, 'deleted_verified', failed=False)
+        self.assertFalse(api.posts)
+        self.assertFalse(api.deletes)
+
+    def test_completed_repair_missing_or_conflicting_target_reaches_offline_doctor(self):
+        for rows in ([], [dict(row(self.r), weight=71000)]):
+            with self.subTest(rows=rows):
+                path = self.journal()
+                api = API(rows)
+                self.assertIs(self.check_single(path, api)[0], False)
+                self.assert_diagnosis(path, 'verified', failed=True)
+                api.rows = [row(self.r, 201)]
+                self.assertIs(self.check_single(path, api)[0], True)
+                self.assert_diagnosis(path, 'verified', failed=False)
+                self.assertFalse(api.posts)
+                self.assertFalse(api.deletes)
+
+    def test_full_replacement_failure_reaches_doctor_without_reopening_history(self):
+        for phase in ('verified', 'closed_partial', 'uncertain'):
+            with self.subTest(phase=phase):
+                path = self.journal(phase=phase, full=True)
+                api = API()
+                self.assertIs(self.check_bulk(path, api)[0], False)
+                self.assert_diagnosis(path, phase, failed=True)
+                api.rows = [row(self.r, 201)]
+                self.assertIs(self.check_bulk(path, api)[0], True)
+                self.assert_diagnosis(path, 'verified', failed=False)
+                self.assertFalse(api.posts)
+                self.assertFalse(api.deletes)
 
 
 if __name__ == '__main__':

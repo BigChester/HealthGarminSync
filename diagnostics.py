@@ -161,7 +161,7 @@ def collect():
     if state_available:
         try:
             operations = h.STATE / 'operations'
-            pending, total = 0, 0
+            pending, total, failed_checks = 0, 0, 0
             if operations.is_symlink():
                 raise ValueError('symlink')
             if operations.exists():
@@ -175,12 +175,19 @@ def collect():
                     ids = job.get('record_ids', [])
                     if not isinstance(ids, list) or any(not isinstance(key, str) for key in ids):
                         raise ValueError('invalid journal')
+                    if 'last_checked_at' in job or 'last_check_passed' in job:
+                        if (not isinstance(job.get('last_checked_at'), str)
+                                or type(job.get('last_check_passed')) is not bool):
+                            raise ValueError('invalid journal verification')
+                        h.aware(job['last_checked_at'])
+                        failed_checks += not job['last_check_passed']
                     pending += job['phase'] not in TERMINAL_PHASES
                     total += 1
-            add('operations', 'warn' if pending else 'ok', f'未完成操作 {pending} 项。',
-                '运行 ./hg verify-operation 核对对应操作记录。' if pending else None,
-                {'total': total, 'unfinished': pending})
-        except (OSError, UnicodeError, ValueError, TypeError):
+            add('operations', 'error' if failed_checks else 'warn' if pending else 'ok',
+                f'未完成操作 {pending} 项；最近一次核对未通过 {failed_checks} 项。',
+                '运行 ./hg verify-operation 核对对应操作记录。' if pending or failed_checks else None,
+                {'total': total, 'unfinished': pending, 'failed_checks': failed_checks})
+        except (OSError, UnicodeError, ValueError, TypeError, h.SafeError):
             add('operations', 'error', '操作记录无法读取或结构无效。', '检查 state/operations 中的本地证据。')
         try:
             last = _json(h.STATE / 'last_run.json')

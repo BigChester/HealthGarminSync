@@ -326,7 +326,7 @@ class DoctorTests(unittest.TestCase):
             'results': {str(index): result for index, result in enumerate(results)}}))
         result, _, checks = self.report()
         self.assertEqual(result, 2)
-        self.assertEqual(checks['operations']['data'], {'total': 8, 'unfinished': 5})
+        self.assertEqual(checks['operations']['data'], {'total': 8, 'unfinished': 5, 'failed_checks': 0})
         self.assertEqual(checks['last_run']['data']['results'], {result: 1 for result in results})
 
     def test_recent_run_result_severity_and_safe_counts(self):
@@ -494,12 +494,51 @@ class DoctorTests(unittest.TestCase):
         path.write_text(json.dumps({'phase': 'uncertain', 'key': SECRET, 'payload': SECRET}))
         result, _, checks = self.report()
         self.assertEqual(result, 0)
-        self.assertEqual(checks['operations']['data'], {'total': 1, 'unfinished': 1})
+        self.assertEqual(checks['operations']['data'], {'total': 1, 'unfinished': 1, 'failed_checks': 0})
         for content in ('{"private":"' + SECRET + '",', json.dumps({'phase': [], 'key': SECRET})):
             path.write_text(content)
             result, _, checks = self.report()
             self.assertEqual(result, 2)
             self.assertEqual(checks['operations']['status'], 'error')
+
+    def test_journal_verification_severity_keeps_historical_phase_and_unfinished_count(self):
+        operations = self.state / 'operations'
+        operations.mkdir()
+        path = operations / 'job.json'
+        for phase in sorted(d.PHASES):
+            for passed in (False, True):
+                with self.subTest(phase=phase, passed=passed):
+                    path.write_text(json.dumps({'phase': phase, 'key': SECRET,
+                        'last_checked_at': h.now().isoformat(), 'last_check_passed': passed}))
+                    previous = path.read_bytes()
+                    code, _, checks = self.report()
+                    unfinished = int(phase not in d.TERMINAL_PHASES)
+                    severity = 'error' if not passed else 'warn' if unfinished else 'ok'
+                    self.assertEqual(code, 0 if passed else 2)
+                    self.assertEqual(checks['operations']['status'], severity)
+                    self.assertEqual(checks['operations']['data'], {'total': 1,
+                        'unfinished': unfinished, 'failed_checks': int(not passed)})
+                    self.assertEqual(path.read_bytes(), previous)
+
+    def test_invalid_journal_verification_is_reported_without_raw_values(self):
+        operations = self.state / 'operations'
+        operations.mkdir()
+        path = operations / 'job.json'
+        stamp = h.now().isoformat()
+        cases = [{'last_checked_at': stamp}, {'last_check_passed': False},
+                 {'last_checked_at': None, 'last_check_passed': False},
+                 {'last_checked_at': [], 'last_check_passed': False},
+                 {'last_checked_at': SECRET, 'last_check_passed': False},
+                 {'last_checked_at': '2026-10-02T12:00:00', 'last_check_passed': True}]
+        cases += [{'last_checked_at': stamp, 'last_check_passed': value}
+                  for value in (None, 0, 1, 'false', SECRET, [], {})]
+        for fields in cases:
+            with self.subTest(fields=fields):
+                path.write_text(json.dumps({'phase': 'verified', 'key': SECRET, **fields}))
+                code, _, checks = self.report()
+                self.assertEqual(code, 2)
+                self.assertEqual(checks['operations']['status'], 'error')
+                self.assertNotIn('data', checks['operations'])
 
     def test_invalid_last_run_does_not_emit_raw_result_and_old_heartbeat_only_warns(self):
         for content in ('not JSON ' + SECRET, json.dumps({'run_at': h.now().isoformat(), 'results': {'id': SECRET}})):
