@@ -80,8 +80,12 @@ class DoctorTests(unittest.TestCase):
         self.config_path.write_text(json.dumps(self.cfg))
 
     def snapshot(self):
-        return {str(path.relative_to(self.root)): (stat.S_IMODE(path.stat().st_mode),
-                path.read_bytes() if path.is_file() else None) for path in [self.root, *self.root.rglob('*')]}
+        result = {}
+        for path in [self.root, *self.root.rglob('*')]:
+            mode = path.stat(follow_symlinks=False).st_mode
+            result[str(path.relative_to(self.root))] = (
+                stat.S_IMODE(mode), path.read_bytes() if stat.S_ISREG(mode) else None)
+        return result
 
     def invoke(self, *arguments):
         before = self.snapshot()
@@ -101,7 +105,8 @@ class DoctorTests(unittest.TestCase):
 
         with contextlib.ExitStack() as stack:
             stack.enter_context(patch.object(sys, 'argv', ['health_garmin.py', *arguments]))
-            for name in ('private_dir', 'write_json', 'database', 'api_client', 'manage_agent', 'RotatingFileHandler'):
+            for name in ('private_dir', 'write_json', 'database', 'api_client', 'manage_agent',
+                         'RotatingFileHandler', 'PrivateRotatingFileHandler'):
                 stack.enter_context(patch.object(h, name, side_effect=AssertionError('mutating helper called')))
             stack.enter_context(patch.object(h.logging, 'basicConfig', side_effect=AssertionError('log setup')))
             stack.enter_context(patch.object(h.os, 'umask', side_effect=AssertionError('umask changed')))
@@ -134,7 +139,7 @@ class DoctorTests(unittest.TestCase):
         result, report, checks = self.report()
         self.assertEqual(result, 0)
         self.assertEqual(checks['state']['status'], 'info')
-        for name in ('run.lock', 'agent-log.lock'):
+        for name in ('run.lock', 'agent-log.lock', 'sync.log'):
             self.assertFalse((self.state / name).exists())
         self.assertEqual(report['status'], 'ok')
         self.assertEqual(checks['inbox']['data']['measurements'], 1)
@@ -227,9 +232,54 @@ class DoctorTests(unittest.TestCase):
                     finally:
                         path.rmdir() if kind == 'directory' else path.unlink()
 
+    def test_fifo_sync_log_cannot_be_hidden_by_healthy_completed_evidence(self):
+        path = self.state / 'sync.log'
+        path.write_text('synthetic log')
+        self.assertEqual(self.report()[0], 0)
+        path.unlink()
+        os.mkfifo(path, 0o600)
+        code, _, checks = self.report()
+        self.assertEqual(code, 2)
+        self.assertEqual(checks['state']['status'], 'error')
+        self.assertIn('state/sync.log', checks['state']['hint'])
+        self.assertEqual(checks['last_run']['status'], 'info')
+        self.assertEqual(checks['last_agent_attempt']['status'], 'info')
+        text_code, output = self.invoke('doctor')
+        self.assertEqual(text_code, 2)
+        self.assertIn('state/sync.log', output)
+
+    def test_sync_log_directory_and_external_symlink_are_not_opened(self):
+        with tempfile.TemporaryDirectory() as outside:
+            target = Path(outside) / SECRET
+            target.write_text(SECRET)
+            path = self.state / 'sync.log'
+            original_open = Path.open
+
+            def guarded_open(candidate, *args, **kwargs):
+                if candidate in (path, target):
+                    raise AssertionError('unsafe log content read')
+                return original_open(candidate, *args, **kwargs)
+
+            for kind in ('directory', 'symlink'):
+                with self.subTest(kind=kind):
+                    path.mkdir() if kind == 'directory' else path.symlink_to(target)
+                    try:
+                        with patch.object(Path, 'open', guarded_open):
+                            code, _, checks = self.report()
+                            text_code, output = self.invoke('doctor')
+                        self.assertEqual((code, text_code), (2, 2))
+                        self.assertEqual(checks['state']['status'], 'error')
+                        self.assertIn('state/sync.log', checks['state']['hint'])
+                        self.assertIn('state/sync.log', output)
+                        self.assertEqual(checks['last_run']['status'], 'info')
+                        self.assertEqual(checks['last_agent_attempt']['status'], 'info')
+                    finally:
+                        path.rmdir() if kind == 'directory' else path.unlink()
+            self.assertEqual(target.read_text(), SECRET)
+
     def test_lock_permission_or_metadata_errors_keep_other_evidence_and_private_details_safe(self):
         original_access, original_lstat = os.access, Path.lstat
-        for name in ('run.lock', 'agent-log.lock'):
+        for name in ('run.lock', 'agent-log.lock', 'sync.log'):
             path = self.state / name
             path.write_text('synthetic lock')
             for failure in ('permission', 'metadata'):

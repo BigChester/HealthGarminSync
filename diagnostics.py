@@ -169,22 +169,22 @@ def collect():
         else:
             list(h.STATE.iterdir())
             state_available = True
-            invalid_lock = None
-            for name in ('run.lock', 'agent-log.lock'):
+            invalid_file = None
+            for name in ('run.lock', 'agent-log.lock', 'sync.log'):
                 path = h.STATE / name
                 try:
                     mode = path.lstat().st_mode
                     if not stat.S_ISREG(mode) or not os.access(path, os.W_OK):
-                        invalid_lock = name
+                        invalid_file = name
                         break
                 except FileNotFoundError:
                     continue
                 except OSError:
-                    invalid_lock = name
+                    invalid_file = name
                     break
-            if invalid_lock:
-                add('state', 'error', '本地锁文件无效或当前进程无法写入。',
-                    f'检查 state/{invalid_lock} 的文件类型和权限。')
+            if invalid_file:
+                add('state', 'error', '本地运行文件无效或当前进程无法写入。',
+                    f'检查 state/{invalid_file} 的文件类型和权限。')
             else:
                 add('state', 'info', '当前进程可访问 state。')
     except OSError:

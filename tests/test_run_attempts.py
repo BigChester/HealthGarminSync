@@ -37,7 +37,7 @@ def isolated_logging():
 @contextlib.contextmanager
 def failing_log_close(case, error=None):
     """Fail only the final flush inside native FileHandler.close, with real fds."""
-    factory = h.RotatingFileHandler
+    factory = h.PrivateRotatingFileHandler
     observed = []
     failure = error if error is not None else OSError(SECRET)
 
@@ -71,7 +71,7 @@ def failing_log_close(case, error=None):
         return handler
 
     try:
-        with patch.object(h, 'RotatingFileHandler', side_effect=create):
+        with patch.object(h, 'PrivateRotatingFileHandler', side_effect=create):
             yield observed
     finally:
         for state in observed:
@@ -90,7 +90,7 @@ class RunAttemptTests(unittest.TestCase):
         old_umask = os.umask(0o077)
         try:
             with patch.object(sys, 'argv', ['health_garmin.py', command]), \
-                    patch.object(h, 'RotatingFileHandler', return_value=logging.NullHandler()), \
+                    patch.object(h, 'PrivateRotatingFileHandler', return_value=logging.NullHandler()), \
                     patch.object(h.logging, 'basicConfig'), patch.object(h.LOG, 'error'), \
                     contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
                 result = h.main()
@@ -141,7 +141,7 @@ class RunAttemptTests(unittest.TestCase):
         self.assertEqual(logging.raiseExceptions, previous_raise)
 
     def test_command_log_failure_and_broken_notice_preserve_primary_exit_results(self):
-        factory = h.RotatingFileHandler
+        factory = h.PrivateRotatingFileHandler
 
         def create(*args, **kwargs):
             handler = factory(*args, **kwargs)
@@ -154,7 +154,7 @@ class RunAttemptTests(unittest.TestCase):
                     h.LOG.info('PRIVATE %s', SECRET)
                     raise primary
 
-                with patch.object(h, 'RotatingFileHandler', side_effect=create), patch.object(h, 'run_sync', side_effect=sync):
+                with patch.object(h, 'PrivateRotatingFileHandler', side_effect=create), patch.object(h, 'run_sync', side_effect=sync):
                     result, _, errors = self.run_with_logging()
                 self.assertEqual(result, expected)
                 self.assertEqual(self.attempt()['error_type'], type(primary).__name__)
@@ -165,7 +165,7 @@ class RunAttemptTests(unittest.TestCase):
                 broken_errors = Mock()
                 broken_errors.write.side_effect = BrokenPipeError(SECRET)
                 with isolated_logging(), patch.object(sys, 'argv', ['health_garmin.py', 'run']), \
-                        patch.object(sys, 'stderr', broken_errors), patch.object(h, 'RotatingFileHandler', side_effect=create), \
+                        patch.object(sys, 'stderr', broken_errors), patch.object(h, 'PrivateRotatingFileHandler', side_effect=create), \
                         patch.object(h, 'run_sync', side_effect=sync):
                     old_umask = os.umask(0o077)
                     try:
@@ -197,7 +197,7 @@ class RunAttemptTests(unittest.TestCase):
                 self.assertEqual(json.loads((self.state / 'last_attempt.json').read_text())['outcome'], 'running')
 
     def test_other_successful_commands_check_owned_logging_before_returning(self):
-        factory = h.RotatingFileHandler
+        factory = h.PrivateRotatingFileHandler
 
         def create(*args, **kwargs):
             handler = factory(*args, **kwargs)
@@ -208,7 +208,7 @@ class RunAttemptTests(unittest.TestCase):
             h.LOG.info('PRIVATE %s', SECRET)
 
         for name, helper in (('init', 'init_config'), ('uninstall-agent', 'manage_agent'), ('status', 'show_status')):
-            with self.subTest(command=name), patch.object(h, 'RotatingFileHandler', side_effect=create), \
+            with self.subTest(command=name), patch.object(h, 'PrivateRotatingFileHandler', side_effect=create), \
                     patch.object(h, helper, side_effect=command):
                 result, _, errors = self.run_with_logging(name)
                 self.assertEqual(result, 2)
@@ -253,7 +253,7 @@ class RunAttemptTests(unittest.TestCase):
         with (self.state / 'run.lock').open('a') as lock:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             with failing_log_close(self) as observed, contextlib.redirect_stderr(errors):
-                handler = h.RotatingFileHandler(self.state / 'guard-close.log')
+                handler = h.PrivateRotatingFileHandler(self.state / 'guard-close.log')
                 check = h.guard_command_logging(handler)
                 handler.close()
                 handler.close()

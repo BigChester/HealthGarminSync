@@ -727,7 +727,7 @@ import builtins
 import socket
 def forbidden(*args, **kwargs):
     raise AssertionError("config, API, home, service or command log accessed before lock validation")
-config = api_client = manage_agent = RotatingFileHandler = forbidden
+config = api_client = manage_agent = PrivateRotatingFileHandler = forbidden
 run_with_attempt = forbidden
 Path.home = classmethod(lambda cls: forbidden())
 socket.create_connection = socket.getaddrinfo = forbidden

@@ -42,7 +42,7 @@ class AgentManagementTests(unittest.TestCase):
         previous_umask = os.umask(0o077)
         try:
             with patch.object(sys, 'argv', ['hg', command]), \
-                    patch.object(h, 'RotatingFileHandler', return_value=logging.NullHandler()), \
+                    patch.object(h, 'PrivateRotatingFileHandler', return_value=logging.NullHandler()), \
                     patch.object(h.logging, 'basicConfig'), patch.object(h.LOG, 'error'), \
                     patch.object(h, 'api_client') as api, \
                     contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):

@@ -72,22 +72,33 @@ def private_dir(path: Path) -> None:
     path.chmod(0o700)
 
 
-def open_run_lock(path: Path):
-    """Open only a regular, non-symlink lock without waiting for FIFO readers."""
+def open_regular_append(path, *, encoding=None, errors=None):
+    """Append only to a regular, non-symlink file without waiting for readers."""
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NONBLOCK | os.O_NOFOLLOW, 0o600)
     try:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
-            raise SafeError("运行锁必须是普通文件；请检查 state/run.lock。")
-        return os.fdopen(fd, "a")
+            raise SafeError("本地运行文件必须是普通文件；请运行 ./hg doctor 检查。")
+        return os.fdopen(fd, "a", encoding=encoding, errors=errors)
     except BaseException:
         try:
             os.close(fd)
         except Exception as exc:
             try:
-                print("运行锁关闭失败：", type(exc).__name__, file=sys.stderr)
+                print("本地运行文件关闭失败：", type(exc).__name__, file=sys.stderr)
             except Exception:
                 pass
         raise
+
+
+def open_run_lock(path: Path):
+    return open_regular_append(path)
+
+
+class PrivateRotatingFileHandler(RotatingFileHandler):
+    """Use the same safe append opening for initialization and every rollover."""
+
+    def _open(self):
+        return open_regular_append(self.baseFilename, encoding=self.encoding, errors=self.errors)
 
 
 def write_json(path: Path, data: Any) -> None:
@@ -1698,7 +1709,7 @@ def main() -> int:
                     f"另一个进程正在处理，{args.command} 未执行；请等待当前进程结束后重试。"))
             owned_handler = None
             try:
-                owned_handler = RotatingFileHandler(
+                owned_handler = PrivateRotatingFileHandler(
                     STATE / "sync.log", maxBytes=1_000_000, backupCount=3, encoding="utf-8")
                 check_logging = guard_command_logging(owned_handler)
 

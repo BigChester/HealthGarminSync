@@ -161,7 +161,7 @@ class OperationVerificationTests(unittest.TestCase):
             with patch.object(sys, 'argv', ['health_garmin.py', 'verify-operation', str(path)]), \
                     patch.object(h, 'config', return_value=self.cfg), \
                     patch.object(h, 'api_client', return_value=api, side_effect=login_error), \
-                    patch.object(h, 'RotatingFileHandler', return_value=logging.NullHandler()), \
+                    patch.object(h, 'PrivateRotatingFileHandler', return_value=logging.NullHandler()), \
                     patch.object(h.logging, 'basicConfig'), patch.object(h.LOG, 'error'), \
                     contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
                 result = h.main()

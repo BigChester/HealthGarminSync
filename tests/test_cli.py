@@ -132,7 +132,7 @@ class CliTests(ConfigFixture):
         previous_umask = os.umask(0o077)
         try:
             with patch.object(sys, "argv", ["health_garmin.py", command, *arguments]), \
-                    patch.object(h, "RotatingFileHandler", return_value=logging.NullHandler()), \
+                    patch.object(h, "PrivateRotatingFileHandler", return_value=logging.NullHandler()), \
                     patch.object(h.logging, "basicConfig"), \
                     patch.object(h.LOG, "error"), \
                     contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
@@ -239,7 +239,7 @@ class LoggingOwnershipTests(ConfigFixture):
         before = self.config_path.read_bytes()
         with (self.state / 'run.lock').open('a') as holder:
             fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            with patch.object(h, 'RotatingFileHandler', wraps=h.RotatingFileHandler) as factory, \
+            with patch.object(h, 'PrivateRotatingFileHandler', wraps=h.PrivateRotatingFileHandler) as factory, \
                     patch.object(h.logging, 'basicConfig') as configure, \
                     patch.object(h.LOG, 'error') as error, patch.object(h, 'config') as config, \
                     patch.object(h, 'run_with_attempt') as run, patch.object(h, 'manage_agent') as service:
@@ -300,7 +300,7 @@ raise SystemExit(h.main())
             owner.close()
 
     def test_log_creation_error_reporting_and_close_remain_inside_run_lock(self):
-        factory, log_error = h.RotatingFileHandler, h.LOG.error
+        factory, log_error = h.PrivateRotatingFileHandler, h.LOG.error
         for primary, expected in ((h.SafeError('controlled'), 2),
                                   (OSError('private-secret'), 2), (KeyboardInterrupt(), 130)):
             with self.subTest(expected=expected, primary=type(primary).__name__):
@@ -330,7 +330,7 @@ raise SystemExit(h.main())
                     observed.append('error')
                     log_error(*args, **kwargs)
 
-                with patch.object(h, 'RotatingFileHandler', side_effect=create), \
+                with patch.object(h, 'PrivateRotatingFileHandler', side_effect=create), \
                         patch.object(h.LOG, 'error', side_effect=error), \
                         patch.object(h, 'run_with_attempt', side_effect=primary):
                     code, errors = self.invoke()
@@ -343,7 +343,7 @@ raise SystemExit(h.main())
 
     def test_lock_open_failure_is_safe_and_does_not_create_log_handler(self):
         (self.state / 'run.lock').mkdir()
-        with patch.object(h, 'RotatingFileHandler') as factory, \
+        with patch.object(h, 'PrivateRotatingFileHandler') as factory, \
                 patch.object(h.LOG, 'error') as error, patch.object(h, 'run_with_attempt') as run:
             code, errors = self.invoke()
         self.assertEqual(code, 2)
@@ -364,7 +364,7 @@ h.STATE = Path(sys.argv[1])
 h.CONFIG = h.BASE / 'config.json'
 def forbidden(*args, **kwargs):
     raise AssertionError('config, API, home, service or logging accessed before lock validation')
-h.config = h.api_client = h.manage_agent = h.RotatingFileHandler = forbidden
+h.config = h.api_client = h.manage_agent = h.PrivateRotatingFileHandler = forbidden
 h.run_with_attempt = forbidden
 Path.home = classmethod(lambda cls: forbidden())
 socket.create_connection = socket.getaddrinfo = forbidden
@@ -422,7 +422,7 @@ raise SystemExit(h.main())
 
         try:
             with patch.object(h.os, 'open', side_effect=open_fd), patch.object(h.os, 'fdopen') as wrap, \
-                    patch.object(h, 'RotatingFileHandler') as logging_factory, patch.object(h, 'config') as config, \
+                    patch.object(h, 'PrivateRotatingFileHandler') as logging_factory, patch.object(h, 'config') as config, \
                     patch.object(h, 'api_client') as api, patch.object(h, 'run_with_attempt') as run:
                 code, errors = self.invoke()
             self.assertEqual(code, 2)
@@ -499,14 +499,14 @@ raise SystemExit(h.main())
 
     def test_repeated_commands_close_real_owned_handlers(self):
         handlers = []
-        factory = h.RotatingFileHandler
+        factory = h.PrivateRotatingFileHandler
 
         def create(*args, **kwargs):
             handler = factory(*args, **kwargs)
             handlers.append(handler)
             return handler
 
-        with patch.object(h, "RotatingFileHandler", side_effect=create), \
+        with patch.object(h, "PrivateRotatingFileHandler", side_effect=create), \
                 patch.object(h, "run_with_attempt"):
             for _ in range(3):
                 self.assertEqual(self.invoke(), (0, ""))
@@ -518,9 +518,9 @@ raise SystemExit(h.main())
         existing = logging.FileHandler(self.root / "caller.log")
         self.addCleanup(existing.close)
         self.root_logger.addHandler(existing)
-        factory = h.RotatingFileHandler
+        factory = h.PrivateRotatingFileHandler
         owned = factory(self.state / "owned.log")
-        with patch.object(h, "RotatingFileHandler", return_value=owned), \
+        with patch.object(h, "PrivateRotatingFileHandler", return_value=owned), \
                 patch.object(h, "run_with_attempt"):
             self.assertEqual(self.invoke(), (0, ""))
         self.assertEqual(self.root_logger.handlers, [existing])
@@ -531,7 +531,7 @@ raise SystemExit(h.main())
 
     def test_logging_initialization_failure_is_safe_and_closes_owned_handler(self):
         owned = h.RotatingFileHandler(self.state / "owned.log")
-        with patch.object(h, "RotatingFileHandler", return_value=owned), \
+        with patch.object(h, "PrivateRotatingFileHandler", return_value=owned), \
                 patch.object(h.logging, "basicConfig", side_effect=OSError("private-secret")), \
                 patch.object(h.LOG, "error"), patch.object(h, "run_with_attempt") as run:
             result, errors = self.invoke()
@@ -552,7 +552,7 @@ raise SystemExit(h.main())
                     close()
                     raise OSError("private-secret")
 
-                with patch.object(h, "RotatingFileHandler", return_value=owned), \
+                with patch.object(h, "PrivateRotatingFileHandler", return_value=owned), \
                         patch.object(owned, "close", side_effect=failing_close), \
                         patch.object(h, "run_with_attempt", side_effect=exc):
                     result, errors = self.invoke()
