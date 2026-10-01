@@ -72,9 +72,9 @@ def private_dir(path: Path) -> None:
     path.chmod(0o700)
 
 
-def open_regular_text(path, mode, *, encoding=None, errors=None, reject_symlink=True):
+def open_regular_file(path, mode, *, encoding=None, errors=None, reject_symlink=True):
     """Open a regular file without blocking or truncating an unchecked path."""
-    flags = {"r": os.O_RDONLY, "w": os.O_WRONLY | os.O_CREAT,
+    flags = {"r": os.O_RDONLY, "rb": os.O_RDONLY, "w": os.O_WRONLY | os.O_CREAT,
              "a": os.O_WRONLY | os.O_CREAT | os.O_APPEND}[mode] | os.O_NONBLOCK
     if reject_symlink:
         flags |= os.O_NOFOLLOW
@@ -84,7 +84,8 @@ def open_regular_text(path, mode, *, encoding=None, errors=None, reject_symlink=
             raise SafeError("本地文件必须是普通文件。")
         if mode == "w":
             os.ftruncate(fd, 0)
-        return os.fdopen(fd, mode, encoding=encoding, errors=errors)
+        return os.fdopen(fd, mode, encoding=None if mode == "rb" else encoding,
+                         errors=None if mode == "rb" else errors)
     except BaseException:
         try:
             os.close(fd)
@@ -94,6 +95,11 @@ def open_regular_text(path, mode, *, encoding=None, errors=None, reject_symlink=
             except Exception:
                 pass
         raise
+
+
+def open_regular_text(path, mode, *, encoding=None, errors=None, reject_symlink=True):
+    return open_regular_file(path, mode, encoding=encoding, errors=errors,
+                             reject_symlink=reject_symlink)
 
 
 def open_regular_append(path, *, encoding=None, errors=None):

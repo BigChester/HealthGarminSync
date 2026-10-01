@@ -92,7 +92,7 @@ class DoctorTests(unittest.TestCase):
         stdout, stderr = io.StringIO(), io.StringIO()
         original_import = builtins.__import__
         original_read = Path.read_text
-        original_open = h.open_regular_text
+        original_open = h.open_regular_file
 
         def offline_import(name, *args, **kwargs):
             if name.split('.')[0] in ('garminconnect', 'requests', 'curl_cffi', 'garth'):
@@ -106,8 +106,8 @@ class DoctorTests(unittest.TestCase):
 
         def open_readonly_without_tokens(path, mode, *args, **kwargs):
             path = Path(path)
-            if mode != 'r' or path == self.tokens or self.tokens in path.parents:
-                raise AssertionError('unsafe JSON file access')
+            if mode not in ('r', 'rb') or path == self.tokens or self.tokens in path.parents:
+                raise AssertionError('unsafe local file access')
             return original_open(path, mode, *args, **kwargs)
 
         with contextlib.ExitStack() as stack:
@@ -122,7 +122,7 @@ class DoctorTests(unittest.TestCase):
             for name in ('mkdir', 'chmod', 'write_text', 'write_bytes', 'replace', 'touch', 'unlink'):
                 stack.enter_context(patch.object(Path, name, side_effect=AssertionError('filesystem mutation')))
             stack.enter_context(patch.object(Path, 'read_text', read_without_tokens))
-            stack.enter_context(patch.object(h, 'open_regular_text', open_readonly_without_tokens))
+            stack.enter_context(patch.object(h, 'open_regular_file', open_readonly_without_tokens))
             stack.enter_context(patch('builtins.__import__', side_effect=offline_import))
             stack.enter_context(contextlib.redirect_stdout(stdout))
             stack.enter_context(contextlib.redirect_stderr(stderr))
@@ -143,7 +143,7 @@ class DoctorTests(unittest.TestCase):
         self.assertEqual(result, 2 if report['summary']['error'] else 0)
         return result, report, {item['id']: item for item in report['checks']}
 
-    def test_fifo_json_reads_finish_with_safe_errors_in_real_cli(self):
+    def test_fifo_json_and_plist_reads_finish_with_safe_errors_in_real_cli(self):
         script = '''import os, pathlib, socket, sys
 from unittest.mock import patch
 sys.path[:0] = [sys.argv[1], str(pathlib.Path(sys.argv[1]) / 'tests')]
@@ -153,7 +153,8 @@ fixture = DoctorTests()
 fixture.setUp()
 try:
     name, identifier = sys.argv[2:]
-    path = fixture.config_path if name == 'config.json' else fixture.state / name
+    path = (fixture.config_path if name == 'config.json' else fixture.plist
+            if name == 'agent.plist' else fixture.state / name)
     path.parent.mkdir(exist_ok=True)
     if path.exists():
         path.unlink()
@@ -165,6 +166,8 @@ try:
         code, _, checks = fixture.report()
         fixture.assertEqual(code, 2)
         fixture.assertEqual(checks[identifier]['status'], 'error')
+        fixture.service.assert_called_once_with(
+            ['/bin/launchctl', 'print', f'gui/{os.getuid()}/{h.LABEL}'], capture_output=True, timeout=5)
         text_code, _ = fixture.invoke('doctor')
         fixture.assertEqual(text_code, 2)
         if identifier != 'last_run':
@@ -174,7 +177,8 @@ finally:
     fixture.doCleanups()
 '''
         for name, identifier in (('config.json', 'config'), ('last_attempt.json', 'last_attempt'),
-                                 ('last_run.json', 'last_run'), ('operations/test.json', 'operations')):
+                                 ('last_run.json', 'last_run'), ('operations/test.json', 'operations'),
+                                 ('agent.plist', 'agent_plist')):
             with self.subTest(path=name), tempfile.TemporaryDirectory() as isolated:
                 child = subprocess.Popen([sys.executable, '-B', '-c', script,
                     str(Path(__file__).resolve().parents[1]), name, identifier], cwd=isolated,
@@ -186,7 +190,7 @@ finally:
                     except subprocess.TimeoutExpired:
                         child.kill()
                         child.communicate(timeout=2)
-                        self.fail('FIFO JSON read blocked the doctor command')
+                        self.fail('FIFO file read blocked the doctor command')
                     self.assertEqual(child.returncode, 0, stdout + stderr)
                 finally:
                     if child.poll() is None:
@@ -201,6 +205,57 @@ finally:
         self.config_path.symlink_to(target)
         self.assertEqual(self.report()[0], 0)
         self.assertEqual(self.invoke('doctor')[0], 0)
+
+    def test_plist_xml_and_binary_remain_readable_and_nonregular_paths_are_errors(self):
+        document = dict(h.agent_plist(), SyntheticNote='临时中文 ' + SECRET)
+        for fmt in (plistlib.FMT_XML, plistlib.FMT_BINARY):
+            with self.subTest(format=fmt):
+                self.plist.write_bytes(plistlib.dumps(document, fmt=fmt))
+                code, _, checks = self.report()
+                self.assertEqual(code, 0)
+                self.assertEqual(checks['agent_plist']['status'], 'ok')
+                self.assertEqual(self.invoke('doctor')[0], 0)
+        target = self.root / 'external-plist'
+        self.plist.replace(target)
+        original = target.read_bytes()
+        for kind in ('directory', 'symlink'):
+            with self.subTest(kind=kind):
+                self.plist.mkdir() if kind == 'directory' else self.plist.symlink_to(target)
+                try:
+                    code, _, checks = self.report()
+                    self.assertEqual(code, 2)
+                    self.assertEqual(checks['agent_plist']['status'], 'error')
+                    self.assertEqual(checks['last_run']['status'], 'info')
+                    self.assertEqual(checks['last_agent_attempt']['status'], 'info')
+                    self.assertEqual(self.invoke('doctor')[0], 2)
+                    self.assertEqual(target.read_bytes(), original)
+                finally:
+                    self.plist.rmdir() if kind == 'directory' else self.plist.unlink()
+
+    def test_binary_reader_rejects_connected_fifo_without_consuming_or_leaking_fd(self):
+        fifo = self.root / 'connected-fifo'
+        os.mkfifo(fifo, 0o600)
+        native_open = os.open
+        peer = native_open(fifo, os.O_RDWR | os.O_NONBLOCK)
+        try:
+            os.write(peer, b'Untouched queued bytes')
+            opened = []
+
+            def open_fd(*args, **kwargs):
+                fd = native_open(*args, **kwargs)
+                opened.append(fd)
+                return fd
+
+            with patch.object(h.os, 'open', side_effect=open_fd), \
+                    patch.object(h.os, 'fdopen') as wrap, self.assertRaises(h.SafeError):
+                h.open_regular_file(fifo, 'rb')
+            wrap.assert_not_called()
+            self.assertEqual(len(opened), 1)
+            with self.assertRaises(OSError):
+                os.fstat(opened[0])
+            self.assertEqual(os.read(peer, 100), b'Untouched queued bytes')
+        finally:
+            os.close(peer)
 
     def test_nonregular_evidence_temporary_files_do_not_hide_healthy_completed_evidence(self):
         for name in ('last_attempt.json.tmp', 'last_agent_attempt.json.tmp', 'last_run.json.tmp'):

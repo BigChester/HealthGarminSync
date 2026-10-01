@@ -341,7 +341,8 @@ def collect():
         try:
             if plist.is_symlink():
                 raise ValueError('symlink')
-            actual = plistlib.loads(plist.read_bytes())
+            with h.open_regular_file(plist, 'rb') as stream:
+                actual = plistlib.load(stream)
             expected = h.agent_plist()
             if not isinstance(actual, dict):
                 raise ValueError('invalid plist')
@@ -356,7 +357,7 @@ def collect():
         except FileNotFoundError:
             add('agent_plist', 'error' if enabled else 'warn', '尚未安装 LaunchAgent。',
                 '运行 ./hg install-agent。' if enabled else None)
-        except (OSError, ValueError, RecursionError, plistlib.InvalidFileException, ExpatError):
+        except (OSError, ValueError, RecursionError, h.SafeError, plistlib.InvalidFileException, ExpatError):
             add('agent_plist', 'error', 'LaunchAgent 配置无法读取或不是有效 plist。',
                 '运行 ./hg install-agent 更新任务。')
         try:
