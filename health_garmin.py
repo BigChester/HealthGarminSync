@@ -607,6 +607,11 @@ def state_row(db: sqlite3.Connection, r: Measurement) -> sqlite3.Row | None:
     return db.execute("SELECT * FROM uploads WHERE record_id=?", (r.key,)).fetchone()
 
 
+def local_status_counts(db: sqlite3.Connection) -> dict[str, int]:
+    return {row["status"]: row["n"] for row in
+            db.execute("SELECT status,COUNT(*) AS n FROM uploads GROUP BY status")}
+
+
 def active_operations() -> set[str]:
     active = set()
     for path in (STATE / "operations").glob("*.json"):
@@ -1187,8 +1192,13 @@ def run_sync(cfg: dict[str, Any], record_id: str | None = None) -> None:
             print("已取消。")
             return
     summary = {"run_at": now().isoformat(), "exports": exports,
-               "complete_measurements": len(records), "waiting_pairs": len(waiting), "results": {}}
+               "complete_measurements": len(records), "waiting_pairs": len(waiting), "results": {},
+               "local_status_counts": {}}
     if not records:
+        dbpath = STATE / "sync.sqlite3"
+        if dbpath.exists() or dbpath.is_symlink():
+            with contextlib.closing(database()) as db, db:
+                summary["local_status_counts"] = local_status_counts(db)
         print("没有可用测量，无须访问 Garmin。")
         write_json(STATE / "last_run.json", summary)
         return
@@ -1232,6 +1242,7 @@ def run_sync(cfg: dict[str, Any], record_id: str | None = None) -> None:
             summary["results"][r.key] = result
             print(r.key, result)
             LOG.info("record=%s status=%s", r.key, result)
+        summary["local_status_counts"] = local_status_counts(db)
         write_json(STATE / "last_sync_comparison.json", {"checked_at": now().isoformat()})
         if settling:
             summary["deferred"] = "settling"

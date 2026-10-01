@@ -361,6 +361,40 @@ class DoctorTests(unittest.TestCase):
                 self.assertEqual(checks['last_run']['status'], severity)
                 self.assertEqual(checks['last_run']['data']['results'], {value: 1 for value in outcomes})
 
+    def test_local_state_snapshot_severity_includes_records_outside_latest_results(self):
+        for status in sorted(d.RESULTS):
+            with self.subTest(status=status):
+                self.last.write_text(json.dumps({'run_at': h.now().isoformat(),
+                    'results': {SECRET: 'verified'}, 'local_status_counts': {status: 2}}))
+                code, _, checks = self.report()
+                expected = 'error' if status in d.UNCERTAIN_RESULTS else 'warn' if status in d.REVIEW_RESULTS else 'info'
+                self.assertEqual(code, 2 if expected == 'error' else 0)
+                check = checks['last_run']
+                self.assertEqual(check['status'], expected)
+                self.assertEqual(check['data']['local_status_counts'], {status: 2})
+                self.assertEqual(check['data']['results'], {'verified': 1})
+                if expected != 'info':
+                    self.assertIn('快照', check['hint'])
+                    self.assertIn('./hg status', check['hint'])
+
+    def test_zero_local_counts_do_not_report_unresolved_records(self):
+        self.last.write_text(json.dumps({'run_at': h.now().isoformat(), 'results': {},
+            'local_status_counts': {'uncertain': 0, 'verified_conflict': 0}}))
+        code, _, checks = self.report()
+        self.assertEqual(code, 0)
+        self.assertEqual(checks['last_run']['status'], 'info')
+
+    def test_invalid_local_status_counts_are_errors_without_private_details(self):
+        for counts in (None, [], {SECRET: 1}, {'uncertain': -1}, {'uncertain': True},
+                       {'verified': '1'}, {'verified': 1.5}, {'verified': {}}, {'verified': None}):
+            with self.subTest(counts=counts):
+                self.last.write_text(json.dumps({'run_at': h.now().isoformat(),
+                    'results': {}, 'local_status_counts': counts}))
+                code, _, checks = self.report()
+                self.assertEqual(code, 2)
+                self.assertEqual(checks['last_run']['status'], 'error')
+                self.assertNotIn('data', checks['last_run'])
+
     def test_stale_summary_keeps_uncertain_error_and_task_hint(self):
         self.last.write_text(json.dumps({'run_at': (h.now() - timedelta(hours=3)).isoformat(),
                                         'results': {SECRET: 'uncertain'}}))

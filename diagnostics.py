@@ -190,18 +190,24 @@ def collect():
                 raise ValueError('invalid last run')
             ran_at = h.aware(last['run_at'])
             counts = dict(Counter(last['results'].values()))
+            local_counts = last.get('local_status_counts', {})
+            if (not isinstance(local_counts, dict)
+                    or any(key not in RESULTS or type(count) is not int or count < 0
+                           for key, count in local_counts.items())):
+                raise ValueError('invalid local status counts')
+            statuses = set(counts) | {key for key, count in local_counts.items() if count > 0}
             stale = cfg is not None and cfg['enabled'] and (h.now() - ran_at).total_seconds() > STALE_SECONDS
-            if UNCERTAIN_RESULTS.intersection(counts):
+            if UNCERTAIN_RESULTS.intersection(statuses):
                 status = 'error'
                 message = '最近运行摘要包含请求结果未确定的记录。'
                 hint = '先用 ./hg compare 查询并人工核对；结果未确定时不要重复提交。'
-                if 'repair_uncertain' in counts:
+                if 'repair_uncertain' in statuses:
                     hint += ' 有修复操作日志时用 ./hg verify-operation 核对。'
-            elif REVIEW_RESULTS.intersection(counts):
+            elif REVIEW_RESULTS.intersection(statuses):
                 status = 'warn'
                 message = '最近运行摘要包含需要人工处理的差异。'
                 hint = '运行 ./hg compare 并人工核对；修复或冲突按对账清单处理。'
-                if 'remote_missing' in counts:
+                if 'remote_missing' in statuses:
                     hint += ' 已确认缺失的记录按 resolve --absent 流程处理。'
             else:
                 status = 'info'
@@ -211,8 +217,13 @@ def collect():
                 if status == 'info':
                     status = 'warn'
                 hint = (hint + ' ' if hint else '') + '最近运行摘要距今超过两小时；请核对任务与设备状态。'
+            data = {'run_at': ran_at.isoformat(), 'results': counts}
+            if 'local_status_counts' in last:
+                data['local_status_counts'] = local_counts
+                if status in ('error', 'warn') and any(local_counts.values()):
+                    hint = (hint + ' ' if hint else '') + '本地状态为最近同步时的快照；运行 ./hg status 核对当前状态。'
             add('last_run', status, message, hint,
-                data={'run_at': ran_at.isoformat(), 'results': counts})
+                data=data)
         except FileNotFoundError:
             add('last_run', 'warn', '尚无最近运行摘要。')
         except (OSError, UnicodeError, ValueError, h.SafeError):

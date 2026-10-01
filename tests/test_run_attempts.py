@@ -14,7 +14,7 @@ from unittest.mock import patch
 
 import health_garmin as h
 import test_diagnostics as fixtures
-from test_reconciliation import API
+from test_reconciliation import API, row
 
 SECRET = fixtures.SECRET
 
@@ -172,14 +172,17 @@ class RunAttemptTests(unittest.TestCase):
         api.assert_not_called()
         self.assertEqual(self.report()[2]['last_attempt']['status'], 'info')
 
-    def test_no_records_and_normal_upload_complete_without_changing_last_run_schema(self):
+    def test_no_records_and_normal_upload_include_local_state_counts(self):
         with patch.object(h, 'load_measurements', return_value=([], [], [], {})), patch.object(h, 'api_client') as api:
             result, _, _ = self.run_main()
         self.assertEqual(result, 0)
         self.assertEqual(self.attempt()['outcome'], 'completed')
         summary = json.loads(self.last.read_text())
-        self.assertEqual(set(summary), {'run_at', 'exports', 'complete_measurements', 'waiting_pairs', 'results'})
+        self.assertEqual(set(summary), {'run_at', 'exports', 'complete_measurements', 'waiting_pairs',
+                                        'results', 'local_status_counts'})
         self.assertEqual(summary['results'], {})
+        self.assertEqual(summary['local_status_counts'], {})
+        self.assertFalse((self.state / 'sync.sqlite3').exists())
         api.assert_not_called()
         api = API()
         with patch.object(h, 'api_client', return_value=api):
@@ -188,6 +191,74 @@ class RunAttemptTests(unittest.TestCase):
         self.assertEqual(self.attempt()['outcome'], 'completed')
         self.assertEqual(len(api.posts), 1)
         self.assertEqual(self.report()[2]['last_run']['data']['results'], {'verified': 1})
+        self.assertEqual(self.report()[2]['last_run']['data']['local_status_counts'], {'verified': 1})
+
+    def test_empty_export_keeps_uncertain_database_states_visible_without_api(self):
+        record = h.load_measurements(self.cfg)[1][0]
+        data = json.loads(self.export.read_text())
+        for samples in data['metrics'].values():
+            samples.clear()
+        self.export.write_text(json.dumps(data))
+        for status in ('inflight', 'uncertain', 'repair_uncertain'):
+            with self.subTest(status=status):
+                with contextlib.closing(h.database()) as db:
+                    h.set_status(db, record, status)
+                with patch.object(h, 'api_client') as api:
+                    self.assertEqual(self.run_main()[0], 0)
+                api.assert_not_called()
+                self.assertEqual(self.attempt()['outcome'], 'completed')
+                summary = json.loads(self.last.read_text())
+                self.assertEqual(summary['results'], {})
+                self.assertEqual(summary['local_status_counts'], {status: 1})
+                code, _, checks = self.report()
+                self.assertEqual(code, 2)
+                self.assertEqual(checks['last_run']['status'], 'error')
+                self.assertEqual(checks['last_run']['data']['local_status_counts'], {status: 1})
+        with contextlib.closing(h.database()) as db:
+            h.set_status(db, record, 'verified_manual')
+        with patch.object(h, 'api_client') as api:
+            self.assertEqual(self.run_main()[0], 0)
+        api.assert_not_called()
+        code, _, checks = self.report()
+        self.assertEqual(code, 0)
+        self.assertEqual(checks['last_run']['status'], 'info')
+        self.assertEqual(checks['last_run']['data']['local_status_counts'], {'verified_manual': 1})
+
+    def test_current_match_and_single_upload_do_not_hide_other_uncertain_records(self):
+        record = h.load_measurements(self.cfg)[1][0]
+        missing = h.Measurement(record.at - timedelta(days=1), 70, 23.5, SECRET)
+        with contextlib.closing(h.database()) as db:
+            h.set_status(db, missing, 'uncertain')
+        api = API([row(record)])
+        with patch.object(h, 'api_client', return_value=api):
+            self.assertEqual(self.run_main()[0], 0)
+        for single in (False, True):
+            with self.subTest(single=single):
+                if single:
+                    with patch.object(h, 'api_client', return_value=api), \
+                            patch('builtins.input', return_value='UPLOAD'), \
+                            contextlib.redirect_stdout(io.StringIO()):
+                        h.run_sync(self.cfg, record.key)
+                summary = json.loads(self.last.read_text())
+                self.assertEqual(summary['results'], {record.key: 'verified'})
+                self.assertEqual(summary['local_status_counts'], {'uncertain': 1, 'verified': 1})
+                code, _, checks = self.report()
+                self.assertEqual(code, 2)
+                self.assertEqual(checks['last_run']['status'], 'error')
+        self.assertFalse(api.posts)
+        self.assertFalse(api.deletes)
+
+    def test_empty_export_cannot_mask_unreadable_existing_database(self):
+        self.export.write_text(json.dumps({'schema_version': 2,
+            'exported_at': h.now().isoformat(), 'metrics': {'weight': []}}))
+        previous = self.last.read_bytes()
+        database = self.state / 'sync.sqlite3'
+        database.write_text('invalid database')
+        with patch.object(h, 'api_client') as api:
+            self.assertEqual(self.run_main()[0], 2)
+        api.assert_not_called()
+        self.assertEqual(self.attempt()['outcome'], 'failed')
+        self.assertEqual(self.last.read_bytes(), previous)
 
     def test_terminal_write_occurs_while_independent_descriptor_cannot_acquire_lock(self):
         writer = h.write_json
