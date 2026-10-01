@@ -34,9 +34,22 @@ def _json(path, reject_symlink=True):
         raise ValueError('JSON nesting too deep') from exc
 
 
+class FutureEvidenceError(ValueError):
+    pass
+
+
+def evidence_time(text, reference_time):
+    stamp = h.aware(text)
+    if (stamp - reference_time).total_seconds() > 600:
+        raise FutureEvidenceError('future evidence time')
+    return stamp
+
+
 def attempt_summary(value, *, allowed_stages=('config', 'sync'),
                     allowed_outcomes=('running', 'completed', 'preview', 'failed', 'interrupted'),
-                    allow_http=True):
+                    allow_http=True, reference_time=None):
+    if reference_time is None:
+        reference_time = h.now()
     fields = {'outcome', 'started_at', 'finished_at', 'stage', 'error_type'}
     if not isinstance(value, dict) or set(value) != fields:
         raise ValueError('invalid attempt fields')
@@ -45,7 +58,7 @@ def attempt_summary(value, *, allowed_stages=('config', 'sync'),
         raise ValueError('invalid attempt values')
     if not isinstance(value['started_at'], str):
         raise ValueError('invalid attempt start')
-    started = h.aware(value['started_at'])
+    started = evidence_time(value['started_at'], reference_time)
     finished = value['finished_at']
     error = value['error_type']
     if outcome == 'running':
@@ -54,7 +67,7 @@ def attempt_summary(value, *, allowed_stages=('config', 'sync'),
     else:
         if not isinstance(finished, str):
             raise ValueError('invalid attempt finish')
-        finished = h.aware(finished)
+        finished = evidence_time(finished, reference_time)
         if finished < started:
             raise ValueError('attempt ended before it started')
         if outcome in ('completed', 'preview'):
@@ -71,6 +84,7 @@ def attempt_summary(value, *, allowed_stages=('config', 'sync'),
 
 def collect():
     checks = []
+    reference_time = h.now()
 
     def add(identifier, status, message, hint=None, data=None):
         item = {'id': identifier, 'status': status, 'message': message}
@@ -195,7 +209,7 @@ def collect():
                     or not isinstance(last.get('results'), dict)
                     or any(not isinstance(result, str) or result not in RESULTS for result in last['results'].values())):
                 raise ValueError('invalid last run')
-            ran_at = h.aware(last['run_at'])
+            ran_at = evidence_time(last['run_at'], reference_time)
             counts = dict(Counter(last['results'].values()))
             local_counts = last.get('local_status_counts', {})
             if (not isinstance(local_counts, dict)
@@ -203,7 +217,7 @@ def collect():
                            for key, count in local_counts.items())):
                 raise ValueError('invalid local status counts')
             statuses = set(counts) | {key for key, count in local_counts.items() if count > 0}
-            stale = cfg is not None and cfg['enabled'] and (h.now() - ran_at).total_seconds() > STALE_SECONDS
+            stale = cfg is not None and cfg['enabled'] and (reference_time - ran_at).total_seconds() > STALE_SECONDS
             if UNCERTAIN_RESULTS.intersection(statuses):
                 status = 'error'
                 message = '最近运行摘要包含请求结果未确定的记录。'
@@ -233,10 +247,13 @@ def collect():
                 data=data)
         except FileNotFoundError:
             add('last_run', 'warn', '尚无最近运行摘要。')
+        except FutureEvidenceError:
+            add('last_run', 'error', '最近运行摘要时间晚于当前 Mac 时间超过十分钟。',
+                '核对 Mac 时间和 state/last_run.json 中的时间证据。')
         except (OSError, UnicodeError, ValueError, h.SafeError):
             add('last_run', 'error', '最近运行摘要无法读取或结构无效。', '检查 state/last_run.json。')
         try:
-            attempt = attempt_summary(_json(h.STATE / 'last_attempt.json'))
+            attempt = attempt_summary(_json(h.STATE / 'last_attempt.json'), reference_time=reference_time)
             outcome = attempt['outcome']
             status = 'error' if outcome in ('failed', 'interrupted') else 'warn' if outcome == 'running' else 'info'
             messages = {'running': '最近运行尚无结束证据；可能仍在运行或曾被中断。',
@@ -247,13 +264,16 @@ def collect():
             add('last_attempt', status, messages[outcome], data=attempt)
         except FileNotFoundError:
             add('last_attempt', 'info', '尚无运行尝试摘要；兼容已有安装。')
+        except FutureEvidenceError:
+            add('last_attempt', 'error', '运行尝试摘要时间晚于当前 Mac 时间超过十分钟。',
+                '核对 Mac 时间和 state/last_attempt.json 中的时间证据。')
         except (OSError, UnicodeError, ValueError, h.SafeError):
             add('last_attempt', 'error', '运行尝试摘要无法读取或结构无效。', '检查 state/last_attempt.json。')
         try:
             attempt = attempt_summary(_json(h.STATE / 'last_agent_attempt.json'),
                                       allowed_stages=('setup', 'run'),
                                       allowed_outcomes=('running', 'completed', 'failed', 'interrupted'),
-                                      allow_http=False)
+                                      allow_http=False, reference_time=reference_time)
             outcome = attempt['outcome']
             status = 'error' if outcome in ('failed', 'interrupted') else 'warn' if outcome == 'running' else 'info'
             messages = {'running': '最近后台入口尚无结束证据；可能仍在运行或曾被中断。',
@@ -261,7 +281,7 @@ def collect():
                         'failed': '最近后台入口失败；请查看本地日志并核对运行摘要。',
                         'interrupted': '最近后台入口已中断；先核对运行摘要与 Garmin，不要直接重发。'}
             latest = h.aware(attempt['finished_at'] or attempt['started_at'])
-            stale = cfg is not None and cfg['enabled'] and (h.now() - latest).total_seconds() > STALE_SECONDS
+            stale = cfg is not None and cfg['enabled'] and (reference_time - latest).total_seconds() > STALE_SECONDS
             hint = None
             if stale:
                 if status == 'info':
@@ -272,6 +292,9 @@ def collect():
             enabled = cfg is not None and cfg['enabled']
             add('last_agent_attempt', 'warn' if enabled else 'info',
                 '尚无后台入口摘要；兼容已有安装，不能据此确认后台执行。')
+        except FutureEvidenceError:
+            add('last_agent_attempt', 'error', '后台入口摘要时间晚于当前 Mac 时间超过十分钟。',
+                '核对 Mac 时间和 state/last_agent_attempt.json 中的时间证据。')
         except (OSError, UnicodeError, ValueError, h.SafeError):
             add('last_agent_attempt', 'error', '后台入口摘要无法读取或结构无效。',
                 '检查 state/last_agent_attempt.json。')

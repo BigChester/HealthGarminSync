@@ -416,6 +416,97 @@ class DoctorTests(unittest.TestCase):
                 self.assertEqual(report['status'], 'error')
                 self.assertEqual(checks['last_run']['status'], 'error')
 
+    def test_run_summary_future_tolerance_and_stale_boundary(self):
+        current = h.now()
+        other_zone = h.aware('2026-10-02T10:00:00+08:00').tzinfo
+        cases = [(timedelta(minutes=10), h.UTC, {}, 'info'),
+                 (timedelta(minutes=10), other_zone, {}, 'info'),
+                 (timedelta(minutes=10, microseconds=1), h.UTC, {}, 'error'),
+                 (timedelta(days=30), other_zone, {}, 'error'),
+                 (-timedelta(hours=2), h.UTC, {}, 'info'),
+                 (-timedelta(hours=2, microseconds=1), h.UTC, {}, 'warn'),
+                 (timedelta(minutes=10), h.UTC, {SECRET: 'uncertain'}, 'error')]
+        for skew, zone, results, expected in cases:
+            with self.subTest(skew=skew, zone=zone, results=results):
+                stamp = (current + skew).astimezone(zone).isoformat()
+                self.last.write_text(json.dumps({'run_at': stamp, 'results': results}))
+                with patch.object(h, 'now', return_value=current):
+                    code, _, checks = self.report()
+                check = checks['last_run']
+                self.assertEqual(code, 2 if expected == 'error' else 0)
+                self.assertEqual(check['status'], expected)
+                if skew > timedelta(minutes=10):
+                    self.assertIn('Mac 时间', check['hint'])
+                    self.assertIn('state/last_run.json', check['hint'])
+                    self.assertNotIn('data', check)
+                elif results:
+                    self.assertIn('未确定', check['message'])
+                else:
+                    self.assertEqual('超过两小时' in check.get('hint', ''), expected == 'warn')
+
+    def test_attempt_start_and_finish_share_future_tolerance(self):
+        current = h.now()
+        other_zone = h.aware('2026-10-02T10:00:00+08:00').tzinfo
+        paths = ((self.state / 'last_attempt.json', 'sync', 'last_attempt'),
+                 (self.agent_attempt, 'run', 'last_agent_attempt'))
+        cases = [('running', 'started_at', timedelta(minutes=10), 'warn'),
+                 ('running', 'started_at', timedelta(minutes=10, microseconds=1), 'error'),
+                 ('completed', 'finished_at', timedelta(minutes=10), 'info'),
+                 ('completed', 'finished_at', timedelta(minutes=10, microseconds=1), 'error'),
+                 ('completed', 'started_at', timedelta(days=30), 'error'),
+                 ('failed', 'finished_at', timedelta(minutes=10), 'error'),
+                 ('interrupted', 'finished_at', timedelta(minutes=10), 'error')]
+        for path, stage, identifier in paths:
+            if identifier == 'last_agent_attempt':
+                (self.state / 'last_attempt.json').unlink()
+            for outcome, field, skew, expected in cases:
+                with self.subTest(identifier=identifier, outcome=outcome, field=field, skew=skew):
+                    stamp = (current + skew).astimezone(other_zone).isoformat()
+                    document = {'outcome': outcome, 'stage': stage,
+                                'started_at': current.isoformat(),
+                                'finished_at': None if outcome == 'running' else current.isoformat(),
+                                'error_type': {'failed': 'OSError',
+                                               'interrupted': 'KeyboardInterrupt'}.get(outcome)}
+                    document[field] = stamp
+                    if field == 'started_at' and outcome != 'running':
+                        document['finished_at'] = stamp
+                    path.write_text(json.dumps(document))
+                    with patch.object(h, 'now', return_value=current):
+                        code, _, checks = self.report()
+                    check = checks[identifier]
+                    self.assertEqual(check['status'], expected)
+                    self.assertEqual(code, 2 if expected == 'error' else 0)
+                    if skew > timedelta(minutes=10):
+                        self.assertIn('Mac 时间', check['hint'])
+                        self.assertIn('state/' + path.name, check['hint'])
+                        self.assertNotIn('data', check)
+                    elif outcome in ('failed', 'interrupted'):
+                        self.assertIn('失败' if outcome == 'failed' else '中断', check['message'])
+                    elif outcome == 'running':
+                        self.assertIsNone(check['data']['finished_at'])
+
+    def test_disabled_future_evidence_is_error_in_json_and_text_reports(self):
+        self.cfg['enabled'] = False
+        self.save_config()
+        current = h.now()
+        future = (current + timedelta(days=30)).isoformat()
+        self.last.write_text(json.dumps({'run_at': future, 'results': {SECRET: 'verified'}}))
+        for path, stage in ((self.state / 'last_attempt.json', 'sync'), (self.agent_attempt, 'run')):
+            path.write_text(json.dumps({'outcome': 'completed', 'stage': stage,
+                'started_at': future, 'finished_at': future, 'error_type': None}))
+        with patch.object(h, 'now', return_value=current):
+            code, _, checks = self.report()
+            text_code, output = self.invoke('doctor')
+        self.assertEqual(code, 2)
+        self.assertEqual(text_code, 2)
+        for identifier in ('last_run', 'last_attempt', 'last_agent_attempt'):
+            self.assertEqual(checks[identifier]['status'], 'error')
+            self.assertIn('Mac 时间', checks[identifier]['hint'])
+            self.assertIn('state/' + identifier + '.json', checks[identifier]['hint'])
+            self.assertNotIn('data', checks[identifier])
+        self.assertNotIn(future, output)
+        self.assertNotIn('已停止', output)
+
     def test_fresh_manual_run_does_not_hide_stale_background_entry(self):
         current = h.now()
         self.last.write_text(json.dumps({'run_at': current.isoformat(), 'results': {SECRET: 'verified'}}))
