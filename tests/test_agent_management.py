@@ -1,4 +1,4 @@
-"""LaunchAgent management with private files and mocked launchctl only."""
+"""LaunchAgent commands with private files and mocked launchctl only."""
 import contextlib
 import fcntl
 import io
@@ -55,6 +55,75 @@ class AgentManagementTests(unittest.TestCase):
 
     def assert_no_drafts(self):
         self.assertEqual(list(self.directory.glob(f'.{h.LABEL}.*.tmp')), [])
+
+    def test_status_success_queries_only_print_with_timeout_and_held_run_lock(self):
+        previous = self.config_path.read_bytes()
+
+        def query(command, **kwargs):
+            self.assertEqual(command, ['/bin/launchctl', 'print', f'gui/{os.getuid()}/{h.LABEL}'])
+            self.assertEqual(kwargs, {'capture_output': True, 'timeout': 5})
+            with (self.state / 'run.lock').open('r') as probe:
+                with self.assertRaises(BlockingIOError):
+                    fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return subprocess.CompletedProcess(command, 0, SECRET, SECRET)
+
+        self.service.side_effect = query
+        code, output, errors = self.command('status')
+        self.assertEqual(code, 0)
+        self.assertIn('LaunchAgent 已载入： True', output)
+        self.assertEqual(errors, '')
+        self.assertEqual(self.service.call_count, 1)
+        self.assertEqual(self.config_path.read_bytes(), previous)
+        self.assertEqual(self.plist.read_bytes(), self.original)
+
+    def test_status_nonzero_query_is_error_without_claiming_known_service_state(self):
+        previous = self.config_path.read_bytes()
+        for result in (3, 5, 113):
+            with self.subTest(result=result):
+                self.service.reset_mock()
+                self.service.return_value = subprocess.CompletedProcess([], result, SECRET, SECRET)
+                code, output, errors = self.command('status')
+                self.assertEqual(code, 2)
+                self.assertNotIn('LaunchAgent 已载入：', output)
+                self.assertIn('未载入或服务查询未成功', errors)
+                self.assertIn(f'返回码 {result}', errors)
+                self.assertIn('./hg doctor', errors)
+                self.service.assert_called_once_with(['/bin/launchctl', 'print',
+                    f'gui/{os.getuid()}/{h.LABEL}'], capture_output=True, timeout=5)
+                self.assertEqual(self.config_path.read_bytes(), previous)
+                self.assertEqual(self.plist.read_bytes(), self.original)
+
+    def test_status_query_failure_releases_lock_and_keeps_run_evidence(self):
+        marker = self.state / 'last_attempt.json'
+        marker.write_text('previous run evidence')
+        previous = self.config_path.read_bytes()
+        for failure in (subprocess.TimeoutExpired('launchctl', 5, SECRET, SECRET), OSError(SECRET)):
+            with self.subTest(failure=type(failure).__name__):
+                self.service.reset_mock()
+                self.service.side_effect = failure
+                code, output, errors = self.command('status')
+                self.assertEqual(code, 2)
+                self.assertNotIn('LaunchAgent 已载入：', output)
+                self.assertIn('超时（5 秒）' if isinstance(failure, subprocess.TimeoutExpired) else '无法执行', errors)
+                self.service.assert_called_once_with(['/bin/launchctl', 'print',
+                    f'gui/{os.getuid()}/{h.LABEL}'], capture_output=True, timeout=5)
+                self.assertEqual(marker.read_text(), 'previous run evidence')
+                self.assertEqual(self.config_path.read_bytes(), previous)
+                self.assertEqual(self.plist.read_bytes(), self.original)
+                with (self.state / 'run.lock').open('r') as probe:
+                    fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                with patch.object(h, 'run_sync') as sync:
+                    self.assertEqual(self.command('run')[0], 0)
+                sync.assert_called_once_with(self.cfg)
+                marker.write_text('previous run evidence')
+
+    def test_status_on_other_platforms_does_not_query_launchctl(self):
+        with patch.object(sys, 'platform', 'linux'):
+            code, output, errors = self.command('status')
+        self.assertEqual(code, 0)
+        self.assertEqual(errors, '')
+        self.assertNotIn('LaunchAgent 已载入：', output)
+        self.service.assert_not_called()
 
     def test_uninstall_bootout_failure_keeps_plist_and_never_claims_success(self):
         self.service.return_value = subprocess.CompletedProcess([], 5, SECRET, SECRET)

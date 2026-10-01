@@ -1431,8 +1431,10 @@ def show_status(cfg: dict[str, Any]) -> None:
     if p.exists():
         print(p.read_text(encoding="utf-8"))
     if sys.platform == "darwin":
-        result = subprocess.run(["/bin/launchctl", "print", f"gui/{os.getuid()}/{LABEL}"], capture_output=True, text=True)
-        print("LaunchAgent 已载入：", result.returncode == 0)
+        code = agent_service_command("print", f"gui/{os.getuid()}/{LABEL}", checked=False)
+        if code != 0:
+            raise SafeError(f"LaunchAgent 未载入或服务查询未成功（返回码 {code}）；运行 ./hg doctor 核查。")
+        print("LaunchAgent 已载入：", True)
 
 
 def resolve_record(args: argparse.Namespace) -> None:
