@@ -81,12 +81,43 @@ def write_json(path: Path, data: Any) -> None:
 def config() -> dict[str, Any]:
     if not CONFIG.exists():
         raise SafeError("尚未初始化，请先运行 ./hg init。")
-    cfg = json.loads(CONFIG.read_text(encoding="utf-8"))
+    try:
+        cfg = json.loads(CONFIG.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise SafeError("config.json 无法读取为完整 UTF-8 JSON，请检查本地配置。") from exc
+    return validate_config(cfg)
+
+
+def validate_config(cfg: Any) -> dict[str, Any]:
+    """Validate read and prospective settings without changing their values."""
+    if not isinstance(cfg, dict):
+        raise SafeError("config.json 必须是 JSON 对象。")
     if cfg.get("is_cn") is not True:
         raise SafeError("本工具仅配置为 Garmin 中国区；is_cn 必须为 true。")
-    date.fromisoformat(cfg["since"])
-    if not 0 <= int(cfg["pair_window_seconds"]) <= 120:
-        raise SafeError("配对窗口必须在 0..120 秒之间。")
+    if type(cfg.get("enabled")) is not bool:
+        raise SafeError("config.json 的 enabled 必须为布尔值 true 或 false，不能是文本或数字。")
+    for key in ("inbox", "since"):
+        if not isinstance(cfg.get(key), str) or not cfg[key].strip():
+            raise SafeError(f"config.json 的 {key} 必须为非空文本。")
+    try:
+        date.fromisoformat(cfg["since"])
+    except ValueError as exc:
+        raise SafeError("config.json 的 since 必须为有效日期，例如 2026-09-29。") from exc
+    sources = cfg.get("allowed_sources")
+    if (not isinstance(sources, list) or not sources
+            or any(not isinstance(s, str) or not s.strip() for s in sources)):
+        raise SafeError("config.json 的 allowed_sources 必须为包含非空来源名称的列表。")
+    for key, choices in (("weight_bare_unit", ("kg", "lb", "g")),
+                         ("fat_bare_unit", ("percent", "fraction"))):
+        if cfg.get(key) not in choices:
+            raise SafeError(f"config.json 的 {key} 必须为 " + "、".join(choices) + "。")
+    for key, minimum, maximum in (("pair_window_seconds", 0, 120),
+                                  ("settle_seconds", 0, None),
+                                  ("max_records_per_run", 1, None)):
+        value = cfg.get(key)
+        if type(value) is not int or value < minimum or (maximum is not None and value > maximum):
+            bounds = f"{minimum}..{maximum}" if maximum is not None else f">={minimum}"
+            raise SafeError(f"config.json 的 {key} 必须为 {bounds} 的整数。")
     return cfg
 
 
@@ -1136,22 +1167,22 @@ def update_settings(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
     changes = {"fat_bare_unit": args.fat_unit, "weight_bare_unit": args.weight_unit,
                "pair_window_seconds": args.pair_window, "since": args.since,
                "inbox": args.inbox}
-    if args.source:
+    if args.source is not None:
         changes["allowed_sources"] = [args.source]
     if cfg.get("enabled") and any(v is not None for v in changes.values()):
         raise SafeError("先运行 ./hg disable，再修改单位、来源、时间或目录，并重新预览。")
+    prospective = dict(cfg)
     for k, v in changes.items():
         if v is not None:
-            cfg[k] = v
-    if args.inbox:
+            prospective[k] = v
+    validate_config(prospective)
+    if args.inbox is not None:
         p = Path(args.inbox).expanduser().resolve()
         if not p.is_dir():
             raise SafeError("inbox 不存在。")
-        cfg["inbox"] = str(p)
-    date.fromisoformat(cfg["since"])
-    if not 0 <= int(cfg["pair_window_seconds"]) <= 120:
-        raise SafeError("配对窗口只能在 0..120 秒，建议默认 0。")
-    write_json(CONFIG, cfg)
+        prospective["inbox"] = str(p)
+    write_json(CONFIG, prospective)
+    cfg.update(prospective)
     print(json.dumps(cfg, ensure_ascii=False, indent=2))
 
 
@@ -1300,8 +1331,10 @@ def main() -> int:
             try:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
-                print("另一个进程正在处理，本次退出，避免重复上传。")
-                return 0
+                if args.command == "run":
+                    print("另一个进程正在处理，本次退出，避免重复上传。")
+                    return 0
+                raise SafeError(f"另一个进程正在处理，{args.command} 未执行；请等待当前进程结束后重试。")
             if args.command == "init":
                 init_config(args)
                 return 0
