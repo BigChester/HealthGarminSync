@@ -301,12 +301,62 @@ class ReconciliationTests(unittest.TestCase):
         plan = self.plan([row(adjacent), ambiguous])
         self.assertEqual(plan['extra_remote'], [])
 
+    def test_exact_match_does_not_hide_unclaimed_nearby_orphan(self):
+        orphan = row(h.Measurement(AT + timedelta(seconds=30), 75, None, 'PICOOC'), 101)
+        plan = self.plan([row(self.r), orphan])
+        self.assertEqual(plan['counts'], {'matched': 1})
+        self.assertEqual(plan['extra_remote'], [orphan])
+
+    def test_legitimate_close_source_targets_claim_their_own_rows(self):
+        other = h.Measurement(AT + timedelta(seconds=30), 71, 24, 'PICOOC')
+        plan = self.plan([row(self.r), row(other, 101)], [self.r, other])
+        self.assertEqual(plan['counts'], {'matched': 2})
+        self.assertEqual(plan['extra_remote'], [])
+
+    def test_ambiguous_exact_rows_keep_all_nearby_candidates_protected(self):
+        orphan = row(h.Measurement(AT + timedelta(seconds=30), 75, None, 'PICOOC'), 102)
+        plan = self.plan([row(self.r, 100), row(self.r, 101), orphan])
+        self.assertEqual(plan['counts'], {'conflict': 1})
+        self.assertEqual(plan['extra_remote'], [])
+
+    def test_unknown_exact_values_keep_nearby_rows_protected(self):
+        unknown = dict(row(self.r), weight='unknown')
+        nearby = row(h.Measurement(AT + timedelta(seconds=30), 75, None, 'PICOOC'), 101)
+        plan = self.plan([unknown, nearby])
+        self.assertEqual(plan['counts'], {'conflict': 1})
+        self.assertEqual(plan['extra_remote'], [])
+
+    def test_overlapping_source_targets_do_not_make_nearby_rows_deletable(self):
+        other = h.Measurement(AT + timedelta(milliseconds=500), 71, 24, 'Other')
+        nearby = row(h.Measurement(AT + timedelta(seconds=30), 75, None, 'PICOOC'), 101)
+        plan = self.plan([row(self.r), nearby], [self.r, other])
+        self.assertEqual(plan['counts'], {'conflict': 2})
+        self.assertEqual(plan['extra_remote'], [])
+
     def test_extra_retained_in_automatic_run(self):
         extra = h.Measurement(AT+timedelta(hours=1), 71, None, 'PICOOC')
         api = API([row(self.r), row(extra, 101)])
         self.sync(api)
         self.assertFalse(api.deletes)
         self.assertEqual(len(api.rows), 2)
+
+    def test_nearby_extra_retained_in_automatic_run(self):
+        extra = h.Measurement(AT + timedelta(seconds=30), 71, None, 'PICOOC')
+        api = API([row(self.r), row(extra, 101)])
+        self.sync(api)
+        self.assertFalse(api.deletes)
+        self.assertFalse(api.posts)
+        self.assertEqual(len(api.rows), 2)
+        path = json.loads((self.state / 'last_compare.json').read_text())['path']
+        self.assertEqual(len(json.loads(Path(path).read_text())['extra_remote']), 1)
+
+    def test_automatic_missing_target_with_known_neighbor_still_requires_review(self):
+        other = h.Measurement(AT + timedelta(seconds=30), 71, 24, 'PICOOC')
+        self.write_export([self.r, other]); api = API([row(other, 101)])
+        self.sync(api)
+        self.assertFalse(api.posts)
+        self.assertFalse(api.deletes)
+        self.assertEqual(h.get_status(self.db, self.r), 'conflict')
 
     def test_weight_only_history_pairs_and_uploads(self):
         self.r = h.Measurement(AT, 70, None, 'PICOOC')

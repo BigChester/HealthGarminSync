@@ -644,7 +644,9 @@ def comparison_plan(db: sqlite3.Connection, records: list[Measurement], obj: Any
     active = active_operations()
     for r in records:
         kind, candidates, reason = index.decide(r)
-        claimed.update(index.nearby(r))
+        # A unique exact row does not own unrelated measurements in its minute.
+        # Ambiguous times or unknown values still protect the whole near range.
+        claimed.update(index.nearby(r) if kind == "conflict" else candidates)
         previous = state_row(db, r)
         status = previous["status"] if previous else "pending"
         action = kind
@@ -670,6 +672,9 @@ def comparison_plan(db: sqlite3.Connection, records: list[Measurement], obj: Any
             for k in (i, j):
                 if entries[k]["action"] != "ignored":
                     entries[k].update(action="conflict", reason="多条 Apple 测量的时间重叠，不能唯一确定对应关系")
+    for r, entry in zip(records, entries):
+        if entry["action"] == "conflict":
+            claimed.update(index.nearby(r))
     extras = []
     for i, row in enumerate(index.rows):
         calendar = row.get("calendarDate")
