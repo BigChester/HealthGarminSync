@@ -46,6 +46,10 @@ class SafeError(Exception):
     """Error whose text contains neither login credentials nor tokens."""
 
 
+class TokenPersistenceError(SafeError):
+    """Renewed credentials were not saved; stop this client's API requests."""
+
+
 def now() -> datetime:
     return datetime.now(UTC)
 
@@ -441,6 +445,37 @@ def utc_fit_clock():
         time.tzset()
 
 
+def guard_token_persistence(client):
+    """Watch native refresh saves without rewriting unchanged token caches."""
+    failure = None
+    original_dump, original_headers = client.dump, client.get_api_headers
+
+    def check():
+        if failure is not None:
+            raise TokenPersistenceError(f"Garmin 令牌续期保存失败：{failure}。"
+                                        "检查 state/tokens 权限和磁盘后运行 ./hg login。")
+
+    def dump(path):
+        nonlocal failure
+        try:
+            result = original_dump(path)
+        except Exception as exc:
+            failure = safe_exception(exc)
+            raise
+        else:
+            failure = None
+            return result
+
+    def headers():
+        # The pinned SDK builds headers before both the initial send and its
+        # one allowed 401 replay, after any refresh that may swallow dump errors.
+        check()
+        return original_headers()
+
+    client.dump, client.get_api_headers = dump, headers
+    return check
+
+
 def api_client(interactive: bool = False):
     try:
         installed = version("garminconnect")
@@ -461,12 +496,17 @@ def api_client(interactive: bool = False):
         password = None
     else:
         api = Garmin(is_cn=True)
+    check_saved = None if interactive else guard_token_persistence(api.client)
     try:
         api.login(str(token_dir))
     except Exception as exc:
+        if check_saved is not None:
+            check_saved()
         # Do not print raw exception text: upstream URLs can contain tickets.
         code = safe_exception(exc)
         raise SafeError(f"Garmin 登录/令牌恢复失败：{code}。网络正常后运行 ./hg login。") from exc
+    if check_saved is not None:
+        check_saved()
     if interactive:
         if not api.client.di_token:
             raise SafeError("Garmin 登录未取得可恢复的令牌；请稍后重新运行 ./hg login。")
@@ -475,19 +515,28 @@ def api_client(interactive: bool = False):
         except Exception as exc:
             raise SafeError(f"Garmin 令牌保存失败：{safe_exception(exc)}。"
                             "检查 state/tokens 权限和磁盘后运行 ./hg login。") from exc
-    return GarminMeasurementAPI(api)
+    return GarminMeasurementAPI(api, check_saved)
 
 
 class GarminMeasurementAPI:
     """Use full weigh-in details; dateRange only exposes the latest each day."""
 
-    def __init__(self, api):
+    def __init__(self, api, check_saved=None):
         self.api = api
+        self.check_saved = check_saved
 
     def __getattr__(self, name):
         return getattr(self.api, name)
 
     def get_body_composition(self, start: str, end: str | None = None):
+        try:
+            return self._get_body_composition(start, end)
+        except Exception:
+            if self.check_saved is not None:
+                self.check_saved()
+            raise
+
+    def _get_body_composition(self, start: str, end: str | None = None):
         end = end or start
         if start == end:
             obj = self.api.get_daily_weigh_ins(start)

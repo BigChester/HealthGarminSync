@@ -1,6 +1,7 @@
 """Pinned SDK contracts with real requests/urllib3 and a sealed fake transport."""
 import argparse
 import contextlib
+from datetime import timedelta
 from importlib.metadata import PackageNotFoundError, version
 import io
 import json
@@ -134,7 +135,8 @@ class SDKTransportTests(unittest.TestCase):
             self.assertEqual(adapter.max_retries.total, 0)
         self.assertIsNone(self.sdk.client._tokenstore_path)
         self.refresh_guard = self.enterContext(patch.object(self.sdk.client, '_refresh_session', side_effect=forbidden))
-        self.api = h.GarminMeasurementAPI(self.sdk)
+        self.check_saved = h.guard_token_persistence(self.sdk.client)
+        self.api = h.GarminMeasurementAPI(self.sdk, self.check_saved)
         self.r = h.Measurement(fixtures.AT, 70, 23.5, 'PICOOC', 22, 53.55)
         self.cfg = {'allowed_sources': ['PICOOC'], 'since': '2020-01-01',
                     'weight_bare_unit': 'kg', 'fat_bare_unit': 'percent', 'pair_window_seconds': 0,
@@ -227,6 +229,79 @@ class SDKTransportTests(unittest.TestCase):
                         self.assertIn(self.fit_files[-1], request['body'])
                 else:
                     self.assertEqual(self.sent[0]['body'], self.sent[1]['body'])
+
+    def assert_refresh_save_failure_blocks_further_requests(self, unauthorized):
+        client = self.sdk.client
+        token_dir = (self.state / 'tokens').resolve()
+        client.di_refresh_token, client.di_client_id = 'synthetic-refresh', 'synthetic-client'
+        client._tokenstore_path = str(token_dir)
+        client.dump(str(token_dir))
+        cache = token_dir / 'garmin_tokens.json'
+        before = cache.read_bytes()
+        response = self.requests.Response()
+        response.status_code = 200
+        response._content = json.dumps({'access_token': 'synthetic-renewed-access',
+                                        'refresh_token': 'synthetic-renewed-refresh'}).encode()
+        self.addCleanup(response.close)
+
+        def renew(*args, **kwargs):
+            self.assert_durable_status('inflight')
+            return response
+
+        def server(method, path, pool):
+            if method == 'POST':
+                self.assert_durable_status('inflight')
+                if unauthorized and sum(request['method'] == 'POST' for request in self.sent) == 1:
+                    return 401, {'message': 'synthetic explicit authentication rejection'}
+                self.rows = [fixtures.row(self.r)]
+            return 200, self.read_payload(path)
+
+        self.handler = server
+        native_refresh = self.garminconnect.client.Client._refresh_session.__get__(client)
+        expires = lambda: not unauthorized and bool(self.sent) and client.di_token == 'synthetic-memory-token'
+        secret = 'synthetic-token-save-error-never-output'
+        original_replace = Path.replace
+
+        def replace(path, target):
+            if Path(target) == cache:
+                raise OSError(secret)
+            return original_replace(path, target)
+
+        with patch.object(client, '_refresh_session', native_refresh), \
+                patch.object(client, '_http_post', side_effect=renew) as refresh, \
+                patch.object(client, '_token_expires_soon', side_effect=expires), \
+                patch.object(Path, 'replace', replace), \
+                patch.object(client, 'dump', wraps=client.dump) as dump:
+            self.assertEqual(h.process_record(self.api, self.db, self.r, sleep=lambda delay: None), 'uncertain')
+            self.assert_durable_status('uncertain')
+            self.assertEqual(h.state_row(self.db, self.r)['detail'], 'TokenPersistenceError')
+            sent = list(self.sent)
+            self.assertEqual(sum(request['method'] == 'POST' for request in sent), int(unauthorized))
+            self.assertFalse(any(request['method'] == 'DELETE' for request in sent))
+            # A successful refresh changed the in-memory token, so the next
+            # request would not refresh again. The recorded save failure must
+            # still stop this instance before a new or repeated measurement.
+            self.assertEqual(client.di_token, 'synthetic-renewed-access')
+            later = h.Measurement(self.r.at + timedelta(minutes=1), 71, 24, 'PICOOC')
+            for record in (self.r, later):
+                with self.assertRaises(h.TokenPersistenceError):
+                    h.process_record(self.api, self.db, record)
+            self.assertIsNone(h.state_row(self.db, later))
+            for operation in self.operations().values():
+                with self.assertRaises(h.TokenPersistenceError):
+                    operation()
+            self.assertEqual(self.sent, sent)
+            refresh.assert_called_once()
+            dump.assert_called_once_with(str(token_dir))
+        self.assertEqual(cache.read_bytes(), before)
+        self.assert_durable_status('uncertain')
+        self.assert_source_untouched()
+
+    def test_proactive_refresh_save_failure_blocks_post_and_later_records(self):
+        self.assert_refresh_save_failure_blocks_further_requests(unauthorized=False)
+
+    def test_401_refresh_save_failure_does_not_replay_or_start_later_records(self):
+        self.assert_refresh_save_failure_blocks_further_requests(unauthorized=True)
 
     def test_saved_post_timeout_stays_uncertain_until_visible_without_repost(self):
         saved, visible = [], False

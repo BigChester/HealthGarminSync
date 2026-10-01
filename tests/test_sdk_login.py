@@ -1,5 +1,6 @@
 """Pinned SDK login contracts using synthetic credentials and sealed networking."""
 import contextlib
+import base64
 from importlib.metadata import PackageNotFoundError, version
 import io
 import json
@@ -10,6 +11,8 @@ import socket
 import stat
 import sys
 import tempfile
+import time
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -88,6 +91,7 @@ class SDKLoginTests(unittest.TestCase):
             self.instances.append(instance)
 
         self.enterContext(patch.object(garminconnect.Garmin, '__init__', construct))
+        self.native_refresh = self.client_type._refresh_session
         self.refresh = self.enterContext(patch.object(self.client_type, '_refresh_session',
                                                       side_effect=forbidden))
         self.profile = self.enterContext(patch.object(garminconnect.Garmin,
@@ -245,3 +249,81 @@ class SDKLoginTests(unittest.TestCase):
             # Native login already dumps its DI-empty cache. The application
             # rejects this session before claiming or explicitly saving success.
             self.assertEqual(dump.call_count, 2)
+
+    def expired_cache_and_refresh_response(self):
+        def jwt(exp):
+            payload = base64.urlsafe_b64encode(json.dumps(
+                {'exp': exp, 'client_id': 'synthetic-client'}).encode()).rstrip(b'=').decode()
+            return 'e30.' + payload + '.synthetic'
+
+        old = dict(TOKENS, di_token=jwt(0))
+        new = dict(TOKENS, di_token=jwt(time.time() + 86400), di_refresh_token='synthetic-renewed-refresh')
+        self.save_cache(json.dumps(old))
+        response = SimpleNamespace(ok=True, status_code=200, json=lambda: {
+            'access_token': new['di_token'], 'refresh_token': new['di_refresh_token']})
+        return new, response
+
+    def test_automatic_refresh_save_failure_stops_login_without_measurement_requests(self):
+        _, response = self.expired_cache_and_refresh_response()
+        before = self.token_file.read_bytes()
+        with patch.object(self.client_type, '_refresh_session', self.native_refresh), \
+                patch.object(self.client_type, '_http_post', return_value=response) as refresh, \
+                patch.object(self.client_type, 'dump', side_effect=OSError(SECRET)) as dump:
+            with self.assertRaises(h.TokenPersistenceError) as caught:
+                h.api_client()
+        self.assertIn('令牌续期保存失败：OSError', str(caught.exception))
+        self.assertNotIn(SECRET, str(caught.exception))
+        refresh.assert_called_once()
+        dump.assert_called_once_with(str(self.tokens))
+        self.assertEqual(self.token_file.read_bytes(), before)
+        self.read_email.assert_not_called()
+        self.read_password.assert_not_called()
+        self.credential_login.assert_not_called()
+        # Even if a caller retained the failed instance, it cannot prepare a
+        # later measurement request using the new credentials only in memory.
+        with self.assertRaises(h.TokenPersistenceError):
+            self.instances[-1].client.get_api_headers()
+
+    def test_automatic_refresh_saves_once_and_next_instance_reuses_the_cache(self):
+        renewed, response = self.expired_cache_and_refresh_response()
+        original_dump = self.client_type.dump
+        with patch.object(self.client_type, '_refresh_session', self.native_refresh), \
+                patch.object(self.client_type, '_http_post', return_value=response) as refresh, \
+                patch.object(self.client_type, 'dump', autospec=True, side_effect=original_dump) as dump:
+            first = h.api_client()
+            self.assertEqual(first.api.client.di_token, renewed['di_token'])
+            self.assertEqual(json.loads(self.token_file.read_text()), renewed)
+            self.assertEqual(stat.S_IMODE(self.token_file.stat().st_mode), 0o600)
+            self.assertEqual(stat.S_IMODE(self.tokens.stat().st_mode), 0o700)
+            second = h.api_client()
+            self.assertEqual(second.api.client.di_token, renewed['di_token'])
+            self.assertIsNot(first.api, second.api)
+        refresh.assert_called_once()
+        self.assertEqual(dump.call_count, 1)
+        self.credential_login.assert_not_called()
+        self.read_email.assert_not_called()
+        self.read_password.assert_not_called()
+
+    def test_later_read_refresh_failure_keeps_the_specific_safe_diagnostic(self):
+        before = self.save_cache()
+        api = h.api_client()
+        client = api.api.client
+        response = SimpleNamespace(ok=True, status_code=200, json=lambda: {
+            'access_token': 'synthetic-renewed-access', 'refresh_token': 'synthetic-renewed-refresh'})
+        original_replace = Path.replace
+
+        def replace(path, target):
+            if Path(target) == self.token_file:
+                raise OSError(SECRET)
+            return original_replace(path, target)
+
+        with patch.object(self.client_type, '_refresh_session', self.native_refresh), \
+                patch.object(client, '_http_post', return_value=response) as refresh, \
+                patch.object(client, '_token_expires_soon', return_value=True), \
+                patch.object(Path, 'replace', replace):
+            with self.assertRaises(h.TokenPersistenceError) as caught:
+                api.get_body_composition('2020-02-20')
+        self.assertIn('令牌续期保存失败：OSError', str(caught.exception))
+        self.assertNotIn(SECRET, str(caught.exception))
+        refresh.assert_called_once()
+        self.assertEqual(self.token_file.read_bytes(), before)
