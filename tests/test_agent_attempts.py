@@ -6,6 +6,7 @@ import io
 import json
 import os
 from pathlib import Path
+import plistlib
 import shutil
 import signal
 import sqlite3
@@ -436,6 +437,120 @@ class AgentAttemptTests(unittest.TestCase):
         shutil.copyfile(source / 'agent_runner.py', self.entry)
         health = (source / 'health_garmin.py').read_text()
         (self.base / 'health_garmin.py').write_text(health + '\n' + override)
+
+    def test_generated_plist_runs_enabled_sync_with_minimal_environment_and_spaces(self):
+        previous_base = self.base
+        self.base = self.root / 'project with spaces'
+        previous_base.rename(self.base)
+        self.state = self.base / 'state'
+        self.config_path = self.base / 'config.json'
+        self.entry = self.base / 'agent_runner.py'
+        self.python = self.base / '.venv/bin/python'
+        self.last = self.state / 'last_run.json'
+        self.tokens = self.state / 'tokens'
+        for name, value in (('BASE', self.base), ('STATE', self.state), ('CONFIG', self.config_path)):
+            self.enterContext(patch.object(h, name, value))
+        self.python.unlink()
+        self.python.symlink_to(sys.executable)
+        self.cfg.update(enabled=True, settle_seconds=0)
+        self.save_config()
+        source_bytes = self.export.read_bytes()
+        token_bytes = (self.tokens / 'oauth.json').read_bytes()
+        server = self.base / 'synthetic-server.json'
+        server.write_text(json.dumps({'posts': 0, 'reads': 0, 'rows': []}))
+        self.install_temporary_script('''
+# Keep the actual entry, sync, comparison and SQLite paths; replace only API I/O.
+import builtins
+import socket
+assert Path.cwd() == BASE
+assert not {'PATH', 'PYTHONPATH', 'VIRTUAL_ENV'} & os.environ.keys()
+def forbidden(*args, **kwargs):
+    raise AssertionError("real network, home, credentials or service access forbidden")
+Path.home = classmethod(lambda cls: forbidden())
+socket.create_connection = socket.getaddrinfo = forbidden
+socket.socket.connect = socket.socket.connect_ex = forbidden
+subprocess.run = subprocess.Popen = forbidden
+builtins.input = getpass.getpass = forbidden
+original_import = builtins.__import__
+def offline_import(name, *args, **kwargs):
+    if name.split('.')[0] in ('garminconnect', 'requests', 'urllib3', 'curl_cffi', 'garth'):
+        return forbidden()
+    return original_import(name, *args, **kwargs)
+builtins.__import__ = offline_import
+original_read_text = Path.read_text
+def read_without_tokens(path, *args, **kwargs):
+    if STATE / 'tokens' in path.parents:
+        return forbidden()
+    return original_read_text(path, *args, **kwargs)
+Path.read_text = read_without_tokens
+class LocalServerAPI:
+    path = BASE / 'synthetic-server.json'
+    def get_body_composition(self, start, end):
+        value = json.loads(self.path.read_text())
+        value['reads'] += 1
+        write_json(self.path, value)
+        return {'dateWeightList': [row for row in value['rows'] if start <= row['calendarDate'] <= end]}
+    def add_body_composition(self, **kwargs):
+        value = json.loads(self.path.read_text())
+        value['posts'] += 1
+        at = aware(kwargs['timestamp'])
+        value['rows'].append({'samplePk': 100, 'calendarDate': at.date().isoformat(),
+                             'timestampGMT': int(at.timestamp() * 1000),
+                             'weight': kwargs['weight'] * 1000,
+                             'bodyFat': kwargs['percent_fat'], 'bmi': kwargs.get('bmi')})
+        write_json(self.path, value)
+        return {'detailedImportResult': {'successes': [{}], 'failures': []}}
+    add_weigh_in = delete_weigh_in = forbidden
+def api_client(interactive=False):
+    assert not interactive
+    return LocalServerAPI()
+''')
+        with contextlib.redirect_stdout(io.StringIO()):
+            h.manage_agent(True, self.cfg)
+        document = plistlib.loads(self.plist.read_bytes())
+        self.assertEqual([call.args[0][1] for call in self.service.call_args_list],
+                         ['print', 'bootout', 'bootstrap'])
+        self.assertEqual(document['ProgramArguments'], [str(self.python), str(self.entry)])
+        self.assertEqual(document['WorkingDirectory'], str(self.base))
+        self.assertEqual(document['EnvironmentVariables'],
+                         {'HOME': str(self.home), 'PYTHONUNBUFFERED': '1'})
+        self.assertNotEqual(Path.cwd(), self.base)
+        children = []
+        try:
+            for run in (1, 2):
+                with self.subTest(run=run):
+                    child = subprocess.Popen(document['ProgramArguments'],
+                                             cwd=document['WorkingDirectory'],
+                                             env=document['EnvironmentVariables'],
+                                             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                    children.append(child)
+                    output, errors = child.communicate(timeout=5)
+                    self.assertEqual(child.returncode, 0, (output, errors))
+                    self.assertEqual(output + errors, b'')
+                    self.assertEqual(json.loads(server.read_text())['posts'], 1)
+                    self.assertGreater(json.loads(server.read_text())['reads'], 0)
+                    self.assertEqual((self.value()['outcome'], self.value()['stage']), ('completed', 'run'))
+                    attempt = json.loads((self.state / 'last_attempt.json').read_text())
+                    self.assertEqual((attempt['outcome'], attempt['stage']), ('completed', 'sync'))
+                    summary = json.loads(self.last.read_text())
+                    self.assertEqual(summary['local_status_counts'], {'verified': 1})
+                    self.assertEqual(list(summary['results'].values()), ['verified'] if run == 1 else [])
+                    with contextlib.closing(sqlite3.connect(self.state / 'sync.sqlite3')) as db:
+                        self.assertEqual(db.execute('SELECT status FROM uploads').fetchall(), [('verified',)])
+                    for name in ('agent.out.log', 'agent.err.log', 'sync.log'):
+                        log = self.state / name
+                        self.assertEqual(log.stat().st_mode & 0o777, 0o600)
+                    self.assertIn('verified', (self.state / 'agent.out.log').read_text())
+                    for name in ('agent-log.lock', 'run.lock'):
+                        with (self.state / name).open('a') as probe:
+                            fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    self.assertEqual(self.export.read_bytes(), source_bytes)
+                    self.assertEqual((self.tokens / 'oauth.json').read_bytes(), token_bytes)
+        finally:
+            for child in children:
+                if child.poll() is None:
+                    child.kill()
+                child.communicate(timeout=5)
 
     def test_real_script_setup_failure_replaces_success_without_starting_sync(self):
         self.install_temporary_script('''
