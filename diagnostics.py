@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import plistlib
+import re
 import subprocess
 import sys
 from xml.parsers.expat import ExpatError
@@ -28,6 +29,38 @@ def _json(path, reject_symlink=True):
         return json.loads(path.read_text(encoding='utf-8'))
     except RecursionError as exc:
         raise ValueError('JSON nesting too deep') from exc
+
+
+def attempt_summary(value):
+    fields = {'outcome', 'started_at', 'finished_at', 'stage', 'error_type'}
+    if not isinstance(value, dict) or set(value) != fields:
+        raise ValueError('invalid attempt fields')
+    outcome, stage = value['outcome'], value['stage']
+    if outcome not in ('running', 'completed', 'preview', 'failed', 'interrupted') or stage not in ('config', 'sync'):
+        raise ValueError('invalid attempt values')
+    if not isinstance(value['started_at'], str):
+        raise ValueError('invalid attempt start')
+    started = h.aware(value['started_at'])
+    finished = value['finished_at']
+    error = value['error_type']
+    if outcome == 'running':
+        if finished is not None or error is not None:
+            raise ValueError('unfinished attempt has terminal fields')
+    else:
+        if not isinstance(finished, str):
+            raise ValueError('invalid attempt finish')
+        finished = h.aware(finished)
+        if finished < started:
+            raise ValueError('attempt ended before it started')
+        if outcome in ('completed', 'preview'):
+            if stage != 'sync' or error is not None:
+                raise ValueError('invalid completed attempt')
+        elif (not isinstance(error, str) or not re.fullmatch(
+                r'[A-Za-z_][A-Za-z0-9_]*(?: HTTP (?:400|401|403|404|429|500|502|503|504))?', error)):
+            raise ValueError('invalid attempt error category')
+    # Never forward exception categories or arbitrary fields to user-facing output.
+    return {'outcome': outcome, 'stage': stage, 'started_at': started.isoformat(),
+            'finished_at': finished.isoformat() if finished is not None else None}
 
 
 def collect():
@@ -154,6 +187,20 @@ def collect():
             add('last_run', 'warn', '尚无最近运行摘要。')
         except (OSError, UnicodeError, ValueError, h.SafeError):
             add('last_run', 'error', '最近运行摘要无法读取或结构无效。', '检查 state/last_run.json。')
+        try:
+            attempt = attempt_summary(_json(h.STATE / 'last_attempt.json'))
+            outcome = attempt['outcome']
+            status = 'error' if outcome in ('failed', 'interrupted') else 'warn' if outcome == 'running' else 'info'
+            messages = {'running': '最近运行尚无结束证据；可能仍在运行或曾被中断。',
+                        'completed': '最近运行命令已结束；不代表全部记录已验证。',
+                        'preview': '最近运行只完成关闭自动写入时的本地预览。',
+                        'failed': '最近运行失败；请查看本地日志并先核对 Garmin。',
+                        'interrupted': '最近运行已中断；上传结果需核对，不能直接重发。'}
+            add('last_attempt', status, messages[outcome], data=attempt)
+        except FileNotFoundError:
+            add('last_attempt', 'info', '尚无运行尝试摘要；兼容已有安装。')
+        except (OSError, UnicodeError, ValueError, h.SafeError):
+            add('last_attempt', 'error', '运行尝试摘要无法读取或结构无效。', '检查 state/last_attempt.json。')
 
     enabled = cfg is not None and cfg['enabled']
     try:

@@ -1131,6 +1131,41 @@ def show_preview(cfg: dict[str, Any]) -> list[Measurement]:
     return records
 
 
+def finish_run_attempt(attempt: dict[str, Any], preserve_error: bool = False) -> None:
+    attempt["finished_at"] = now().isoformat()
+    try:
+        write_json(STATE / "last_attempt.json", attempt)
+    except BaseException as exc:
+        if not preserve_error:
+            raise
+        detail = safe_exception(exc)
+        print("运行结束证据未保存：", detail, file=sys.stderr)
+        LOG.error("Run attempt evidence not saved: %s", detail)
+
+
+def run_with_attempt() -> None:
+    """Record only a CLI run whose caller already holds the exclusive run lock."""
+    attempt = {"outcome": "running", "started_at": now().isoformat(),
+               "finished_at": None, "stage": "config", "error_type": None}
+    write_json(STATE / "last_attempt.json", attempt)
+    try:
+        cfg = config()
+        attempt["stage"] = "sync"
+        write_json(STATE / "last_attempt.json", attempt)
+        run_sync(cfg)
+    except KeyboardInterrupt as exc:
+        attempt.update(outcome="interrupted", error_type=safe_exception(exc))
+        finish_run_attempt(attempt, preserve_error=True)
+        raise
+    except Exception as exc:
+        attempt.update(outcome="failed", error_type=safe_exception(exc))
+        finish_run_attempt(attempt, preserve_error=True)
+        raise
+    else:
+        attempt["outcome"] = "completed" if cfg["enabled"] else "preview"
+        finish_run_attempt(attempt)
+
+
 def run_sync(cfg: dict[str, Any], record_id: str | None = None) -> None:
     if record_id is None and not cfg.get("enabled", False):
         print("自动写入未启用；本次只预览。启用前先完成单条试传。")
@@ -1413,13 +1448,15 @@ def main() -> int:
             if args.command == "init":
                 init_config(args)
                 return 0
+            if args.command == "run":
+                run_with_attempt()
+                return 0
             cfg = config()
             if args.command == "inspect": inspect_files(cfg)
             elif args.command == "preview": show_preview(cfg)
             elif args.command == "login":
                 api_client(interactive=True)
                 print("已登录 Garmin 中国区。令牌保存在本机 state/tokens；未上传健康数据。")
-            elif args.command == "run": run_sync(cfg)
             elif args.command == "upload-one": run_sync(cfg, args.record_id)
             elif args.command == "compare": compare_exports(args, cfg)
             elif args.command == "repair-one": reviewed_operation(args, cfg)
