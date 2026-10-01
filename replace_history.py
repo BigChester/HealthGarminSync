@@ -119,19 +119,22 @@ def verify(path, api=None):
         scoped = [row for row in index.rows if start.isoformat() <= row['calendarDate'] <= end.isoformat()]
         owners = {indices[0] for kind, indices, _ in decisions if kind == 'matched'}
         matched = (all(kind == 'matched' for kind, _, _ in decisions)
-                   and len(owners) == len(targets) == len(scoped))
-        if matched and not plan['extra_remote']:
+                   and len(owners) == len(targets) == len(scoped)
+                   and not plan['extra_remote'])
+        if matched:
             for r in targets:
                 h.set_status(db, r, 'verified', 'Full-history replacement independently verified')
             job['phase'] = 'verified'
         job['last_checked_at'] = h.now().isoformat()
+        job['last_check_passed'] = matched
         job['verification'] = {'matched': sum(index.decide(r)[0] == 'matched' for r in targets),
                                'target_count': len(targets), 'remote_count': len(scoped),
                                'extra': len(plan['extra_remote'])}
         h.write_json(path, job)
         h.write_json(Path(job['backup']) / 'remote-after.json', obj)
-    print('完整历史只读核验：', job['verification'], '；阶段：', job['phase'], flush=True)
-    return job['phase'] == 'verified'
+    print('本次完整历史只读核验：', '匹配' if matched else '未匹配',
+          job['verification'], '；操作历史阶段：', job['phase'], flush=True)
+    return matched
 
 
 def execute(args, cfg, api=None):
@@ -251,6 +254,7 @@ def execute(args, cfg, api=None):
                 raise h.SafeError('最终完整历史未匹配，保留日志并暂停。')
             print('完整历史替换已完成；备份：', backup, flush=True)
         except Exception as exc:
+            job = h.read_operation(journal_path)
             job['phase'] = 'uncertain'
             job['error'] = h.safe_exception(exc)
             if isinstance(exc, h.SafeError):

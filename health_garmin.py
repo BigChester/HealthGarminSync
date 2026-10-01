@@ -884,19 +884,20 @@ def read_operation(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text())
 
 
-def verify_operation(args: argparse.Namespace) -> None:
+def verify_operation(args: argparse.Namespace) -> bool:
     path = Path(args.operation).expanduser()
     journal = read_operation(path)
     if journal.get("type") == "full_replacement":
         from replace_history import verify
-        verify(path)
-        return
+        return verify(path)
     day = date.fromisoformat(journal["original"]["calendarDate"])
     obj = fetch_remote_snapshot(api_client(), day, day)
     payload = journal.get("replacement") or journal.get("measurement")
     if payload:
         r = Measurement(**{**payload, "at": aware(payload["at"])})
-        matched = classify_remote(r, obj) == "matched"
+        classification = classify_remote(r, obj)
+        matched = classification == "matched"
+        result = {"matched": "匹配", "absent": "目标缺失", "conflict": "目标冲突"}[classification]
         if matched:
             with contextlib.closing(database()) as db, db:
                 set_status(db, r, "verified", "Delayed reviewed-operation verification matched")
@@ -904,11 +905,14 @@ def verify_operation(args: argparse.Namespace) -> None:
     else:
         matched = not any(str(row.get("samplePk")) == str(journal["original"]["samplePk"])
                           for row in obj["dateWeightList"])
+        result = "原记录已不存在" if matched else "原记录仍存在"
         if matched:
             journal["phase"] = "deleted_verified"
     journal["last_checked_at"] = now().isoformat()
+    journal["last_check_passed"] = matched
     write_json(path, journal)
-    print("只读核对：", journal["phase"], "；未重复删除或上传。")
+    print("本次只读核对：", result, "；操作历史阶段：", journal["phase"])
+    return matched
 
 
 def resume_operation(args: argparse.Namespace) -> None:
@@ -1352,7 +1356,9 @@ def main() -> int:
             elif args.command == "replace-all":
                 from replace_history import execute
                 execute(args, cfg)
-            elif args.command == "verify-operation": verify_operation(args)
+            elif args.command == "verify-operation":
+                if not verify_operation(args):
+                    return 2
             elif args.command == "resume-operation": resume_operation(args)
             elif args.command == "settings": update_settings(args, cfg)
             elif args.command == "status": show_status(cfg)
