@@ -7,6 +7,8 @@ import json
 import os
 from pathlib import Path
 import shutil
+import signal
+import sqlite3
 import subprocess
 import sys
 import time
@@ -515,6 +517,179 @@ def api_client(*args, **kwargs):
             if child.poll() is None:
                 child.kill()
             child.wait(timeout=5)
+
+    def test_real_post_sigkill_recovers_across_entries_without_repeating_the_write(self):
+        self.cfg['settle_seconds'] = 0
+        self.save_config()
+        source_bytes, token_bytes = self.export.read_bytes(), (self.tokens / 'oauth.json').read_bytes()
+        old_last = self.last.read_bytes()
+        server = self.base / 'synthetic-server.json'
+        ready = self.base / 'synthetic-post-ready.json'
+        visible = self.base / 'synthetic-visible'
+        server.write_text(json.dumps({'posts': 0, 'deletes': 0, 'reads': 0, 'rows': []}))
+        self.install_temporary_script('''
+# Replace only the network boundary. The runner, main, sync and process_record
+# remain the actual copied production implementation in every process.
+import builtins
+import socket
+import time
+
+def offline_only(*args, **kwargs):
+    raise AssertionError("real network, credentials or service access forbidden")
+
+Path.home = classmethod(lambda cls: offline_only())
+socket.create_connection = socket.getaddrinfo = offline_only
+socket.socket.connect = socket.socket.connect_ex = offline_only
+subprocess.run = subprocess.Popen = offline_only
+builtins.input = getpass.getpass = offline_only
+original_import = builtins.__import__
+def offline_import(name, *args, **kwargs):
+    if name.split('.')[0] in ('garminconnect', 'requests', 'urllib3', 'curl_cffi', 'garth'):
+        return offline_only()
+    return original_import(name, *args, **kwargs)
+builtins.__import__ = offline_import
+original_read_text = Path.read_text
+def read_without_tokens(path, *args, **kwargs):
+    if STATE / 'tokens' in path.parents:
+        return offline_only()
+    return original_read_text(path, *args, **kwargs)
+Path.read_text = read_without_tokens
+
+class LocalServerAPI:
+    path = BASE / 'synthetic-server.json'
+    def get_body_composition(self, start, end):
+        value = json.loads(self.path.read_text())
+        value['reads'] += 1
+        write_json(self.path, value)
+        rows = value['rows'] if (BASE / 'synthetic-visible').exists() else []
+        return {'dateWeightList': [row for row in rows if start <= row['calendarDate'] <= end]}
+
+    def add_body_composition(self, **kwargs):
+        # A separate read-only connection must see the committed gate BEFORE
+        # this simulated remote service receives and durably saves the POST.
+        with contextlib.closing(sqlite3.connect(
+                f"file:{STATE / 'sync.sqlite3'}?mode=ro", uri=True)) as probe:
+            assert probe.execute('SELECT status FROM uploads').fetchall() == [('inflight',)]
+        value = json.loads(self.path.read_text())
+        value['posts'] += 1
+        at = aware(kwargs['timestamp'])
+        value['rows'].append({'samplePk': 100, 'calendarDate': at.date().isoformat(),
+                             'timestampGMT': int(at.timestamp() * 1000),
+                             'weight': kwargs['weight'] * 1000,
+                             'bodyFat': kwargs['percent_fat'], 'bmi': kwargs.get('bmi')})
+        value['durable_inflight_before_post'] = True
+        write_json(self.path, value)
+        write_json(BASE / 'synthetic-post-ready.json', {'received': True})
+        # Parent SIGKILLs this real entry after receipt, before any response.
+        while True:
+            time.sleep(0.02)
+
+    def add_weigh_in(self, **kwargs):
+        raise AssertionError("fixture must exercise the FIT POST path")
+
+    def delete_weigh_in(self, *args, **kwargs):
+        value = json.loads(self.path.read_text())
+        value['deletes'] += 1
+        write_json(self.path, value)
+        raise AssertionError("recovery must never delete")
+
+def api_client(interactive=False):
+    assert not interactive
+    return LocalServerAPI()
+''')
+        children = []
+        run_marker = self.state / 'last_attempt.json'
+
+        def launch():
+            child = subprocess.Popen([sys.executable, '-B', str(self.entry)],
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            children.append(child)
+            return child
+
+        def local_status():
+            with contextlib.closing(sqlite3.connect(
+                    f"file:{self.state / 'sync.sqlite3'}?mode=ro", uri=True)) as db:
+                return db.execute('SELECT status FROM uploads').fetchall()
+
+        def unlocked():
+            for name in ('agent-log.lock', 'run.lock'):
+                with (self.state / name).open('a') as probe:
+                    fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+        try:
+            first = launch()
+            deadline = time.monotonic() + 5
+            while not ready.exists():
+                if first.poll() is not None:
+                    self.fail(f'temporary entry exited before simulated POST: {first.returncode}')
+                if time.monotonic() >= deadline:
+                    self.fail('temporary entry did not reach simulated POST')
+                time.sleep(0.01)
+            self.assertIsNone(first.poll())
+            self.assertEqual(json.loads(ready.read_text()), {'received': True})
+            accepted = json.loads(server.read_text())
+            self.assertEqual(accepted['posts'], 1)
+            self.assertEqual(accepted['deletes'], 0)
+            self.assertTrue(accepted['durable_inflight_before_post'])
+            self.assertEqual(local_status(), [('inflight',)])
+            self.assertEqual(self.export.read_bytes(), source_bytes)
+            run = json.loads(run_marker.read_text())
+            self.assertEqual((run['outcome'], run['stage'], run['finished_at']), ('running', 'sync', None))
+            self.assertEqual((self.value()['outcome'], self.value()['stage']), ('running', 'run'))
+            self.assertIsNone(self.value()['finished_at'])
+            entry_bytes, run_bytes = self.marker.read_bytes(), run_marker.read_bytes()
+            for name in ('agent-log.lock', 'run.lock'):
+                with (self.state / name).open('a') as probe:
+                    with self.assertRaises(BlockingIOError):
+                        fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            first.kill()
+            first.wait(timeout=5)
+            self.assertEqual(first.returncode, -signal.SIGKILL)
+            self.assertEqual(self.marker.read_bytes(), entry_bytes)
+            self.assertEqual(run_marker.read_bytes(), run_bytes)
+            self.assertEqual(self.last.read_bytes(), old_last)
+            self.assertEqual(json.loads(server.read_text()), accepted)
+            self.assertEqual(local_status(), [('inflight',)])
+            unlocked()
+
+            second = launch()
+            second.wait(timeout=5)
+            self.assertEqual(second.returncode, 0)
+            self.assertEqual(local_status(), [('uncertain',)])
+            self.assertEqual(json.loads(server.read_text())['posts'], 1)
+            summary = json.loads(self.last.read_text())
+            self.assertEqual(list(summary['results'].values()), ['uncertain'])
+            self.assertEqual(summary['local_status_counts'], {'uncertain': 1})
+            self.assertEqual(self.value()['outcome'], 'completed')
+            self.assertEqual(json.loads(run_marker.read_text())['outcome'], 'completed')
+            result, _, checks = self.report()
+            self.assertEqual(result, 2)
+            self.assertEqual(checks['last_run']['status'], 'error')
+            self.assertEqual(checks['last_run']['data']['local_status_counts'], {'uncertain': 1})
+            unlocked()
+
+            visible.touch()
+            third = launch()
+            third.wait(timeout=5)
+            self.assertEqual(third.returncode, 0)
+            self.assertEqual(local_status(), [('verified',)])
+            summary = json.loads(self.last.read_text())
+            self.assertEqual(list(summary['results'].values()), ['verified'])
+            self.assertEqual(summary['local_status_counts'], {'verified': 1})
+            result, _, checks = self.report()
+            self.assertEqual(result, 0)
+            self.assertEqual(checks['last_run']['status'], 'info')
+            final = json.loads(server.read_text())
+            self.assertEqual((final['posts'], final['deletes']), (1, 0))
+            self.assertGreater(final['reads'], accepted['reads'])
+            self.assertEqual(self.export.read_bytes(), source_bytes)
+            self.assertEqual((self.tokens / 'oauth.json').read_bytes(), token_bytes)
+            unlocked()
+        finally:
+            for child in children:
+                if child.poll() is None:
+                    child.kill()
+                child.wait(timeout=5)
 
 
 if __name__ == '__main__':
