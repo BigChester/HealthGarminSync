@@ -704,7 +704,7 @@ def fetch_remote_snapshot(api: Any, start: date, end: date) -> dict[str, Any]:
 
 
 def comparison_plan(db: sqlite3.Connection, records: list[Measurement], obj: Any,
-                    start: date, end: date) -> dict[str, Any]:
+                    start: date, end: date, *, selected_ids: set[str] | None = None) -> dict[str, Any]:
     index = RemoteIndex(obj)
     entries, claimed, owners = [], set(), {}
     active = active_operations()
@@ -750,6 +750,10 @@ def comparison_plan(db: sqlite3.Connection, records: list[Measurement], obj: Any
             raise SafeError("Garmin calendarDate 无法解析。")
         if i not in claimed and start <= day <= end:
             extras.append(row)
+    if selected_ids is not None:
+        # All current sources establish correspondence, even when completed
+        # history is not selected for another remote check or status update.
+        entries = [entry for entry in entries if entry["id"] in selected_ids]
     return {"created_at": now().isoformat(), "start": start.isoformat(), "end": end.isoformat(),
             "entries": entries, "extra_remote": extras, "remote_snapshot": obj,
             "counts": dict(Counter(e["action"] for e in entries))}
@@ -1130,12 +1134,13 @@ def select_comparison_records(records: list[Measurement], db: sqlite3.Connection
 
 
 def load_local_comparison(cfg: dict[str, Any], records: list[Measurement], api: Any,
-                          db: sqlite3.Connection) -> dict[str, Any]:
+                          db: sqlite3.Connection, *, source_records: list[Measurement] | None = None) -> dict[str, Any]:
     if not records:
         return {"entries": [], "counts": {}, "extra_remote": []}
     start, end = min(r.at.date() for r in records), max(r.at.date() for r in records)
     obj = fetch_remote_snapshot(api, start, end)
-    plan = comparison_plan(db, records, obj, start, end)
+    plan = comparison_plan(db, source_records if source_records is not None else records,
+                           obj, start, end, selected_ids={r.key for r in records})
     save_comparison(plan, cfg, automatic=True)
     return plan
 
@@ -1271,6 +1276,7 @@ def run_sync(cfg: dict[str, Any], record_id: str | None = None) -> None:
         show_preview(cfg)
         return
     samples, records, waiting, exports = load_measurements(cfg)
+    source_records = records
     if record_id:
         records = [r for r in records if r.key == record_id]
         if len(records) != 1:
@@ -1294,7 +1300,7 @@ def run_sync(cfg: dict[str, Any], record_id: str | None = None) -> None:
     with contextlib.closing(database()) as db, db:
         selected = select_comparison_records(records, db, full=record_id is not None)
         api = api_client() if selected else None
-        plan = load_local_comparison(cfg, selected, api, db)
+        plan = load_local_comparison(cfg, selected, api, db, source_records=source_records)
         summary["comparison"] = plan["counts"]
         print_comparison(plan) if plan["entries"] else print("近期没有需要复核的测量。")
         by_id = {r.key: r for r in records}

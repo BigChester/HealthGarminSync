@@ -255,6 +255,94 @@ class ReconciliationTests(unittest.TestCase):
                 self.assertEqual(summary['local_status_counts'], {status: 1})
                 self.assertEqual((plan.read_bytes(), (self.state / 'last_compare.json').read_bytes()), previous)
 
+    def test_skipped_completed_sources_still_protect_selected_record_correspondence(self):
+        for status in ('verified', 'verified_manual', 'ignored'):
+            for offset, source in ((0, 'Second Scale'), (0.5, 'PICOOC'), (2, 'PICOOC')):
+                for visible in ((True,) if offset == 2 else (False, True)):
+                    with self.subTest(status=status, offset=offset, visible=visible):
+                        old = self.r
+                        new = h.Measurement(AT + timedelta(seconds=offset), 70, 23.5, source)
+                        self.cfg['allowed_sources'] = ['PICOOC', 'Second Scale']
+                        h.set_status(self.db, old, status, 'Retained completed decision')
+                        self.db.execute('DELETE FROM uploads WHERE record_id!=?', (old.key,))
+                        self.db.commit()
+                        before = dict(h.state_row(self.db, old))
+                        h.write_json(self.state / 'last_sync_comparison.json', {})
+                        self.write_export([old, new])
+                        source_bytes = (self.inbox / 'health.json').read_bytes()
+                        remote = h.Measurement(AT + timedelta(seconds=1 if offset == 2 else 0),
+                                               70, 23.5, 'PICOOC')
+                        api = API([row(remote)] if visible else [])
+                        self.sync(api)
+                        self.assertFalse(api.posts)
+                        self.assertFalse(api.deletes)
+                        self.assertEqual(dict(h.state_row(self.db, old)), before)
+                        self.assertEqual(h.get_status(self.db, new), 'conflict')
+                        summary = json.loads((self.state / 'last_run.json').read_text())
+                        self.assertEqual(summary['comparison'], {'conflict': 1})
+                        self.assertEqual(summary['results'], {new.key: 'conflict'})
+                        self.assertEqual(summary['local_status_counts'], {status: 1, 'conflict': 1})
+                        plan = json.loads((self.state / 'plans' / 'sync-latest.json').read_text())
+                        self.assertEqual([entry['id'] for entry in plan['entries']], [new.key])
+                        self.assertEqual(plan['counts'], {'conflict': 1})
+                        self.assertEqual(plan['extra_remote'], [])
+                        self.assertEqual((self.inbox / 'health.json').read_bytes(), source_bytes)
+
+    def test_unrelated_completed_context_does_not_expand_queries_or_change_status(self):
+        old = self.r
+        new = h.Measurement(AT + timedelta(days=40), 71, 24, 'PICOOC')
+        later = h.Measurement(AT + timedelta(days=80), 72, 25, 'PICOOC')
+        neighbor = h.Measurement(new.at - timedelta(minutes=10), 73, 26, 'PICOOC')
+        retained = (old, neighbor, later)
+        for record in retained:
+            h.set_status(self.db, record, 'verified', 'Keep existing evidence')
+        before = [dict(h.state_row(self.db, record)) for record in retained]
+        h.write_json(self.state / 'last_sync_comparison.json', {})
+        self.write_export([old, neighbor, new, later])
+        source = (self.inbox / 'health.json').read_bytes()
+        api = API([row(record, pk) for pk, record in enumerate((old, neighbor, new, later), 100)])
+        self.sync(api)
+        day = new.at.date()
+        self.assertEqual(api.reads, [((day - timedelta(days=1)).isoformat(),
+                                    (day + timedelta(days=1)).isoformat())])
+        self.assertFalse(api.posts)
+        self.assertFalse(api.deletes)
+        self.assertEqual([dict(h.state_row(self.db, record)) for record in retained], before)
+        summary = json.loads((self.state / 'last_run.json').read_text())
+        self.assertEqual(summary['comparison'], {'matched': 1})
+        self.assertEqual(summary['results'], {new.key: 'verified'})
+        self.assertEqual(summary['local_status_counts'], {'verified': 4})
+        plan = json.loads((self.state / 'plans' / 'sync-latest.json').read_text())
+        self.assertEqual([entry['id'] for entry in plan['entries']], [new.key])
+        self.assertEqual(plan['start'], day.isoformat())
+        self.assertEqual(plan['end'], day.isoformat())
+        self.assertEqual(plan['extra_remote'], [])
+        self.assertEqual((self.inbox / 'health.json').read_bytes(), source)
+
+    def test_explicit_single_upload_keeps_other_source_correspondence_context(self):
+        new = h.Measurement(AT, 70, 23.5, 'Second Scale')
+        self.cfg['allowed_sources'].append(new.source)
+        self.write_export([self.r, new])
+        source = (self.inbox / 'health.json').read_bytes()
+        for visible in (False, True):
+            with self.subTest(visible=visible):
+                h.set_status(self.db, self.r, 'verified', 'Original verification')
+                self.db.execute('DELETE FROM uploads WHERE record_id=?', (new.key,))
+                self.db.commit()
+                before = dict(h.state_row(self.db, self.r))
+                api = API([row(self.r)] if visible else [])
+                with patch.object(h, 'api_client', return_value=api), \
+                        patch('builtins.input', return_value='UPLOAD'), contextlib.redirect_stdout(io.StringIO()):
+                    h.run_sync(self.cfg, new.key)
+                self.assertFalse(api.posts)
+                self.assertFalse(api.deletes)
+                self.assertEqual(dict(h.state_row(self.db, self.r)), before)
+                self.assertEqual(h.get_status(self.db, new), 'conflict')
+                summary = json.loads((self.state / 'last_run.json').read_text())
+                self.assertEqual(summary['comparison'], {'conflict': 1})
+                self.assertEqual(summary['results'], {new.key: 'conflict'})
+                self.assertEqual((self.inbox / 'health.json').read_bytes(), source)
+
     def test_required_comparison_still_logs_in_for_initial_recent_changed_or_pending_records(self):
         recent = h.Measurement(h.now() - timedelta(days=1), 70, 23.5, 'PICOOC')
         cases = [('first', self.r, self.r, 'verified', True),
