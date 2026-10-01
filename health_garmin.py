@@ -1592,13 +1592,28 @@ def main() -> int:
         finally:
             sys.dont_write_bytecode = previous_bytecode
     os.umask(0o077)
-    private_dir(STATE)
-    owned_handler = None
+
+    def report_error(exc: BaseException, *, log: bool = False) -> int:
+        if isinstance(exc, KeyboardInterrupt):
+            print("已中断。上传中断的记录不会盲目重发。", file=sys.stderr)
+            return 130
+        if isinstance(exc, SafeError):
+            print("停止：", exc, file=sys.stderr)
+            message, values = "%s", (exc,)
+        else:
+            detail = safe_exception(exc)
+            print("错误：", detail, "。请检查配置/网络；先核对 Garmin 再重试。", file=sys.stderr)
+            message, values = "Unhandled %s", (detail,)
+        if log:
+            try:
+                LOG.error(message, *values)
+            except Exception as failure:
+                print("错误日志未保存：", type(failure).__name__, file=sys.stderr)
+        return 2
+
+    primary_result = None
     try:
-        owned_handler = RotatingFileHandler(
-            STATE / "sync.log", maxBytes=1_000_000, backupCount=3, encoding="utf-8")
-        logging.basicConfig(level=logging.INFO, handlers=[owned_handler],
-                            format="%(asctime)s %(levelname)s %(message)s")
+        private_dir(STATE)
         with (STATE / "run.lock").open("a") as lock:
             try:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -1606,75 +1621,76 @@ def main() -> int:
                 if args.command == "run":
                     print("另一个进程正在处理，本次退出，避免重复上传。")
                     return 0
-                raise SafeError(f"另一个进程正在处理，{args.command} 未执行；请等待当前进程结束后重试。")
-            if args.command == "init":
-                init_config(args)
-                return 0
-            if args.command == "run":
-                run_with_attempt()
-                return 0
-            if args.command == "uninstall-agent":
-                manage_agent(False)
-                return 0
-            cfg = config()
-            if args.command == "inspect": inspect_files(cfg)
-            elif args.command == "preview": show_preview(cfg)
-            elif args.command == "login":
-                api_client(interactive=True)
-                print("已登录 Garmin 中国区。令牌保存在本机 state/tokens；未上传健康数据。")
-            elif args.command == "upload-one": run_sync(cfg, args.record_id)
-            elif args.command == "compare": compare_exports(args, cfg)
-            elif args.command == "repair-one": reviewed_operation(args, cfg)
-            elif args.command == "delete-extra": reviewed_operation(args, cfg, delete_extra=True)
-            elif args.command == "replace-all":
-                from replace_history import execute
-                execute(args, cfg)
-            elif args.command == "verify-operation":
-                if not verify_operation(args):
-                    return 2
-            elif args.command == "resume-operation": resume_operation(args)
-            elif args.command == "settings": update_settings(args, cfg)
-            elif args.command == "status": show_status(cfg)
-            elif args.command == "install-agent": manage_agent(True, cfg)
-            elif args.command == "disable":
-                cfg["enabled"] = False; write_json(CONFIG, cfg)
-                print("自动写入已关闭。要停掉定时检查，再运行 ./hg uninstall-agent。")
-            elif args.command == "enable":
-                with contextlib.closing(database()) as db, db:
-                    n = db.execute("SELECT COUNT(*) FROM uploads WHERE status IN ('verified','verified_manual')").fetchone()[0]
-                if not n:
-                    raise SafeError("先完成至少一条真实记录试传及核验，再启用自动写入。")
-                show_preview(cfg)
-                if input("确认以后自动上传完整新测量，输入 ENABLE：").strip() == "ENABLE":
-                    cfg["enabled"] = True; write_json(CONFIG, cfg)
-                    print("自动写入已启用。")
-            elif args.command == "remote":
-                d = date.fromisoformat(args.date).isoformat()
-                obj = api_client().get_body_composition(d, d)
-                p = STATE / f"remote-{d}.json"; write_json(p, obj)
-                print("仅查询，响应保存到：", p)
-                print(json.dumps(obj, ensure_ascii=False, indent=2))
-            elif args.command == "resolve": resolve_record(args)
-        return 0
-    except SafeError as exc:
-        print("停止：", exc, file=sys.stderr); LOG.error("%s", exc)
-        return 2
-    except KeyboardInterrupt:
-        print("已中断。上传中断的记录不会盲目重发。", file=sys.stderr)
-        return 130
-    except Exception as exc:
-        # Raw tracebacks can contain tokens. Report type only by default.
-        detail = safe_exception(exc)
-        print("错误：", detail, "。请检查配置/网络；先核对 Garmin 再重试。", file=sys.stderr)
-        LOG.error("Unhandled %s", detail)
-        return 2
-    finally:
-        if owned_handler is not None:
-            logging.getLogger().removeHandler(owned_handler)
+                return report_error(SafeError(
+                    f"另一个进程正在处理，{args.command} 未执行；请等待当前进程结束后重试。"))
+            owned_handler = None
             try:
-                owned_handler.close()
-            except Exception as exc:
-                print("日志关闭失败：", type(exc).__name__, file=sys.stderr)
+                owned_handler = RotatingFileHandler(
+                    STATE / "sync.log", maxBytes=1_000_000, backupCount=3, encoding="utf-8")
+                logging.basicConfig(level=logging.INFO, handlers=[owned_handler],
+                                    format="%(asctime)s %(levelname)s %(message)s")
+                if args.command == "init":
+                    init_config(args)
+                    return 0
+                if args.command == "run":
+                    run_with_attempt()
+                    return 0
+                if args.command == "uninstall-agent":
+                    manage_agent(False)
+                    return 0
+                cfg = config()
+                if args.command == "inspect": inspect_files(cfg)
+                elif args.command == "preview": show_preview(cfg)
+                elif args.command == "login":
+                    api_client(interactive=True)
+                    print("已登录 Garmin 中国区。令牌保存在本机 state/tokens；未上传健康数据。")
+                elif args.command == "upload-one": run_sync(cfg, args.record_id)
+                elif args.command == "compare": compare_exports(args, cfg)
+                elif args.command == "repair-one": reviewed_operation(args, cfg)
+                elif args.command == "delete-extra": reviewed_operation(args, cfg, delete_extra=True)
+                elif args.command == "replace-all":
+                    from replace_history import execute
+                    execute(args, cfg)
+                elif args.command == "verify-operation":
+                    if not verify_operation(args):
+                        return 2
+                elif args.command == "resume-operation": resume_operation(args)
+                elif args.command == "settings": update_settings(args, cfg)
+                elif args.command == "status": show_status(cfg)
+                elif args.command == "install-agent": manage_agent(True, cfg)
+                elif args.command == "disable":
+                    cfg["enabled"] = False; write_json(CONFIG, cfg)
+                    print("自动写入已关闭。要停掉定时检查，再运行 ./hg uninstall-agent。")
+                elif args.command == "enable":
+                    with contextlib.closing(database()) as db, db:
+                        n = db.execute("SELECT COUNT(*) FROM uploads WHERE status IN ('verified','verified_manual')").fetchone()[0]
+                    if not n:
+                        raise SafeError("先完成至少一条真实记录试传及核验，再启用自动写入。")
+                    show_preview(cfg)
+                    if input("确认以后自动上传完整新测量，输入 ENABLE：").strip() == "ENABLE":
+                        cfg["enabled"] = True; write_json(CONFIG, cfg)
+                        print("自动写入已启用。")
+                elif args.command == "remote":
+                    d = date.fromisoformat(args.date).isoformat()
+                    obj = api_client().get_body_composition(d, d)
+                    p = STATE / f"remote-{d}.json"; write_json(p, obj)
+                    print("仅查询，响应保存到：", p)
+                    print(json.dumps(obj, ensure_ascii=False, indent=2))
+                elif args.command == "resolve": resolve_record(args)
+            except (Exception, KeyboardInterrupt) as exc:
+                primary_result = report_error(exc, log=owned_handler is not None)
+                return primary_result
+            finally:
+                if owned_handler is not None:
+                    logging.getLogger().removeHandler(owned_handler)
+                    try:
+                        owned_handler.close()
+                    except Exception as exc:
+                        print("日志关闭失败：", type(exc).__name__, file=sys.stderr)
+        return 0
+    except (Exception, KeyboardInterrupt) as exc:
+        result = report_error(exc)
+        return primary_result if primary_result is not None else result
 
 
 if __name__ == "__main__":

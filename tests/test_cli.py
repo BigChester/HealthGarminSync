@@ -7,6 +7,7 @@ import json
 import logging
 import os
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 from types import SimpleNamespace
@@ -222,16 +223,166 @@ class LoggingOwnershipTests(ConfigFixture):
         self.root_logger.handlers = self.previous_handlers
         self.root_logger.setLevel(self.previous_level)
 
-    def invoke(self):
+    def invoke(self, command="run"):
         errors = io.StringIO()
         previous_umask = os.umask(0o077)
         try:
-            with patch.object(sys, "argv", ["health_garmin.py", "run"]), \
-                    contextlib.redirect_stderr(errors):
+            with patch.object(sys, "argv", ["health_garmin.py", command]), \
+                    contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(errors):
                 result = h.main()
         finally:
             os.umask(previous_umask)
         return result, errors.getvalue()
+
+    def test_busy_commands_skip_unopenable_log_without_initializing_logging(self):
+        (self.state / 'sync.log').mkdir()
+        before = self.config_path.read_bytes()
+        with (self.state / 'run.lock').open('a') as holder:
+            fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with patch.object(h, 'RotatingFileHandler', wraps=h.RotatingFileHandler) as factory, \
+                    patch.object(h.logging, 'basicConfig') as configure, \
+                    patch.object(h.LOG, 'error') as error, patch.object(h, 'config') as config, \
+                    patch.object(h, 'run_with_attempt') as run, patch.object(h, 'manage_agent') as service:
+                for command, expected in (('run', 0), ('status', 2), ('install-agent', 2)):
+                    with self.subTest(command=command):
+                        code, errors = self.invoke(command)
+                        self.assertEqual(code, expected)
+                        self.assertEqual(errors, '' if command == 'run' else
+                            f'停止： 另一个进程正在处理，{command} 未执行；请等待当前进程结束后重试。\n')
+                for boundary in (factory, configure, error, config, run, service):
+                    boundary.assert_not_called()
+        self.assertEqual(self.config_path.read_bytes(), before)
+        self.assertEqual({path.name for path in self.state.iterdir()}, {'sync.log', 'run.lock'})
+
+    def test_busy_subprocess_does_not_rotate_active_owner_log(self):
+        log = self.state / 'sync.log'
+        prefix = 'retained owner evidence\n'
+        log.write_text(prefix + 'x' * (999_980 - len(prefix)))
+        original = log.read_bytes()
+        owner = h.RotatingFileHandler(log, maxBytes=1_000_000, backupCount=3, encoding='utf-8')
+        script = '''
+import builtins, socket, sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[3])
+import health_garmin as h
+h.STATE = Path(sys.argv[1])
+def forbidden(*args, **kwargs):
+    raise AssertionError("real config, API, home or service access forbidden")
+h.config = h.api_client = h.manage_agent = forbidden
+Path.home = classmethod(lambda cls: forbidden())
+socket.create_connection = socket.getaddrinfo = forbidden
+socket.socket.connect = socket.socket.connect_ex = forbidden
+builtins.input = h.getpass.getpass = forbidden
+command = sys.argv[2]
+sys.argv = ['hg', command]
+raise SystemExit(h.main())
+'''
+        try:
+            inode = os.fstat(owner.stream.fileno()).st_ino
+            with (self.state / 'run.lock').open('a') as holder:
+                fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                for command in ('status', 'install-agent'):
+                    with self.subTest(command=command):
+                        child = subprocess.run([sys.executable, '-B', '-c', script, str(self.state),
+                                                command, str(Path(h.__file__).resolve().parent)],
+                                               cwd=self.root, env={'HOME': str(self.root)},
+                                               capture_output=True, text=True, timeout=5)
+                        self.assertEqual(child.returncode, 2)
+                        self.assertIn(command + ' 未执行', child.stderr)
+                        self.assertEqual(log.read_bytes(), original)
+                        self.assertEqual(log.stat().st_ino, inode)
+                        self.assertEqual(os.fstat(owner.stream.fileno()).st_ino, inode)
+                        self.assertEqual(list(self.state.glob('sync.log.*')), [])
+                owner.emit(logging.LogRecord('owner', logging.INFO, '', 0, 'owner resumes', (), None))
+                self.assertEqual(log.read_bytes(), original + b'owner resumes\n')
+                self.assertEqual(log.stat().st_ino, inode)
+        finally:
+            owner.close()
+
+    def test_log_creation_error_reporting_and_close_remain_inside_run_lock(self):
+        factory, log_error = h.RotatingFileHandler, h.LOG.error
+        for primary, expected in ((h.SafeError('controlled'), 2),
+                                  (OSError('private-secret'), 2), (KeyboardInterrupt(), 130)):
+            with self.subTest(expected=expected, primary=type(primary).__name__):
+                observed = []
+
+                def locked():
+                    with (self.state / 'run.lock').open('r') as probe:
+                        with self.assertRaises(BlockingIOError):
+                            fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+                def create(*args, **kwargs):
+                    locked()
+                    observed.append('create')
+                    owned = factory(*args, **kwargs)
+                    close = owned.close
+
+                    def close_locked():
+                        locked()
+                        observed.append('close')
+                        close()
+
+                    self.enterContext(patch.object(owned, 'close', side_effect=close_locked))
+                    return owned
+
+                def error(*args, **kwargs):
+                    locked()
+                    observed.append('error')
+                    log_error(*args, **kwargs)
+
+                with patch.object(h, 'RotatingFileHandler', side_effect=create), \
+                        patch.object(h.LOG, 'error', side_effect=error), \
+                        patch.object(h, 'run_with_attempt', side_effect=primary):
+                    code, errors = self.invoke()
+                self.assertEqual(code, expected)
+                self.assertNotIn('private-secret', errors)
+                self.assertEqual(observed, ['create', 'close'] if expected == 130 else ['create', 'error', 'close'])
+                self.assertEqual(self.root_logger.handlers, [])
+                with (self.state / 'run.lock').open('r') as probe:
+                    fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def test_lock_open_failure_is_safe_and_does_not_create_log_handler(self):
+        (self.state / 'run.lock').mkdir()
+        with patch.object(h, 'RotatingFileHandler') as factory, \
+                patch.object(h.LOG, 'error') as error, patch.object(h, 'run_with_attempt') as run:
+            code, errors = self.invoke()
+        self.assertEqual(code, 2)
+        self.assertIn('IsADirectoryError', errors)
+        self.assertNotIn('Traceback', errors)
+        factory.assert_not_called()
+        error.assert_not_called()
+        run.assert_not_called()
+
+    def test_lock_close_failure_preserves_primary_error_and_interruption_codes(self):
+        original_open = Path.open
+
+        class CloseFailure:
+            def __init__(self, stream):
+                self.stream = stream
+
+            def __enter__(self):
+                return self.stream
+
+            def __exit__(self, *args):
+                self.stream.close()
+                raise OSError('private-secret')
+
+        def open_with_close_failure(path, *args, **kwargs):
+            stream = original_open(path, *args, **kwargs)
+            return CloseFailure(stream) if path == self.state / 'run.lock' else stream
+
+        for primary, expected in ((None, 2), (h.SafeError('controlled'), 2), (KeyboardInterrupt(), 130)):
+            with self.subTest(expected=expected, primary=type(primary).__name__):
+                with patch.object(Path, 'open', open_with_close_failure), \
+                        patch.object(h, 'run_with_attempt', side_effect=primary):
+                    code, errors = self.invoke()
+                self.assertEqual(code, expected)
+                self.assertIn('OSError', errors)
+                self.assertNotIn('private-secret', errors)
+                self.assertNotIn('Traceback', errors)
+                self.assertEqual(self.root_logger.handlers, [])
+                with (self.state / 'run.lock').open('r') as probe:
+                    fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
 
     def test_repeated_commands_close_real_owned_handlers(self):
         handlers = []

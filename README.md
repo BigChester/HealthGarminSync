@@ -271,7 +271,7 @@ tail -n 80 state/agent.err.log
 | 未来时间被拒绝 | 核对 at / exported_at、时区及手机时间，重新导出 |
 | BMI 后到 | compare 生成 repair，手动修复指定记录 |
 | 配置或 settings 被拒绝 | enabled 必须为 JSON 布尔值；校验失败保留原配置 |
-| 显式命令返回 2、提示未执行 | run.lock 被占用，等进程结束；定时 run 遇锁跳过并返回 0 |
+| 显式命令返回 2、提示未执行 | run.lock 被占用，等进程结束；定时 run 遇锁跳过并返回 0，忙碌命令不写 sync.log |
 | 定时任务卸载失败 | 运行 doctor 核对服务；未确认卸载时保留任务文件，配置损坏时也可运行 uninstall-agent |
 | 401/403/验证码失败 | 检查中国区账号、网络，重新 login，避免连续快速重试 |
 | 令牌续期保存失败 | 核对 state/tokens 权限和磁盘，恢复后重新 login |
