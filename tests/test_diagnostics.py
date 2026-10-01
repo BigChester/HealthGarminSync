@@ -66,6 +66,11 @@ class DoctorTests(unittest.TestCase):
         self.last = self.state / 'last_run.json'
         self.last.write_text(json.dumps({'run_at': h.now().isoformat(),
             'results': {SECRET: 'verified'}, 'exports': {SECRET: SECRET}, 'payload': SECRET}))
+        stamp = h.now().isoformat()
+        self.agent_attempt = self.state / 'last_agent_attempt.json'
+        self.agent_attempt.write_text(json.dumps({'outcome': 'completed', 'started_at': stamp,
+            'finished_at': stamp, 'stage': 'run', 'error_type': None}))
+        self.agent_attempt.chmod(0o600)
         self.plist = self.home / 'Library/LaunchAgents' / (h.LABEL + '.plist')
         self.plist.parent.mkdir(parents=True)
         self.plist.write_bytes(plistlib.dumps(h.agent_plist()))

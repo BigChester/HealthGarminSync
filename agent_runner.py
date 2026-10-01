@@ -200,7 +200,7 @@ def safe_notice(stream, category, message='后台输出日志失败'):
         pass
 
 
-def run_locked():
+def run_locked(on_ready=None):
     original_out, original_err, original_argv = sys.stdout, sys.stderr, sys.argv
     streams = []
     reporting = False
@@ -236,6 +236,8 @@ def run_locked():
         sys.stdout, sys.stderr = streams
         sys.argv = [str(h.BASE / 'health_garmin.py'), 'run']
         try:
+            if on_ready is not None:
+                on_ready()
             result = h.main()
         except BaseException as exc:
             safe_notice(streams[1], type(exc).__name__, message='后台运行失败')
@@ -245,6 +247,54 @@ def run_locked():
         for stream in streams:
             stream.close()
     return 2 if result == 0 and any(stream.failed for stream in streams) else result
+
+
+def finish_agent_attempt(attempt, preserve_error=False):
+    try:
+        attempt['finished_at'] = h.now().isoformat()
+        h.write_json(h.STATE / 'last_agent_attempt.json', attempt)
+    except BaseException as exc:
+        if not isinstance(exc, Exception) and not preserve_error:
+            raise
+        safe_notice(sys.stderr, type(exc).__name__, message='后台入口结束证据未保存')
+        return False
+    return True
+
+
+def run_with_agent_attempt():
+    """Caller holds agent-log.lock through setup, stream cleanup and evidence writes."""
+    attempt = {'outcome': 'running', 'started_at': h.now().isoformat(),
+               'finished_at': None, 'stage': 'setup', 'error_type': None}
+    try:
+        h.write_json(h.STATE / 'last_agent_attempt.json', attempt)
+    except BaseException as exc:
+        safe_notice(sys.stderr, type(exc).__name__, message='后台入口开始证据未保存')
+        raise
+
+    def ready():
+        next_stage = dict(attempt, stage='run')
+        h.write_json(h.STATE / 'last_agent_attempt.json', next_stage)
+        attempt.update(next_stage)
+
+    try:
+        result = run_locked(on_ready=ready)
+    except KeyboardInterrupt as exc:
+        attempt.update(outcome='interrupted', error_type=type(exc).__name__)
+        finish_agent_attempt(attempt, preserve_error=True)
+        raise
+    except Exception as exc:
+        attempt.update(outcome='failed', error_type=type(exc).__name__)
+        finish_agent_attempt(attempt, preserve_error=True)
+        raise
+    else:
+        if result == 0:
+            attempt.update(outcome='completed', error_type=None)
+        elif result == 130:
+            attempt.update(outcome='interrupted', error_type='KeyboardInterrupt')
+        else:
+            attempt.update(outcome='failed', error_type='CommandFailed')
+        saved = finish_agent_attempt(attempt, preserve_error=result != 0)
+        return 2 if result == 0 and not saved else result
 
 
 def main():
@@ -264,7 +314,7 @@ def main():
             safe_notice(sys.stderr, type(exc).__name__)
             result = 2
         else:
-            result = run_locked()
+            result = run_with_agent_attempt()
     finally:
         try:
             os.close(lock_fd)

@@ -33,12 +33,14 @@ def _json(path, reject_symlink=True):
         raise ValueError('JSON nesting too deep') from exc
 
 
-def attempt_summary(value):
+def attempt_summary(value, *, allowed_stages=('config', 'sync'),
+                    allowed_outcomes=('running', 'completed', 'preview', 'failed', 'interrupted'),
+                    allow_http=True):
     fields = {'outcome', 'started_at', 'finished_at', 'stage', 'error_type'}
     if not isinstance(value, dict) or set(value) != fields:
         raise ValueError('invalid attempt fields')
     outcome, stage = value['outcome'], value['stage']
-    if outcome not in ('running', 'completed', 'preview', 'failed', 'interrupted') or stage not in ('config', 'sync'):
+    if outcome not in allowed_outcomes or stage not in allowed_stages:
         raise ValueError('invalid attempt values')
     if not isinstance(value['started_at'], str):
         raise ValueError('invalid attempt start')
@@ -55,10 +57,11 @@ def attempt_summary(value):
         if finished < started:
             raise ValueError('attempt ended before it started')
         if outcome in ('completed', 'preview'):
-            if stage != 'sync' or error is not None:
+            if stage != allowed_stages[-1] or error is not None:
                 raise ValueError('invalid completed attempt')
         elif (not isinstance(error, str) or not re.fullmatch(
-                r'[A-Za-z_][A-Za-z0-9_]*(?: HTTP (?:400|401|403|404|429|500|502|503|504))?', error)):
+                r'[A-Za-z_][A-Za-z0-9_]*' +
+                (r'(?: HTTP (?:400|401|403|404|429|500|502|503|504))?' if allow_http else ''), error)):
             raise ValueError('invalid attempt error category')
     # Never forward exception categories or arbitrary fields to user-facing output.
     return {'outcome': outcome, 'stage': stage, 'started_at': started.isoformat(),
@@ -227,6 +230,25 @@ def collect():
             add('last_attempt', 'info', '尚无运行尝试摘要；兼容已有安装。')
         except (OSError, UnicodeError, ValueError, h.SafeError):
             add('last_attempt', 'error', '运行尝试摘要无法读取或结构无效。', '检查 state/last_attempt.json。')
+        try:
+            attempt = attempt_summary(_json(h.STATE / 'last_agent_attempt.json'),
+                                      allowed_stages=('setup', 'run'),
+                                      allowed_outcomes=('running', 'completed', 'failed', 'interrupted'),
+                                      allow_http=False)
+            outcome = attempt['outcome']
+            status = 'error' if outcome in ('failed', 'interrupted') else 'warn' if outcome == 'running' else 'info'
+            messages = {'running': '最近后台入口尚无结束证据；可能仍在运行或曾被中断。',
+                        'completed': '最近后台入口阶段已结束；不代表同步完成或全部记录已验证。',
+                        'failed': '最近后台入口失败；请查看本地日志并核对运行摘要。',
+                        'interrupted': '最近后台入口已中断；先核对运行摘要与 Garmin，不要直接重发。'}
+            add('last_agent_attempt', status, messages[outcome], data=attempt)
+        except FileNotFoundError:
+            enabled = cfg is not None and cfg['enabled']
+            add('last_agent_attempt', 'warn' if enabled else 'info',
+                '尚无后台入口摘要；兼容已有安装，不能据此确认后台执行。')
+        except (OSError, UnicodeError, ValueError, h.SafeError):
+            add('last_agent_attempt', 'error', '后台入口摘要无法读取或结构无效。',
+                '检查 state/last_agent_attempt.json。')
 
     enabled = cfg is not None and cfg['enabled']
     try:
