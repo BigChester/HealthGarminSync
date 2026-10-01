@@ -353,8 +353,122 @@ raise SystemExit(h.main())
         error.assert_not_called()
         run.assert_not_called()
 
+    def test_invalid_run_lock_paths_fail_quickly_before_any_command_work(self):
+        script = '''
+import builtins, socket, sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[2])
+import health_garmin as h
+h.BASE = Path(sys.argv[1]).parent
+h.STATE = Path(sys.argv[1])
+h.CONFIG = h.BASE / 'config.json'
+def forbidden(*args, **kwargs):
+    raise AssertionError('config, API, home, service or logging accessed before lock validation')
+h.config = h.api_client = h.manage_agent = h.RotatingFileHandler = forbidden
+h.run_with_attempt = forbidden
+Path.home = classmethod(lambda cls: forbidden())
+socket.create_connection = socket.getaddrinfo = forbidden
+socket.socket.connect = socket.socket.connect_ex = forbidden
+builtins.input = h.getpass.getpass = forbidden
+sys.argv = ['hg', 'run']
+raise SystemExit(h.main())
+'''
+        marker = self.state / 'last_attempt.json'
+        marker.write_bytes(b'Preserved old run evidence')
+        summary = self.state / 'last_run.json'
+        summary.write_bytes(b'Preserved old summary')
+        before = marker.read_bytes(), summary.read_bytes(), self.config_path.read_bytes()
+        target = self.root / 'untouched-target'
+        target.write_bytes(b'Preserved external target')
+        lock = self.state / 'run.lock'
+        for kind in ('fifo', 'symlink'):
+            with self.subTest(kind=kind):
+                if kind == 'fifo':
+                    os.mkfifo(lock, 0o600)
+                else:
+                    lock.symlink_to(target)
+                child = subprocess.Popen([sys.executable, '-B', '-c', script, str(self.state),
+                                          str(Path(h.__file__).resolve().parent)], cwd=self.root,
+                                         env={'HOME': str(self.root)}, stdout=subprocess.PIPE,
+                                         stderr=subprocess.PIPE, text=True)
+                try:
+                    output, errors = child.communicate(timeout=2)
+                finally:
+                    if child.poll() is None:
+                        child.kill()
+                    child.wait(timeout=2)
+                    child.stdout.close()
+                    child.stderr.close()
+                    lock.unlink()
+                self.assertEqual(child.returncode, 2)
+                self.assertEqual(output, '')
+                self.assertNotIn('AssertionError', errors)
+                self.assertNotIn('Traceback', errors)
+                self.assertEqual(target.read_bytes(), b'Preserved external target')
+                self.assertFalse((self.state / 'sync.log').exists())
+                self.assertEqual((marker.read_bytes(), summary.read_bytes(), self.config_path.read_bytes()), before)
+
+    def test_fifo_with_reader_is_rejected_and_owned_descriptor_is_closed(self):
+        lock = self.state / 'run.lock'
+        os.mkfifo(lock, 0o600)
+        native_open, native_close = os.open, os.close
+        reader = native_open(lock, os.O_RDONLY | os.O_NONBLOCK)
+        opened = []
+
+        def open_fd(*args, **kwargs):
+            fd = native_open(*args, **kwargs)
+            opened.append(fd)
+            return fd
+
+        try:
+            with patch.object(h.os, 'open', side_effect=open_fd), patch.object(h.os, 'fdopen') as wrap, \
+                    patch.object(h, 'RotatingFileHandler') as logging_factory, patch.object(h, 'config') as config, \
+                    patch.object(h, 'api_client') as api, patch.object(h, 'run_with_attempt') as run:
+                code, errors = self.invoke()
+            self.assertEqual(code, 2)
+            self.assertIn('普通文件', errors)
+            self.assertNotIn('Traceback', errors)
+            for boundary in (wrap, logging_factory, config, api, run):
+                boundary.assert_not_called()
+            self.assertEqual(len(opened), 1)
+            with self.assertRaises(OSError):
+                os.fstat(opened[0])
+            os.fstat(reader)
+        finally:
+            native_close(reader)
+
+    def test_fdopen_failure_closes_descriptor_and_keeps_primary_exception(self):
+        native_open, native_close = os.open, os.close
+        for primary, close_failure in ((OSError('private-secret'), False),
+                                       (OSError('private-secret'), True), (KeyboardInterrupt(), True)):
+            with self.subTest(primary=type(primary).__name__, close_failure=close_failure):
+                opened = []
+
+                def open_fd(*args, **kwargs):
+                    fd = native_open(*args, **kwargs)
+                    opened.append(fd)
+                    return fd
+
+                def close(fd):
+                    native_close(fd)
+                    if close_failure:
+                        raise OSError('private-secret')
+
+                errors = io.StringIO()
+                with patch.object(h.os, 'open', side_effect=open_fd), patch.object(h.os, 'fdopen', side_effect=primary), \
+                        patch.object(h.os, 'close', side_effect=close) as cleanup, contextlib.redirect_stderr(errors), \
+                        self.assertRaises(type(primary)) as raised:
+                    h.open_run_lock(self.state / 'run.lock')
+                self.assertIs(raised.exception, primary)
+                self.assertEqual(len(opened), 1)
+                cleanup.assert_called_once_with(opened[0])
+                with self.assertRaises(OSError):
+                    os.fstat(opened[0])
+                self.assertNotIn('private-secret', errors.getvalue())
+                self.assertNotIn('Traceback', errors.getvalue())
+
     def test_lock_close_failure_preserves_primary_error_and_interruption_codes(self):
-        original_open = Path.open
+        original_open = h.open_run_lock
 
         class CloseFailure:
             def __init__(self, stream):
@@ -367,13 +481,12 @@ raise SystemExit(h.main())
                 self.stream.close()
                 raise OSError('private-secret')
 
-        def open_with_close_failure(path, *args, **kwargs):
-            stream = original_open(path, *args, **kwargs)
-            return CloseFailure(stream) if path == self.state / 'run.lock' else stream
+        def open_with_close_failure(path):
+            return CloseFailure(original_open(path))
 
         for primary, expected in ((None, 2), (h.SafeError('controlled'), 2), (KeyboardInterrupt(), 130)):
             with self.subTest(expected=expected, primary=type(primary).__name__):
-                with patch.object(Path, 'open', open_with_close_failure), \
+                with patch.object(h, 'open_run_lock', side_effect=open_with_close_failure), \
                         patch.object(h, 'run_with_attempt', side_effect=primary):
                     code, errors = self.invoke()
                 self.assertEqual(code, expected)

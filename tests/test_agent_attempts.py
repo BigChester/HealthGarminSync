@@ -721,6 +721,51 @@ def api_client(*args, **kwargs):
         with (self.state / 'agent-log.lock').open('a') as probe:
             fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
 
+    def test_real_script_fifo_run_lock_fails_quickly_without_overwriting_run_evidence(self):
+        self.install_temporary_script('''
+import builtins
+import socket
+def forbidden(*args, **kwargs):
+    raise AssertionError("config, API, home, service or command log accessed before lock validation")
+config = api_client = manage_agent = RotatingFileHandler = forbidden
+run_with_attempt = forbidden
+Path.home = classmethod(lambda cls: forbidden())
+socket.create_connection = socket.getaddrinfo = forbidden
+socket.socket.connect = socket.socket.connect_ex = forbidden
+builtins.input = getpass.getpass = forbidden
+''')
+        os.mkfifo(self.state / 'run.lock', 0o600)
+        stamp = h.now().isoformat()
+        run_marker = self.state / 'last_attempt.json'
+        run_marker.write_text(json.dumps({'outcome': 'completed', 'stage': 'sync', 'started_at': stamp,
+                                         'finished_at': stamp, 'error_type': None}))
+        before = run_marker.read_bytes(), self.last.read_bytes(), self.export.read_bytes(), (self.tokens / 'oauth.json').read_bytes()
+        child = subprocess.Popen([sys.executable, '-B', str(self.entry)], cwd=self.base,
+                                 env={'HOME': str(self.home)}, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            output, errors = child.communicate(timeout=2)
+        finally:
+            if child.poll() is None:
+                child.kill()
+            child.wait(timeout=2)
+            child.stdout.close()
+            child.stderr.close()
+        self.assertEqual(child.returncode, 2)
+        self.assertNotIn(fixtures.SECRET.encode(), output + errors)
+        self.assertEqual((self.value()['outcome'], self.value()['stage']), ('failed', 'run'))
+        self.assertEqual((run_marker.read_bytes(), self.last.read_bytes(), self.export.read_bytes(),
+                          (self.tokens / 'oauth.json').read_bytes()), before)
+        self.assertFalse((self.state / 'sync.log').exists())
+        self.assertFalse((self.state / 'sync.sqlite3').exists())
+        log = (self.state / 'agent.err.log').read_text()
+        self.assertNotIn('AssertionError', log)
+        self.assertNotIn('Traceback', log)
+        code, _, checks = self.report()
+        self.assertEqual(code, 2)
+        self.assertEqual(checks['last_agent_attempt']['status'], 'error')
+        with (self.state / 'agent-log.lock').open('a') as probe:
+            fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
     def test_real_script_sigkill_keeps_unfinished_evidence_and_releases_locks(self):
         self.install_temporary_script('''
 import time

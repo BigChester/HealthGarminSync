@@ -26,6 +26,7 @@ from pathlib import Path
 import plistlib
 import re
 import sqlite3
+import stat
 import subprocess
 import sys
 import tempfile
@@ -69,6 +70,24 @@ def private_dir(path: Path) -> None:
         raise SafeError("本地私密目录不能是符号链接。")
     path.mkdir(parents=True, exist_ok=True, mode=0o700)
     path.chmod(0o700)
+
+
+def open_run_lock(path: Path):
+    """Open only a regular, non-symlink lock without waiting for FIFO readers."""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NONBLOCK | os.O_NOFOLLOW, 0o600)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise SafeError("运行锁必须是普通文件；请检查 state/run.lock。")
+        return os.fdopen(fd, "a")
+    except BaseException:
+        try:
+            os.close(fd)
+        except Exception as exc:
+            try:
+                print("运行锁关闭失败：", type(exc).__name__, file=sys.stderr)
+            except Exception:
+                pass
+        raise
 
 
 def write_json(path: Path, data: Any) -> None:
@@ -1668,7 +1687,7 @@ def main() -> int:
     primary_result = None
     try:
         private_dir(STATE)
-        with (STATE / "run.lock").open("a") as lock:
+        with open_run_lock(STATE / "run.lock") as lock:
             try:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
