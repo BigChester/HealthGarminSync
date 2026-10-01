@@ -2,7 +2,7 @@
 
 iPhone 快捷指令将 Apple 健康中的 PICOOC 测量导出到 iCloud Drive，Mac 本地 CLI 每 30 分钟检查并同步到 Garmin 中国区。合并 JSON 使用 `schema_version=2`，包含体重、体脂率、可选 BMI 和瘦体重（lbm）；瘦体重仅本地保存，不映射为 Garmin 肌肉量。兼容既有 `schema_version=1` 导出和记录 ID。
 
-当前版本有 206 项离线单元测试；开发回归与历史设备验收分别见 [TEST_REPORT.md](TEST_REPORT.md)。iPhone 搭建步骤见 [SHORTCUTS.md](SHORTCUTS.md)，本包不含可导入的 `.shortcut`。
+开发回归与历史设备验收见 [TEST_REPORT.md](TEST_REPORT.md)。iPhone 搭建步骤见 [SHORTCUTS.md](SHORTCUTS.md)，本包不含可导入的 `.shortcut`。
 
 ## 1. 准备手机和共享目录
 
@@ -238,6 +238,8 @@ iPhone 自动化按 [SHORTCUTS.md](SHORTCUTS.md) 第 5 节设置：退出 PICOOC
 
 ```bash
 cd "$HOME/Applications/HealthGarminSync"
+./hg doctor
+./hg doctor --json                # 供自动化读取
 ./hg status
 ./hg preview
 ./hg run
@@ -248,6 +250,8 @@ tail -n 80 state/sync.log
 tail -n 80 state/agent.out.log
 tail -n 80 state/agent.err.log
 ```
+
+`doctor` 离线只读检查环境、配置、导出、运行摘要和 LaunchAgent，配置损坏或进程锁被占用时也可运行。有错误返回 2，其余返回 0；后台执行与权限需实际验收。虚拟环境缺失时，用 Python 3.12+ 执行 `python3 health_garmin.py doctor`。
 
 `sync.log` 自动轮换；LaunchAgent 输出日志需自行归档。预览、查询和日志应留在本机账户下；失败通知通过本地状态和日志查看。
 
