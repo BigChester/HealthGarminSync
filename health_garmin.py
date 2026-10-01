@@ -1354,11 +1354,6 @@ def resolve_record(args: argparse.Namespace) -> None:
 
 
 def main() -> int:
-    os.umask(0o077)
-    private_dir(STATE)
-    logging.basicConfig(level=logging.INFO, handlers=[
-        RotatingFileHandler(STATE / "sync.log", maxBytes=1_000_000, backupCount=3, encoding="utf-8")],
-        format="%(asctime)s %(levelname)s %(message)s")
     parser = argparse.ArgumentParser(description=__doc__)
     subs = parser.add_subparsers(dest="command", required=True)
     p = subs.add_parser("init"); p.add_argument("--inbox"); p.add_argument("--since")
@@ -1390,7 +1385,22 @@ def main() -> int:
     group.add_argument("--present", action="store_true")
     group.add_argument("--absent", action="store_true")
     group.add_argument("--ignore", action="store_true")
+    p = subs.add_parser("doctor", help="离线只读检查配置、导出和后台任务")
+    p.add_argument("--json", action="store_true", help="输出 JSON 检查报告")
     args = parser.parse_args()
+    if args.command == "doctor":
+        previous_bytecode = sys.dont_write_bytecode
+        sys.dont_write_bytecode = True
+        try:
+            from diagnostics import doctor
+            return doctor(json_output=args.json)
+        finally:
+            sys.dont_write_bytecode = previous_bytecode
+    os.umask(0o077)
+    private_dir(STATE)
+    logging.basicConfig(level=logging.INFO, handlers=[
+        RotatingFileHandler(STATE / "sync.log", maxBytes=1_000_000, backupCount=3, encoding="utf-8")],
+        format="%(asctime)s %(levelname)s %(message)s")
     try:
         with (STATE / "run.lock").open("a") as lock:
             try:
