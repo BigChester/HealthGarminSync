@@ -269,6 +269,7 @@ tail -n 80 state/agent.err.log
 | BMI 后到 | compare 生成 repair，手动修复指定记录 |
 | 配置或 settings 被拒绝 | enabled 必须为 JSON 布尔值；校验失败保留原配置 |
 | 显式命令返回 2、提示未执行 | run.lock 被占用，等进程结束；定时 run 遇锁跳过并返回 0 |
+| 定时任务卸载失败 | 运行 doctor 核对服务；未确认卸载时保留任务文件，配置损坏时也可运行 uninstall-agent |
 | 401/403/验证码失败 | 检查中国区账号、网络，重新 login，避免连续快速重试 |
 | 429 | 暂停重试，稍后查询 |
 | 上传超时 | 查询 uncertain，核对后 resolve |
