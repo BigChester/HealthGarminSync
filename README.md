@@ -2,7 +2,7 @@
 
 iPhone 快捷指令将 Apple 健康中的 PICOOC 测量导出到 iCloud Drive，Mac 本地 CLI 每 30 分钟检查并同步到 Garmin 中国区。合并 JSON 使用 `schema_version=2`，包含体重、体脂率、可选 BMI 和瘦体重（lbm）；瘦体重仅本地保存，不映射为 Garmin 肌肉量。兼容既有 `schema_version=1` 导出和记录 ID。
 
-当前版本有 182 项离线单元测试；开发回归与历史设备验收分别见 [TEST_REPORT.md](TEST_REPORT.md)。iPhone 搭建步骤见 [SHORTCUTS.md](SHORTCUTS.md)，本包不含可导入的 `.shortcut`。
+当前版本有 206 项离线单元测试；开发回归与历史设备验收分别见 [TEST_REPORT.md](TEST_REPORT.md)。iPhone 搭建步骤见 [SHORTCUTS.md](SHORTCUTS.md)，本包不含可导入的 `.shortcut`。
 
 ## 1. 准备手机和共享目录
 
@@ -170,7 +170,7 @@ bash setup.sh
 # 核对原记录和目标值，输入 REPLACE 记录ID
 ```
 
-流程为备份、删除指定记录、确认删除、重建、读回核验。执行前重新查询，双方值变化需重新生成清单。备份在 `state/backups/时间戳/`，持久操作日志在 `state/operations/`。Apple 未提供的原有体脂和 BMI 会保留；原记录含无法保留的其他身体成分字段时拒绝删除。
+删除前检查重建条件，随后备份、删除指定记录、确认删除、重建并读回核验。执行前重新查询，双方值变化需重新生成清单。备份在 `state/backups/时间戳/`，持久操作日志在 `state/operations/`。Apple 未提供的原有体脂和 BMI 会保留；原记录含无法保留的其他身体成分字段时拒绝删除。
 
 ### 删除指定多余记录
 
@@ -205,6 +205,8 @@ bash setup.sh
 ```bash
 ./hg verify-operation state/operations/这里替换为操作记录文件名.json
 ```
+
+输出区分本次核验结果与历史操作阶段；匹配返回 0，未匹配或查询失败返回 2。
 
 仅在已确认目标缺失、原记录已删除时，恢复已备份的单条修复：
 
