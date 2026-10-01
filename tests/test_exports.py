@@ -39,6 +39,39 @@ class ExportBundleTests(unittest.TestCase):
         self.assertEqual([s.value for s in data], [70, 23.5])
         self.assertEqual(at, h.aware(EXPORTED))
 
+    def test_export_time_uses_ten_minute_clock_tolerance_in_both_schemas(self):
+        current = h.aware('2026-10-02T10:00:00+08:00')
+        for original in (bundle(), old('weight', [sample('70 kg')])):
+            for skew in (timedelta(days=-30), timedelta(0), timedelta(minutes=10),
+                         timedelta(minutes=10, microseconds=1), timedelta(days=30)):
+                for zone in (current.tzinfo, h.UTC):
+                    with self.subTest(schema=original['schema_version'], skew=skew, zone=zone):
+                        data = copy.deepcopy(original)
+                        stamp = (current + skew).astimezone(zone)
+                        data['exported_at'] = stamp.isoformat()
+                        with patch.object(h, 'now', return_value=current):
+                            if skew > timedelta(minutes=10):
+                                with self.assertRaisesRegex(h.SafeError, '未来导出时间'):
+                                    h.decode_export(data, CFG)
+                            else:
+                                self.assertEqual(h.decode_export(data, CFG)[1], stamp)
+
+    def test_future_export_metadata_is_rejected_even_without_selected_samples(self):
+        current = h.now()
+        for selected in (False, True):
+            with self.subTest(selected=selected), tempfile.TemporaryDirectory() as temp:
+                data = bundle()
+                if not selected:
+                    data['metrics'] = {'weight': [], 'body_fat': []}
+                data['exported_at'] = (current + timedelta(days=1)).isoformat()
+                source = Path(temp) / 'future.json'
+                source.write_text(json.dumps(data))
+                previous = source.read_bytes()
+                with patch.object(h, 'now', return_value=current):
+                    with self.assertRaisesRegex(h.SafeError, 'future.json:.*未来导出时间'):
+                        h.load_exports(dict(CFG, inbox=temp))
+                self.assertEqual(source.read_bytes(), previous)
+
     def test_v1_still_reads(self):
         x = bundle(); data = []
         for metric, samples in x["metrics"].items():

@@ -656,6 +656,57 @@ class ReconciliationTests(unittest.TestCase):
         api = API(); self.sync(api)
         self.assertEqual(len(api.posts), 1)
 
+    def test_zero_settling_allows_small_export_clock_skew(self):
+        current = h.now()
+        source = self.inbox / 'health.json'
+        data = json.loads(source.read_text())
+        data['exported_at'] = (current + timedelta(minutes=1)).isoformat()
+        source.write_text(json.dumps(data))
+        prior = source.read_bytes()
+        api = API()
+        with patch.object(h, 'now', return_value=current):
+            self.sync(api)
+        summary = json.loads((self.state / 'last_run.json').read_text())
+        self.assertEqual(len(api.posts), 1)
+        self.assertEqual(summary['results'][self.r.key], 'verified')
+        self.assertNotIn('deferred', summary)
+        self.assertEqual(source.read_bytes(), prior)
+
+    def test_positive_settling_waits_until_window_boundary(self):
+        current = h.now()
+        self.cfg['settle_seconds'] = 120
+        source = self.inbox / 'health.json'
+        data = json.loads(source.read_text())
+        data['exported_at'] = current.isoformat()
+        source.write_text(json.dumps(data))
+        api = API()
+        with patch.object(h, 'now', return_value=current + timedelta(seconds=119)):
+            self.sync(api)
+        summary = json.loads((self.state / 'last_run.json').read_text())
+        self.assertEqual(summary['results'][self.r.key], 'deferred')
+        self.assertEqual(summary['deferred'], 'settling')
+        self.assertFalse(api.posts)
+        with patch.object(h, 'now', return_value=current + timedelta(seconds=120)):
+            self.sync(api)
+        summary = json.loads((self.state / 'last_run.json').read_text())
+        self.assertEqual(len(api.posts), 1)
+        self.assertEqual(summary['results'][self.r.key], 'verified')
+        self.assertNotIn('deferred', summary)
+
+    def test_confirmed_manual_upload_bypasses_positive_settling(self):
+        current = h.now()
+        self.cfg['settle_seconds'] = 120
+        source = self.inbox / 'health.json'
+        data = json.loads(source.read_text())
+        data['exported_at'] = (current + timedelta(minutes=1)).isoformat()
+        source.write_text(json.dumps(data))
+        api = API()
+        with patch.object(h, 'now', return_value=current), patch.object(h, 'api_client', return_value=api), \
+                patch('builtins.input', return_value='UPLOAD'), contextlib.redirect_stdout(io.StringIO()):
+            h.run_sync(self.cfg, self.r.key)
+        self.assertEqual(len(api.posts), 1)
+        self.assertEqual(h.get_status(self.db, self.r), 'verified')
+
     def test_ignored_never_uploaded_even_if_remote_missing(self):
         h.set_status(self.db, self.r, 'ignored')
         api = API(); self.sync(api)

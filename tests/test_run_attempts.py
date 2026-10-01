@@ -99,6 +99,38 @@ class RunAttemptTests(unittest.TestCase):
         self.assertFalse(api.posts)
         self.assertFalse(api.deletes)
 
+    def test_future_export_stops_before_api_and_recovers_after_corrected_metadata(self):
+        current = h.now()
+        previous = self.last.read_bytes()
+        data = json.loads(self.export.read_text())
+        data['exported_at'] = (current + timedelta(days=1)).isoformat()
+        self.export.write_text(json.dumps(data))
+        source = self.export.read_bytes()
+        with patch.object(h, 'now', return_value=current), patch.object(h, 'api_client') as api:
+            result, _, errors = self.run_main()
+        self.assertEqual(result, 2)
+        self.assertIn('未来导出时间', errors)
+        self.assertEqual(self.attempt()['outcome'], 'failed')
+        self.assertEqual(self.attempt()['stage'], 'sync')
+        self.assertEqual(self.last.read_bytes(), previous)
+        self.assertEqual(self.export.read_bytes(), source)
+        api.assert_not_called()
+        code, _, checks = self.report()
+        self.assertEqual(code, 2)
+        self.assertEqual(checks['inbox']['status'], 'error')
+        self.assertEqual(checks['last_attempt']['status'], 'error')
+        data['exported_at'] = (current - timedelta(minutes=3)).isoformat()
+        self.export.write_text(json.dumps(data))
+        source = self.export.read_bytes()
+        api = API()
+        with patch.object(h, 'api_client', return_value=api):
+            result, _, _ = self.run_main()
+        self.assertEqual(result, 0)
+        self.assertEqual(len(api.posts), 1)
+        self.assertEqual(self.attempt()['outcome'], 'completed')
+        self.assertEqual(self.export.read_bytes(), source)
+        self.assertEqual(self.report()[2]['inbox']['status'], 'ok')
+
     def test_interrupted_post_keeps_inflight_and_subsequent_run_never_reposts(self):
         class InterruptedAPI(API):
             def add_body_composition(self, **kwargs):

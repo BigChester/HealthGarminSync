@@ -274,6 +274,9 @@ def export_groups(obj: Any) -> dict[str, list[dict[str, Any]]]:
 def decode_export(obj: Any, cfg: dict[str, Any]) -> tuple[list[Sample], datetime]:
     groups = export_groups(obj)
     exported = aware(obj.get("exported_at", ""))
+    future_limit = now() + timedelta(minutes=10)
+    if exported > future_limit:
+        raise SafeError("发现未来导出时间，请检查 exported_at、时区和手机时间。")
     allowed = {normalized_source(s) for s in cfg["allowed_sources"]}
     output: list[Sample] = []
     for metric, samples in groups.items():
@@ -286,7 +289,7 @@ def decode_export(obj: Any, cfg: dict[str, Any]) -> tuple[list[Sample], datetime
             dt = aware(item.get("at", ""))
             if dt.date() < date.fromisoformat(cfg["since"]):
                 continue
-            if dt > now() + timedelta(minutes=10):
+            if dt > future_limit:
                 raise SafeError("发现未来测量时间，请检查日期格式、时区和手机时间。")
             value = parse_quantity(item.get("value"), metric, cfg)
             output.append(Sample(metric, dt, value, source.strip()))
@@ -1196,7 +1199,8 @@ def run_sync(cfg: dict[str, Any], record_id: str | None = None) -> None:
         by_id = {r.key: r for r in records}
         writes = 0
         recent = [aware(v) for k, v in exports.items() if k in ("weight", "body_fat")]
-        settling = not record_id and recent and (now() - max(recent)).total_seconds() < int(cfg["settle_seconds"])
+        settle_seconds = int(cfg["settle_seconds"])
+        settling = not record_id and settle_seconds > 0 and recent and (now() - max(recent)).total_seconds() < settle_seconds
         for entry in plan["entries"]:
             r, action = by_id[entry["id"]], entry["action"]
             if action == "matched":
