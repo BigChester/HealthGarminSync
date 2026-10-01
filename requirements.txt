@@ -1,0 +1,5 @@
+# Primary dependency fixed to the reviewed PyPI release of 2026-09-18.
+garminconnect==0.3.16
+# Recommended by upstream for login TLS compatibility. setup.sh records the
+# exact resolved version and all transitive versions in requirements.lock.txt.
+curl_cffi

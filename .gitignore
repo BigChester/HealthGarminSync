@@ -1,0 +1,13 @@
+.venv/
+state/
+config.json
+requirements.lock.txt
+__pycache__/
+*.pyc
+.DS_Store
+.env
+.env.*
+!.env.example
+.pytest_cache/
+.coverage
+htmlcov/
