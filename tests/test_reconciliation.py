@@ -260,6 +260,9 @@ class ReconciliationTests(unittest.TestCase):
                 self.sync(api)
                 self.assertFalse(api.posts)
                 self.assertEqual(h.get_status(self.db, self.r), status)
+                summary = json.loads((self.state / 'last_run.json').read_text())
+                self.assertEqual(summary['results'][self.r.key], status)
+                self.assertEqual(summary['comparison'], {'conflict': 2})
 
                 # A corrected export removes the ambiguity, but an empty read
                 # still cannot prove that the previous request did not succeed.
@@ -267,6 +270,27 @@ class ReconciliationTests(unittest.TestCase):
                 self.sync(api)
                 self.assertFalse(api.posts)
                 self.assertEqual(h.get_status(self.db, self.r), 'uncertain')
+                summary = json.loads((self.state / 'last_run.json').read_text())
+                self.assertEqual(summary['results'][self.r.key], 'uncertain')
+                self.assertEqual(summary['comparison'], {'uncertain': 1})
+
+    def test_review_actions_report_persisted_uncertain_markers_without_submission(self):
+        for marker in ('inflight', 'uncertain', 'repair_uncertain'):
+            for action in ('repair', 'replace', 'conflict'):
+                with self.subTest(marker=marker, action=action):
+                    h.set_status(self.db, self.r, marker)
+                    plan = self.plan([])
+                    plan['entries'][0]['action'] = action
+                    plan['counts'] = {action: 1}
+                    api = API()
+                    with patch.object(h, 'load_local_comparison', return_value=plan):
+                        self.sync(api)
+                    summary = json.loads((self.state / 'last_run.json').read_text())
+                    self.assertEqual(summary['results'][self.r.key], marker)
+                    self.assertEqual(summary['comparison'], {action: 1})
+                    self.assertEqual(h.get_status(self.db, self.r), marker)
+                    self.assertFalse(api.posts)
+                    self.assertFalse(api.deletes)
 
     def test_every_chunk_is_validated_before_first_write(self):
         other = h.Measurement(AT + timedelta(days=60), 71, 24, 'PICOOC')

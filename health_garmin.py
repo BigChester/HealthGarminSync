@@ -1211,10 +1211,11 @@ def run_sync(cfg: dict[str, Any], record_id: str | None = None) -> None:
                 # whose outcome is still unknown.
                 if previous in ("inflight", "uncertain", "repair_uncertain"):
                     blocked = previous
+                    result = blocked
                 else:
                     blocked = "verified_conflict" if previous in ("verified", "verified_manual", "verified_conflict", "remote_missing") else "conflict"
+                    result = action
                 set_status(db, r, blocked, entry["reason"])
-                result = action
             elif action == "uncertain":
                 result = process_record(api, db, r)
             elif action == "missing" and not settling and writes < int(cfg["max_records_per_run"]):
