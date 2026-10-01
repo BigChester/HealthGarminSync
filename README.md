@@ -255,6 +255,8 @@ tail -n 80 state/agent.err.log
 
 最近一次取得锁的 `run` 尝试保存在 `state/last_attempt.json`，覆盖更新；失败和中断会由 `doctor` 报告。缺少结束记录时只提示待核查，进程可能仍在运行。`state/last_run.json` 保留最近完成的同步摘要。
 
+`state/last_agent_attempt.json` 同样覆盖更新，记录后台入口的日志初始化和主程序调用阶段，便于定位同步开始前的失败。
+
 `sync.log` 自动轮换。后台的 `agent.out.log` 和 `agent.err.log` 每文件最多 1 MB，各保留 3 份备份；旧超大日志保留尾部。已有任务运行 `./hg install-agent` 切换到新入口。预览、查询和日志留在本机账户下，失败通过本地状态和日志查看。
 
 | 现象 | 排查方式 |
