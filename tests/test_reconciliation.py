@@ -397,6 +397,91 @@ class ReconciliationTests(unittest.TestCase):
         self.assertEqual(json.loads(backups[0].read_text())['dateWeightList'], [original])
         self.assertTrue(list((self.state/'backups').glob('*/sync.sqlite3')))
 
+    def test_reviewed_repair_rejects_unknown_neighbor_before_deleting_original(self):
+        original = dict(row(self.r), bodyFat=None)
+        neighbor = row(h.Measurement(AT + timedelta(seconds=30), 75, None, 'PICOOC'), 101)
+        path = self.plan([original, neighbor], save=True); api = API([original, neighbor])
+        with self.assertRaises(h.SafeError): self.reviewed(api, path)
+        self.assertFalse(api.deletes)
+        self.assertFalse(api.posts)
+        self.assertEqual(api.rows, [original, neighbor])
+        self.assertFalse(list((self.state / 'operations').glob('*.json')))
+
+    def test_reviewed_repair_preserves_uniquely_matched_reviewed_neighbor(self):
+        other = h.Measurement(AT + timedelta(seconds=30), 71, 24, 'PICOOC')
+        self.write_export([self.r, other])
+        original = dict(row(self.r), bodyFat=None)
+        neighbor = row(other, 101)
+        path = self.plan([original, neighbor], [self.r, other], save=True); api = API([original, neighbor])
+        self.reviewed(api, path)
+        self.assertEqual(api.deletes, [('100', '2020-02-20')])
+        self.assertEqual(len(api.posts), 1)
+        self.assertIn(neighbor, api.rows)
+        self.assertEqual(len(api.rows), 2)
+        self.assertEqual(h.get_status(self.db, self.r), 'verified')
+
+    def test_confirmation_time_new_neighbor_prevents_deletion(self):
+        original = dict(row(self.r), bodyFat=None)
+        neighbor = row(h.Measurement(AT + timedelta(seconds=30), 75, None, 'PICOOC'), 101)
+        path = self.plan([original], save=True); api = API([original])
+        args = argparse.Namespace(plan=str(path), record_id=self.r.key)
+        def confirm(_):
+            api.rows.append(neighbor)
+            return 'REPLACE ' + self.r.key
+        with patch.object(h, 'api_client', return_value=api), patch('builtins.input', side_effect=confirm), contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(h.SafeError): h.reviewed_operation(args, self.cfg)
+        self.assertFalse(api.deletes)
+        self.assertFalse(api.posts)
+        self.assertEqual(api.rows, [original, neighbor])
+
+    def test_reviewed_repair_rejects_ambiguous_or_unknown_source_neighbor(self):
+        other = h.Measurement(AT + timedelta(seconds=30), 71, 24, 'PICOOC')
+        self.write_export([self.r, other])
+        original = dict(row(self.r), bodyFat=None)
+        for neighbors in ([row(other, 101), row(other, 102)], [dict(row(other, 101), weight='unknown')]):
+            with self.subTest(neighbors=neighbors):
+                rows = [original, *neighbors]
+                path = self.plan(rows, [self.r, other], save=True); api = API(rows)
+                with self.assertRaises(h.SafeError): self.reviewed(api, path)
+                self.assertFalse(api.deletes)
+                self.assertFalse(api.posts)
+                self.assertEqual(api.rows, rows)
+
+    def test_new_source_neighbor_not_in_reviewed_plan_cannot_allow_replacement(self):
+        original = dict(row(self.r), bodyFat=None)
+        path = self.plan([original], save=True)
+        other = h.Measurement(AT + timedelta(seconds=30), 71, 24, 'PICOOC')
+        self.write_export([self.r, other]); api = API([original, row(other, 101)])
+        with self.assertRaises(h.SafeError): self.reviewed(api, path)
+        self.assertFalse(api.deletes)
+        self.assertFalse(api.posts)
+
+    def test_new_overlapping_source_cannot_make_neighbor_look_unique(self):
+        other = h.Measurement(AT + timedelta(seconds=30), 71, 24, 'PICOOC')
+        original = dict(row(self.r), bodyFat=None)
+        neighbor = row(other, 101)
+        path = self.plan([original, neighbor], [self.r, other], save=True)
+        overlapping = h.Measurement(other.at + timedelta(milliseconds=500), 72, 25, 'PICOOC')
+        self.write_export([self.r, other, overlapping]); api = API([original, neighbor])
+        with self.assertRaises(h.SafeError): self.reviewed(api, path)
+        self.assertFalse(api.deletes)
+        self.assertFalse(api.posts)
+
+    def test_neighbor_appearing_after_delete_still_prevents_post(self):
+        original = dict(row(self.r), bodyFat=None)
+        path = self.plan([original], save=True); api = API([original])
+        delete = api.delete_weigh_in
+        neighbor = row(h.Measurement(AT + timedelta(seconds=30), 75, None, 'PICOOC'), 101)
+        def delete_and_add_neighbor(pk, day):
+            delete(pk, day)
+            api.rows.append(neighbor)
+        with patch.object(api, 'delete_weigh_in', side_effect=delete_and_add_neighbor):
+            with self.assertRaises(h.SafeError): self.reviewed(api, path)
+        self.assertEqual(api.deletes, [('100', '2020-02-20')])
+        self.assertFalse(api.posts)
+        self.assertEqual(api.rows, [neighbor])
+        self.assertEqual(json.loads(next((self.state / 'operations').glob('*.json')).read_text())['phase'], 'uncertain')
+
     def test_reviewed_repair_refuses_changed_remote(self):
         original = row(self.r); original['bodyFat'] = None
         path = self.plan([original], save=True)

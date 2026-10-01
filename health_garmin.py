@@ -737,6 +737,57 @@ def compare_exports(args: argparse.Namespace, cfg: dict[str, Any]) -> dict[str, 
     return plan
 
 
+def reviewed_replacement_snapshot(obj: Any, target: Measurement,
+                                  targets: list[Measurement]) -> dict[str, Any]:
+    """Exclude only uniquely matched, distinguishable reviewed source neighbours."""
+    index = RemoteIndex(obj)
+    decisions = [index.decide(r) for r in targets]
+    owners = Counter(indices[0] for kind, indices, _ in decisions
+                     if kind in ("matched", "repair", "replace"))
+    overlapping = set()
+    ordered = sorted((r.at.timestamp(), i) for i, r in enumerate(targets))
+    for (stamp, i), (next_stamp, j) in zip(ordered, ordered[1:]):
+        if next_stamp - stamp <= 2:  # FIT seconds plus matching tolerance.
+            overlapping.update((i, j))
+    accepted = {indices[0] for i, (r, (kind, indices, _)) in enumerate(zip(targets, decisions))
+                if r.key != target.key and i not in overlapping
+                and kind == "matched" and owners[indices[0]] == 1}
+    return {**obj, "dateWeightList": [row for i, row in enumerate(index.rows) if i not in accepted]}
+
+
+class ReviewedReplacementAPI:
+    """Revalidate reviewed neighbours on every replacement read, including POST preflight."""
+
+    def __init__(self, api: Any, target: Measurement, targets: list[Measurement]):
+        self.api, self.target, self.targets = api, target, targets
+
+    def __getattr__(self, name):
+        return getattr(self.api, name)
+
+    def get_body_composition(self, start: str, end: str):
+        return reviewed_replacement_snapshot(self.api.get_body_composition(start, end),
+                                             self.target, self.targets)
+
+
+def replacement_preflight(obj: Any, original: dict[str, Any], replacement: Measurement,
+                          records: list[Measurement], saved: dict[str, Any]) -> list[Measurement]:
+    reviewed = {entry["id"]: entry["measurement"] for entry in saved["entries"]}
+    # Changed or newly exported sources can make an otherwise reviewed neighbour
+    # ambiguous; include every current source when checking distinguishability.
+    overlapping = set()
+    ordered = sorted((r.at.timestamp(), r.key) for r in records)
+    for (stamp, key), (next_stamp, next_key) in zip(ordered, ordered[1:]):
+        if next_stamp - stamp <= 2:
+            overlapping.update((key, next_key))
+    targets = [replacement, *(r for r in records if r.key != replacement.key
+                             and r.key not in overlapping and reviewed.get(r.key) == r.payload())]
+    remaining = {**obj, "dateWeightList": [row for row in RemoteIndex(obj).rows if row != original]}
+    scoped = reviewed_replacement_snapshot(remaining, replacement, targets)
+    if classify_remote(replacement, scoped) != "absent":
+        raise SafeError("删除后目标测量附近仍有未能唯一匹配已审阅 Apple 数据的记录，未删除；请重新对账。")
+    return targets
+
+
 def reviewed_operation(args: argparse.Namespace, cfg: dict[str, Any], delete_extra: bool = False) -> None:
     """Apply only the selected, unchanged item in a previously saved comparison."""
     path = Path(args.plan).expanduser()
@@ -803,6 +854,8 @@ def reviewed_operation(args: argparse.Namespace, cfg: dict[str, Any], delete_ext
         if not pk.isdigit() or int(pk) <= 0 or not isinstance(calendar, str):
             raise SafeError("缺少明确的 Garmin 记录 ID 或 calendarDate，不能删除。")
         date.fromisoformat(calendar)
+        if measurement:
+            replacement_preflight(obj, remote_row, replacement, records, saved)
         operation_dir = STATE / "operations"
         for existing in operation_dir.glob("*.json"):
             history = json.loads(existing.read_text())
@@ -834,6 +887,8 @@ def reviewed_operation(args: argparse.Namespace, cfg: dict[str, Any], delete_ext
                          and candidates[0]["remote"] == [remote_row])
         if not unchanged:
             raise SafeError("确认期间目标数据已变化，未删除；请重新对账。")
+        if measurement:
+            reviewed_targets = replacement_preflight(obj, remote_row, replacement, latest_records, saved)
         fresh = latest
         stamp = now().strftime("%Y%m%dT%H%M%S%fZ")
         backup = STATE / "backups" / stamp
@@ -865,7 +920,8 @@ def reviewed_operation(args: argparse.Namespace, cfg: dict[str, Any], delete_ext
                 set_status(db, replacement, "pending", "Original removal confirmed; reviewed replacement permitted")
                 journal["phase"] = "uploading"
                 write_json(journal_path, journal)
-                result = process_record(api, db, replacement, reviewed=True)
+                scoped_api = ReviewedReplacementAPI(api, replacement, reviewed_targets)
+                result = process_record(scoped_api, db, replacement, reviewed=True)
                 journal["phase"] = "verified" if result == "verified" else "uncertain"
                 write_json(journal_path, journal)
                 if result != "verified":
