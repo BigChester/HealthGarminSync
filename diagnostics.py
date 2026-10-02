@@ -167,15 +167,23 @@ def collect():
         elif not os.access(h.STATE, os.R_OK | os.W_OK | os.X_OK):
             add('state', 'error', '当前进程无法读写 state。', '检查本地目录权限。')
         else:
-            list(h.STATE.iterdir())
+            children = list(h.STATE.iterdir())
             state_available = True
             invalid_file = None
-            for name in ('run.lock', 'agent-log.lock', 'sync.log', 'last_attempt.json.tmp',
-                         'last_agent_attempt.json.tmp', 'last_run.json.tmp'):
+            runtime_names = ('run.lock', 'agent-log.lock', 'sync.log', 'last_attempt.json.tmp',
+                             'last_agent_attempt.json.tmp', 'last_run.json.tmp')
+            log_names = ['agent.out.log', 'agent.err.log']
+            readwrite_logs = {base + suffix for base in log_names for suffix in ('', '.1', '.2', '.3')}
+            log_names.extend(child.name for child in children
+                             if re.fullmatch(r'agent\.(?:out|err)\.log\.[0-9]+', child.name))
+            for name in (*runtime_names, *log_names):
                 path = h.STATE / name
                 try:
                     mode = path.lstat().st_mode
-                    if not stat.S_ISREG(mode) or not os.access(path, os.W_OK):
+                    access = os.W_OK if name in runtime_names else 0
+                    if name in readwrite_logs:
+                        access = os.R_OK | os.W_OK
+                    if not stat.S_ISREG(mode) or (access and not os.access(path, access)):
                         invalid_file = name
                         break
                 except FileNotFoundError:
@@ -184,7 +192,7 @@ def collect():
                     invalid_file = name
                     break
             if invalid_file:
-                add('state', 'error', '本地运行文件无效或当前进程无法写入。',
+                add('state', 'error', '本地运行文件无效或当前进程缺少所需权限。',
                     f'检查 state/{invalid_file} 的文件类型和权限。')
             else:
                 add('state', 'info', '当前进程可访问 state。')

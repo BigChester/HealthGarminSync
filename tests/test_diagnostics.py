@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import plistlib
+import re
 import stat
 import subprocess
 import sys
@@ -22,6 +23,19 @@ import health_garmin as h
 
 
 SECRET = 'private-ticket-never-output'
+
+
+def without_evidence_times(output):
+    def replace(match):
+        try:
+            h.aware(match.group(2))
+        except h.SafeError:
+            return match.group(0)
+        return match.group(1) + '<evidence time>"'
+
+    return re.sub(r'("(?:run_at|started_at|finished_at)"\s*:\s*")'
+                  r'(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2}))"',
+                  replace, output)
 
 
 class DoctorTests(unittest.TestCase):
@@ -102,12 +116,16 @@ class DoctorTests(unittest.TestCase):
         def read_without_tokens(path, *args, **kwargs):
             if self.tokens in path.parents:
                 raise AssertionError('token content read')
+            if path.parent == self.state and re.fullmatch(r'agent\.(?:out|err)\.log(?:\.[0-9]+)?', path.name):
+                raise AssertionError('background log content read')
             return original_read(path, *args, **kwargs)
 
         def open_readonly_without_tokens(path, mode, *args, **kwargs):
             path = Path(path)
             if mode not in ('r', 'rb') or path == self.tokens or self.tokens in path.parents:
                 raise AssertionError('unsafe local file access')
+            if path.parent == self.state and re.fullmatch(r'agent\.(?:out|err)\.log(?:\.[0-9]+)?', path.name):
+                raise AssertionError('background log content read')
             return original_open(path, mode, *args, **kwargs)
 
         with contextlib.ExitStack() as stack:
@@ -133,8 +151,9 @@ class DoctorTests(unittest.TestCase):
         self.assertEqual(self.snapshot(), before)
         self.assertEqual(stderr.getvalue(), '')
         self.assertNotIn(SECRET, stdout.getvalue())
-        self.assertNotIn('73.123', stdout.getvalue())
-        self.assertNotIn('26.789', stdout.getvalue())
+        visible = without_evidence_times(stdout.getvalue())
+        self.assertNotIn('73.123', visible)
+        self.assertNotIn('26.789', visible)
         return result, stdout.getvalue()
 
     def report(self):
@@ -257,6 +276,102 @@ finally:
         finally:
             os.close(peer)
 
+    def test_invalid_background_logs_are_diagnosed_before_entry_and_recover(self):
+        script = '''import contextlib, io, os, pathlib, socket, sys
+from unittest.mock import patch
+sys.path[:0] = [sys.argv[1], str(pathlib.Path(sys.argv[1]) / 'tests')]
+from test_diagnostics import DoctorTests, SECRET
+import health_garmin as h
+import agent_runner as runner
+fixture = DoctorTests()
+fixture.setUp()
+def forbidden(*args, **kwargs):
+    raise AssertionError('unexpected network/API/service request')
+h.api_client = h.manage_agent = forbidden
+socket.create_connection = socket.socket.connect = forbidden
+try:
+    name, kind = sys.argv[2:]
+    path = fixture.state / name
+    target = fixture.root / SECRET
+    target.write_text(SECRET)
+    source, tokens = fixture.export.read_bytes(), (fixture.tokens / 'oauth.json').read_bytes()
+    if kind == 'directory':
+        path.mkdir()
+    elif kind == 'fifo':
+        os.mkfifo(path, 0o600)
+    else:
+        path.symlink_to(target)
+    code, _, checks = fixture.report()
+    fixture.assertEqual(code, 2)
+    fixture.assertEqual(checks['state']['status'], 'error')
+    fixture.assertIn('state/' + name, checks['state']['hint'])
+    fixture.assertEqual(checks['last_run']['status'], 'info')
+    fixture.assertEqual(checks['last_agent_attempt']['status'], 'info')
+    fixture.assertEqual(fixture.invoke('doctor')[0], 2)
+    errors = io.StringIO()
+    with patch.object(h, 'main', return_value=0) as business, contextlib.redirect_stderr(errors):
+        fixture.assertEqual(runner.entrypoint(), 2)
+        business.assert_not_called()
+        path.rmdir() if kind == 'directory' else path.unlink()
+        fixture.assertEqual(runner.entrypoint(), 0)
+        business.assert_called_once()
+    fixture.assertNotIn(SECRET, errors.getvalue())
+    fixture.assertEqual(fixture.report()[0], 0)
+    fixture.assertEqual(fixture.invoke('doctor')[0], 0)
+    fixture.assertEqual(target.read_text(), SECRET)
+    fixture.assertEqual(fixture.export.read_bytes(), source)
+    fixture.assertEqual((fixture.tokens / 'oauth.json').read_bytes(), tokens)
+finally:
+    fixture.doCleanups()
+'''
+        for name, kind in (('agent.out.log', 'directory'), ('agent.err.log', 'fifo'),
+                           ('agent.out.log.1', 'symlink'), ('agent.err.log.3', 'directory'),
+                           ('agent.out.log.4', 'fifo')):
+            with self.subTest(path=name), tempfile.TemporaryDirectory() as isolated:
+                child = subprocess.Popen([sys.executable, '-B', '-c', script,
+                    str(Path(__file__).resolve().parents[1]), name, kind], cwd=isolated,
+                    env={'HOME': isolated, 'TMPDIR': isolated}, stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE, text=True)
+                try:
+                    try:
+                        stdout, stderr = child.communicate(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        child.kill()
+                        child.communicate(timeout=2)
+                        self.fail('background log path blocked the command')
+                    self.assertEqual(child.returncode, 0, stdout + stderr)
+                finally:
+                    if child.poll() is None:
+                        child.kill()
+                    child.communicate(timeout=2)
+                    for pipe in (child.stdout, child.stderr):
+                        pipe.close()
+
+    def test_background_log_metadata_checks_preserve_regular_logs_and_ignore_unrelated_names(self):
+        for name in ('agent.out.log', 'agent.err.log.1', 'agent.out.log.3'):
+            (self.state / name).write_bytes((SECRET + '\n').encode() * 100_000)
+        for name in ('agent.out.log.4', 'agent.err.log.01'):
+            path = self.state / name
+            path.touch()
+            path.chmod(0o400)
+        for name in ('agent.out.log.1x', 'agent.err.log.-1'):
+            (self.state / name).mkdir()
+        self.assertEqual(self.report()[0], 0)
+        self.assertEqual(self.invoke('doctor')[0], 0)
+        native_access = os.access
+
+        def denied_readwrite(path, mode, *args, **kwargs):
+            if Path(path) == self.state / 'agent.err.log.1' and mode == os.R_OK | os.W_OK:
+                return False
+            return native_access(path, mode, *args, **kwargs)
+
+        with patch.object(os, 'access', denied_readwrite):
+            code, _, checks = self.report()
+            self.assertEqual(self.invoke('doctor')[0], 2)
+        self.assertEqual(code, 2)
+        self.assertIn('state/agent.err.log.1', checks['state']['hint'])
+        self.assertEqual(checks['last_run']['status'], 'info')
+
     def test_nonregular_evidence_temporary_files_do_not_hide_healthy_completed_evidence(self):
         for name in ('last_attempt.json.tmp', 'last_agent_attempt.json.tmp', 'last_run.json.tmp'):
             path = self.state / name
@@ -292,11 +407,32 @@ finally:
                                              capture_output=True, timeout=5)
 
     def test_plain_output_is_readable_and_contains_current_process_scope(self):
+        stamp = h.now().replace(second=26, microsecond=789919).isoformat()
+        last = json.loads(self.last.read_text())
+        last['run_at'] = stamp
+        self.last.write_text(json.dumps(last))
+        attempt = json.loads(self.agent_attempt.read_text())
+        attempt.update(started_at=stamp, finished_at=stamp)
+        self.agent_attempt.write_text(json.dumps(attempt))
+        attempt['stage'] = 'sync'
+        (self.state / 'last_attempt.json').write_text(json.dumps(attempt))
         result, output = self.invoke('doctor')
         self.assertEqual(result, 0)
         self.assertIn('离线诊断', output)
         self.assertIn('当前进程可读取导出', output)
         self.assertIn('后台执行', output)
+        self.assertIn(stamp, output)
+        self.assertEqual(self.invoke('doctor', '--json')[0], 0)
+        for arguments in (('doctor',), ('doctor', '--json')):
+            for payload in ('{"body_fat": 26.789}', '{"weight": "73.123 kg"}',
+                            '{"run_at": "26.789"}', '{"note": "2026-10-01T23:57:26.789919+00:00"}'):
+                with self.subTest(arguments=arguments, payload=payload):
+                    def emit(json_output=False):
+                        print(payload)
+                        return 0
+
+                    with patch.object(d, 'doctor', side_effect=emit), self.assertRaises(AssertionError):
+                        self.invoke(*arguments)
 
     def test_disabled_uninstalled_with_missing_optional_state_is_warning(self):
         self.cfg['enabled'] = False
