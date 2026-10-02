@@ -8,7 +8,7 @@ import os
 from pathlib import Path
 import sys
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import health_garmin as h
 import replace_history as bulk
@@ -261,6 +261,49 @@ class OperationDiagnosticTests(unittest.TestCase):
         self.assert_diagnosis(path, 'deleted_verified', failed=False)
         self.assertFalse(api.posts)
         self.assertFalse(api.deletes)
+
+    def test_deletion_identity_uncertainty_survives_cli_and_doctor_until_known_absence(self):
+        path = self.journal(phase='uncertain', deletion=True)
+        original = json.loads(path.read_text())['original']
+        raw = Mock()
+        api = h.GarminMeasurementAPI(raw)
+        day = original['calendarDate']
+
+        def rows(items):
+            raw.get_weigh_ins.return_value = {'dailyWeightSummaries': [{
+                'summaryDate': day, 'numOfWeightEntries': len(items), 'allWeightMetrics': items}]}
+
+        source, token = self.export.read_bytes(), (self.tokens / 'oauth.json').read_bytes()
+        for invalid in (None, '', 0, -1, True, 100.0, 'invalid'):
+            with self.subTest(samplePk=invalid):
+                rows([dict(original, samplePk=invalid)])
+                code, output, errors = self.invoke_cli(path, api)
+                self.assertEqual(code, 2)
+                self.assertNotIn('原记录已不存在', output)
+                self.assertNotIn('invalid', errors)
+                self.assert_diagnosis(path, 'uncertain', failed=True)
+        anonymous = dict(original)
+        anonymous.pop('samplePk')
+        rows([anonymous])
+        self.assertEqual(self.invoke_cli(path, api)[0], 2)
+        self.assert_diagnosis(path, 'uncertain', failed=True)
+        rows([anonymous, dict(original, samplePk='00100')])
+        code, output, _ = self.invoke_cli(path, api)
+        self.assertEqual(code, 2)
+        self.assertIn('原记录仍存在', output)
+        self.assert_diagnosis(path, 'uncertain', failed=True)
+        rows([dict(original, samplePk=200)])
+        self.assertEqual(self.invoke_cli(path, api)[0], 0)
+        self.assert_diagnosis(path, 'deleted_verified', failed=False)
+        self.assertFalse(h.original_id_absent([original], '00100'))
+        self.assertTrue(h.original_id_absent([], '00100'))
+        with self.assertRaises(h.SafeError):
+            h.original_id_absent([], True)
+        raw.delete_weigh_in.assert_not_called()
+        raw.add_weigh_in.assert_not_called()
+        raw.add_body_composition.assert_not_called()
+        self.assertEqual(self.export.read_bytes(), source)
+        self.assertEqual((self.tokens / 'oauth.json').read_bytes(), token)
 
     def test_completed_repair_missing_or_conflicting_target_reaches_offline_doctor(self):
         for rows in ([], [dict(row(self.r), weight=71000)]):

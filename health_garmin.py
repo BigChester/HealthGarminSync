@@ -665,6 +665,34 @@ def remote_time(row: dict[str, Any]) -> datetime | None:
     return None
 
 
+def original_id_absent(rows: list[dict[str, Any]], original_pk: Any) -> bool:
+    """Confirm absence only when every returned row has a usable record ID."""
+    def identifier(value):
+        if isinstance(value, bool) or not isinstance(value, (int, str)):
+            return None
+        text = str(value)
+        if not text.isdigit():
+            return None
+        try:
+            number = int(text)
+        except ValueError:
+            return None
+        return number if number > 0 else None
+
+    target = identifier(original_pk)
+    if target is None:
+        raise SafeError("原记录 ID 无法可靠解析，不能确认删除。")
+    unidentified = False
+    for row in rows:
+        candidate = identifier(row.get("samplePk"))
+        if candidate == target:
+            return False
+        unidentified |= candidate is None
+    if unidentified:
+        raise SafeError("Garmin 明细包含无法识别的记录 ID，不能确认原记录已不存在。")
+    return True
+
+
 def classify_remote(r: Measurement, obj: Any) -> str:
     try:
         kind, _, _ = RemoteIndex(obj).decide(r)
@@ -1057,7 +1085,7 @@ def reviewed_operation(args: argparse.Namespace, cfg: dict[str, Any], delete_ext
         try:
             api.delete_weigh_in(pk, calendar)
             remaining = fetch_remote_snapshot(api, start, end)
-            if any(str(row.get("samplePk")) == pk for row in remaining["dateWeightList"]):
+            if not original_id_absent(remaining["dateWeightList"], pk):
                 raise SafeError("删除请求后原记录仍可见，暂停后续操作。")
             journal["phase"] = "deleted_verified" if delete_extra else "deleted"
             write_json(journal_path, journal)
@@ -1122,7 +1150,7 @@ def verify_operation(args: argparse.Namespace) -> bool:
             matched = classification == "matched"
             result = {"matched": "匹配", "absent": "目标缺失", "conflict": "目标冲突"}[classification]
         else:
-            matched = not any(str(row.get("samplePk")) == original_pk for row in obj["dateWeightList"])
+            matched = original_id_absent(obj["dateWeightList"], original_pk)
             result = "原记录已不存在" if matched else "原记录仍存在"
     except Exception:
         record_failed_check(path, journal)

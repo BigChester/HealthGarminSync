@@ -975,6 +975,77 @@ class ReconciliationTests(unittest.TestCase):
         self.assertFalse(api.posts)
         self.assertFalse(api.deletes)
 
+    def test_delete_extra_stays_uncertain_when_post_delete_original_has_no_id(self):
+        extra = h.Measurement(AT + timedelta(hours=1), 71, 24, 'PICOOC')
+        original = row(extra, 100)
+
+        class AnonymousReadback(API):
+            def delete_weigh_in(api, pk, day):
+                super().delete_weigh_in(pk, day)
+                api.rows.append(dict(original, samplePk=None))
+
+        api = AnonymousReadback([row(self.r, 101), original])
+        plan = self.plan(api.rows, save=True)
+        source = (self.inbox / 'health.json').read_bytes()
+        tokens = self.state / 'tokens' / 'synthetic'
+        h.private_dir(tokens.parent); tokens.write_bytes(b'synthetic token')
+        with self.assertRaisesRegex(h.SafeError, '操作结果未确定'):
+            self.reviewed(api, plan, delete_extra=True)
+        journal = next((self.state / 'operations').glob('*.json'))
+        self.assertEqual(json.loads(journal.read_text())['phase'], 'uncertain')
+        self.assertEqual(len(api.deletes), 1)
+        self.assertFalse(api.posts)
+        self.assertIsNone(h.state_row(self.db, self.r))
+        args = argparse.Namespace(operation=str(journal))
+        with patch.object(h, 'api_client', return_value=api), contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(h.SafeError):
+                h.verify_operation(args)
+            self.assertIs(json.loads(journal.read_text())['last_check_passed'], False)
+            api.rows = [row(self.r, 101), dict(original, samplePk='00100')]
+            self.assertIs(h.verify_operation(args), False)
+            api.rows = [row(self.r, 101)]
+            self.assertIs(h.verify_operation(args), True)
+        self.assertEqual(json.loads(journal.read_text())['phase'], 'deleted_verified')
+        self.assertEqual(len(api.deletes), 1)
+        self.assertFalse(api.posts)
+        self.assertEqual((self.inbox / 'health.json').read_bytes(), source)
+        self.assertEqual(tokens.read_bytes(), b'synthetic token')
+
+    def test_repair_does_not_post_after_delete_readback_loses_original_id(self):
+        original = dict(row(self.r), bodyFat=None)
+        anonymous = dict(original)
+        anonymous.pop('samplePk')
+
+        class AnonymousReadback(API):
+            def delete_weigh_in(api, pk, day):
+                super().delete_weigh_in(pk, day)
+                api.rows.append(anonymous)
+
+        api = AnonymousReadback([original])
+        plan = self.plan(api.rows, save=True)
+        source = (self.inbox / 'health.json').read_bytes()
+        tokens = self.state / 'tokens' / 'synthetic'
+        h.private_dir(tokens.parent); tokens.write_bytes(b'synthetic token')
+        with self.assertRaisesRegex(h.SafeError, '操作结果未确定'):
+            self.reviewed(api, plan)
+        journal = next((self.state / 'operations').glob('*.json'))
+        self.assertEqual(json.loads(journal.read_text())['phase'], 'uncertain')
+        self.assertEqual(h.get_status(self.db, self.r), 'repair_uncertain')
+        self.assertEqual(len(api.deletes), 1)
+        self.assertFalse(api.posts)
+        args = argparse.Namespace(operation=str(journal))
+        with patch.object(h, 'api_client', return_value=api), contextlib.redirect_stdout(io.StringIO()):
+            self.assertIs(h.verify_operation(args), False)
+            self.assertEqual(h.get_status(self.db, self.r), 'repair_uncertain')
+            api.rows = [row(self.r, 201)]
+            self.assertIs(h.verify_operation(args), True)
+        self.assertEqual(h.get_status(self.db, self.r), 'verified')
+        self.assertEqual(json.loads(journal.read_text())['phase'], 'verified')
+        self.assertEqual(len(api.deletes), 1)
+        self.assertFalse(api.posts)
+        self.assertEqual((self.inbox / 'health.json').read_bytes(), source)
+        self.assertEqual(tokens.read_bytes(), b'synthetic token')
+
     def test_cancelled_repair_does_not_modify_remote(self):
         original = dict(row(self.r), bodyFat=None)
         path = self.plan([original], save=True); api = API([original])
