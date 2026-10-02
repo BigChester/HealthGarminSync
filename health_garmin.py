@@ -685,19 +685,30 @@ def canonical_remote_id(value: Any) -> int | None:
     return number if number > 0 else None
 
 
-def original_id_absent(rows: list[dict[str, Any]], original_pk: Any) -> bool:
-    """Confirm absence only when every returned row has a usable record ID."""
-    target = canonical_remote_id(original_pk)
-    if target is None:
-        raise SafeError("原记录 ID 无法可靠解析，不能确认删除。")
+def original_id_absent(rows: list[dict[str, Any]], original_pk: Any, *, calendar: str) -> bool:
+    """Confirm absence of the date + ID addressed by the SDK's DELETE endpoint."""
+    def record_day(value):
+        if not isinstance(value, str):
+            return None
+        value = value.strip()  # The pinned SDK strips before validating YYYY-MM-DD.
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+            return None
+        try:
+            return date.fromisoformat(value)
+        except ValueError:
+            return None
+
+    target, original_day = canonical_remote_id(original_pk), record_day(calendar)
+    if target is None or original_day is None:
+        raise SafeError("原记录 ID 或日期无法可靠解析，不能确认删除。")
     unidentified = False
     for row in rows:
-        candidate = canonical_remote_id(row.get("samplePk"))
-        if candidate == target:
+        candidate, day = canonical_remote_id(row.get("samplePk")), record_day(row.get("calendarDate"))
+        if candidate == target and day == original_day:
             return False
-        unidentified |= candidate is None
+        unidentified |= candidate is None or day is None
     if unidentified:
-        raise SafeError("Garmin 明细包含无法识别的记录 ID，不能确认原记录已不存在。")
+        raise SafeError("Garmin 明细包含无法识别的记录 ID 或日期，不能确认原记录已不存在。")
     return True
 
 
@@ -1126,7 +1137,7 @@ def reviewed_operation(args: argparse.Namespace, cfg: dict[str, Any], delete_ext
         try:
             api.delete_weigh_in(pk, calendar)
             remaining = fetch_remote_snapshot(api, start, end)
-            if not original_id_absent(remaining["dateWeightList"], pk):
+            if not original_id_absent(remaining["dateWeightList"], pk, calendar=calendar):
                 raise SafeError("删除请求后原记录仍可见，暂停后续操作。")
             journal["phase"] = "deleted_verified" if delete_extra else "deleted"
             write_json(journal_path, journal)
@@ -1191,7 +1202,8 @@ def verify_operation(args: argparse.Namespace) -> bool:
             matched = classification == "matched"
             result = {"matched": "匹配", "absent": "目标缺失", "conflict": "目标冲突"}[classification]
         else:
-            matched = original_id_absent(obj["dateWeightList"], original_pk)
+            matched = original_id_absent(obj["dateWeightList"], original_pk,
+                                         calendar=journal["original"]["calendarDate"])
             result = "原记录已不存在" if matched else "原记录仍存在"
     except Exception:
         record_failed_check(path, journal)
@@ -1226,7 +1238,8 @@ class ResumedReplacementAPI:
         kind = classify_remote(self.target, obj)
         if kind == "matched":
             return obj  # Read-only completion does not require source access.
-        if not original_id_absent(RemoteIndex(obj).rows, str(self.journal["original"]["samplePk"])):
+        if not original_id_absent(RemoteIndex(obj).rows, self.journal["original"]["samplePk"],
+                                  calendar=self.journal["original"]["calendarDate"]):
             raise SafeError("原 Garmin 记录仍存在，停止；不会重复删除。")
         if kind == "absent" and not self.context_needed:
             return obj
@@ -1270,7 +1283,8 @@ def resume_operation(args: argparse.Namespace) -> None:
         write_json(path, journal)
         print("远端已匹配，无需继续上传。")
         return
-    if not original_id_absent(RemoteIndex(obj).rows, original_pk):
+    if not original_id_absent(RemoteIndex(obj).rows, original_pk,
+                              calendar=journal["original"]["calendarDate"]):
         raise SafeError("原 Garmin 记录仍存在，停止；不会重复删除。")
     if classify_remote(r, obj) != "absent":
         raise SafeError("远端存在冲突，需重新核对；不恢复上传。")
@@ -1280,7 +1294,9 @@ def resume_operation(args: argparse.Namespace) -> None:
         return
     obj = remote_for(api, r)
     if classify_remote(r, obj) != "matched":
-        if not original_id_absent(RemoteIndex(obj).rows, original_pk) or classify_remote(r, obj) != "absent":
+        if (not original_id_absent(RemoteIndex(obj).rows, original_pk,
+                                   calendar=journal["original"]["calendarDate"])
+                or classify_remote(r, obj) != "absent"):
             raise SafeError("确认期间远端记录发生变化，不恢复上传。")
     journal["phase"] = "uploading"
     journal["resumed_at"] = now().isoformat()

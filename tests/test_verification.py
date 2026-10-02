@@ -22,6 +22,10 @@ class OperationVerificationTests(unittest.TestCase):
     setUp = fixtures.ReconciliationTests.setUp
     tearDown = fixtures.ReconciliationTests.tearDown
     write_export = fixtures.ReconciliationTests.write_export
+    detailed_api = fixtures.ReconciliationTests.detailed_api
+    native_deletion_api = fixtures.ReconciliationTests.native_deletion_api
+    deletion_plan = fixtures.ReconciliationTests.deletion_plan
+    reviewed = fixtures.ReconciliationTests.reviewed
 
     def journal(self, phase='verified', deletion=False, full=False):
         path = self.state / 'operations' / 'verification.json'
@@ -60,6 +64,89 @@ class OperationVerificationTests(unittest.TestCase):
         self.assertFalse(api.posts)
         self.assertFalse(api.deletes)
         return journal
+
+    def test_generated_deletion_ignores_same_id_on_padding_day_during_readback_and_verify(self):
+        extra = h.Measurement(self.r.at + timedelta(hours=1), 74, None, 'PICOOC')
+        following = row(h.Measurement(self.r.at + timedelta(days=1, hours=2), 75, None, 'PICOOC'), '00100')
+        backend = API([row(self.r, 300), row(extra, 100), following])
+        api = self.native_deletion_api(backend, fail_at=None)
+        source = (self.inbox / 'health.json').read_bytes()
+        token = self.state / 'tokens' / 'synthetic.json'
+        h.write_json(token, {'synthetic': 'private-cache'})
+        token_bytes = token.read_bytes()
+        plan = self.deletion_plan(api)
+        self.reviewed(api, plan, delete_extra=True)
+        journal = next((self.state / 'operations').glob('*.json'))
+        self.assertEqual(h.read_operation(journal)['phase'], 'deleted_verified')
+        backup = Path(h.read_operation(journal)['backup']) / 'remote.json'
+        backup_bytes = backup.read_bytes()
+        self.assertIs(self.check_single(journal, api)[0], True)
+        self.assertEqual(h.read_operation(journal)['last_check_passed'], True)
+        self.assertEqual(backend.deletes, [('100', extra.at.date().isoformat())])
+        self.assertFalse(backend.posts)
+        self.assertIn(following, backend.rows)
+        self.assertFalse(any(item['samplePk'] == 100 and item['calendarDate'] == extra.at.date().isoformat()
+                             for item in backend.rows))
+        self.assertEqual(backup.read_bytes(), backup_bytes)
+        self.assertEqual((self.inbox / 'health.json').read_bytes(), source)
+        self.assertEqual(token.read_bytes(), token_bytes)
+
+    def test_generated_repair_resumes_after_timeout_with_same_id_on_padding_day(self):
+        original = dict(row(self.r, 100), bodyFat=None)
+        following = row(h.Measurement(self.r.at + timedelta(days=1, hours=2), 75, None, 'PICOOC'), '00100')
+        backend = API([original, following])
+        api = self.native_deletion_api(backend, fail_at=1)
+        source = (self.inbox / 'health.json').read_bytes()
+        token = self.state / 'tokens' / 'synthetic.json'
+        h.write_json(token, {'synthetic': 'private-cache'})
+        token_bytes = token.read_bytes()
+        plan = self.deletion_plan(api)
+        with self.assertRaises(h.SafeError):
+            self.reviewed(api, plan)
+        journal = next((self.state / 'operations').glob('*.json'))
+        before = journal.read_bytes()
+        self.assertEqual(h.read_operation(journal)['phase'], 'uncertain')
+        self.assertEqual(h.get_status(self.db, self.r), 'repair_uncertain')
+        backup = Path(h.read_operation(journal)['backup']) / 'remote.json'
+        backup_bytes = backup.read_bytes()
+        args = argparse.Namespace(operation=str(journal))
+        with patch.object(h, 'api_client', return_value=api), contextlib.redirect_stdout(io.StringIO()):
+            with patch('builtins.input', side_effect=AssertionError('Original still present: no confirmation')):
+                with self.assertRaises(h.SafeError):
+                    h.resume_operation(args)
+            self.assertEqual(journal.read_bytes(), before)
+            self.assertEqual(h.get_status(self.db, self.r), 'repair_uncertain')
+            # The original DELETE completes after its response timed out; the other date is unchanged.
+            backend.rows.remove(original)
+            with patch('builtins.input', return_value='RESUME ' + self.r.key):
+                h.resume_operation(args)
+            with patch('builtins.input', side_effect=AssertionError('Matched resume must be read-only')):
+                h.resume_operation(args)
+        self.assertEqual(h.read_operation(journal)['phase'], 'verified')
+        self.assertEqual(h.get_status(self.db, self.r), 'verified')
+        self.assertEqual(backend.deletes, [('100', original['calendarDate'])])
+        self.assertEqual(len(backend.posts), 1)
+        self.assertIn(following, backend.rows)
+        self.assertEqual(backup.read_bytes(), backup_bytes)
+        self.assertEqual((self.inbox / 'health.json').read_bytes(), source)
+        self.assertEqual(token.read_bytes(), token_bytes)
+
+    def test_original_absence_requires_known_date_and_id_before_excluding_other_days(self):
+        original = row(self.r, '00100')
+        day = original['calendarDate']
+        following = dict(original, calendarDate=(self.r.at.date() + timedelta(days=1)).isoformat())
+        self.assertTrue(h.original_id_absent([following], 100, calendar=' ' + day + ' '))
+        self.assertFalse(h.original_id_absent([original], 100, calendar=day))
+        for invalid in (None, '', '20200220', '2020-02-30', '2020-W08-4', True):
+            with self.subTest(calendar=invalid):
+                unknown = dict(following, calendarDate=invalid)
+                with self.assertRaises(h.SafeError):
+                    h.original_id_absent([unknown], 100, calendar=day)
+                with self.assertRaises(h.SafeError):
+                    h.original_id_absent([], 100, calendar=invalid)
+                self.assertFalse(h.original_id_absent([unknown, original], 100, calendar=day))
+        with self.assertRaises(h.SafeError):
+            h.original_id_absent([dict(following, samplePk=None)], 100, calendar=day)
 
     def test_completed_repair_reports_missing_or_conflict_then_current_match(self):
         for rows, diagnosis in (([], '目标缺失'), ([dict(row(self.r), weight=71000)], '目标冲突')):
@@ -326,10 +413,10 @@ class OperationDiagnosticTests(unittest.TestCase):
         rows([dict(original, samplePk=200)])
         self.assertEqual(self.invoke_cli(path, api)[0], 0)
         self.assert_diagnosis(path, 'deleted_verified', failed=False)
-        self.assertFalse(h.original_id_absent([original], '00100'))
-        self.assertTrue(h.original_id_absent([], '00100'))
+        self.assertFalse(h.original_id_absent([original], '00100', calendar=day))
+        self.assertTrue(h.original_id_absent([], '00100', calendar=day))
         with self.assertRaises(h.SafeError):
-            h.original_id_absent([], True)
+            h.original_id_absent([], True, calendar=day)
         raw.delete_weigh_in.assert_not_called()
         raw.add_weigh_in.assert_not_called()
         raw.add_body_composition.assert_not_called()

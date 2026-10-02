@@ -253,7 +253,7 @@ def execute(args, cfg, api=None):
                     event('delete_intent', pk)
                     api.delete_weigh_in(pk, day.isoformat())
                     after = h.RemoteIndex(api.get_body_composition(day.isoformat(), day.isoformat())).rows
-                    if not h.original_id_absent(after, pk):
+                    if not h.original_id_absent(after, pk, calendar=day.isoformat()):
                         raise h.SafeError('删除后旧记录仍可见，暂停，不重复删除。')
                     event('delete_verified', pk)
                 for r in targets_by_day[day]:

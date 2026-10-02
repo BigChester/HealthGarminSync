@@ -194,6 +194,31 @@ class BulkReplacementTests(unittest.TestCase):
         self.assertEqual((self.inbox / 'health.json').read_bytes(), source)
         self.assertEqual(token.read_bytes(), token_bytes)
 
+    def test_native_batch_deletes_reused_id_only_on_each_original_calendar_day(self):
+        other = h.Measurement(self.r.at + timedelta(days=1), 71, 24, 'PICOOC')
+        records = [self.r, other]
+        self.write_export(records)
+        source = (self.inbox / 'health.json').read_bytes()
+        token = self.state / 'tokens' / 'synthetic.json'
+        h.write_json(token, {'synthetic': 'private-cache'})
+        token_bytes = token.read_bytes()
+        backend = API([dict(row(self.r, 100), bodyFat=None), dict(row(other, 100), bodyFat=None)])
+        api = self.native_deletion_api(backend, fail_at=None)
+        obj = h.fetch_remote_snapshot(api, self.r.at.date(), other.at.date())
+        path = h.save_comparison(h.comparison_plan(self.db, records, obj,
+            self.r.at.date(), other.at.date()), self.cfg)
+        self.invoke(api, path)
+        job = h.read_operation(next((self.state / 'operations').glob('full-*.json')))
+        self.assertEqual(job['phase'], 'verified')
+        self.assertEqual(backend.deletes, [('100', self.r.at.date().isoformat()),
+                                          ('100', other.at.date().isoformat())])
+        self.assertEqual(len(backend.posts), 2)
+        self.assertEqual([event['id'] for event in job['events'] if event['kind'] == 'delete_verified'],
+                         ['100', '100'])
+        self.assertEqual([h.get_status(self.db, record) for record in records], ['verified', 'verified'])
+        self.assertEqual((self.inbox / 'health.json').read_bytes(), source)
+        self.assertEqual(token.read_bytes(), token_bytes)
+
     def test_full_replacement_preserves_match_removes_near_conflict_and_extra(self):
         first = self.r
         second = h.Measurement(first.at + timedelta(hours=1), 71, 24, 'PICOOC', 23, 54)
