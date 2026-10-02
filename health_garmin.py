@@ -764,9 +764,10 @@ def fetch_remote_snapshot(api: Any, start: date, end: date) -> dict[str, Any]:
         obj = api.get_body_composition(cursor.isoformat(), stop.isoformat())
         index = RemoteIndex(obj)
         for row in index.rows:
-            identity = (str(row.get("samplePk")), str(row.get("calendarDate")))
             if row.get("samplePk") is None:
-                identity = (json.dumps(row, sort_keys=True, allow_nan=False), "")
+                rows.append(row)
+                continue
+            identity = (str(row["samplePk"]), str(row.get("calendarDate")))
             if identity in seen:
                 if seen[identity] != row:
                     raise SafeError("分批查询中的同一 Garmin 记录发生变化，请重新对账。")

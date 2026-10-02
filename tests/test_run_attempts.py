@@ -420,6 +420,59 @@ class RunAttemptTests(unittest.TestCase):
                     getattr(raw, name).assert_not_called()
                 self.assertEqual((self.export.read_bytes(), (self.tokens / 'oauth.json').read_bytes()), (source, tokens))
 
+    def test_multiple_anonymous_details_remain_ambiguous_across_runs_and_recover(self):
+        self.cfg['settle_seconds'] = 0
+        self.save_config()
+        record = h.load_measurements(self.cfg)[1][0]
+        known = row(record)
+        source, tokens = self.export.read_bytes(), (self.tokens / 'oauth.json').read_bytes()
+        for missing_key in (False, True):
+            for previous in ('pending', 'uncertain', 'inflight'):
+                with self.subTest(missing_key=missing_key, previous=previous):
+                    anonymous = dict(known)
+                    if missing_key:
+                        del anonymous['samplePk']
+                    else:
+                        anonymous['samplePk'] = None
+                    ambiguous = True
+
+                    def details(start, end):
+                        items = [dict(anonymous), dict(anonymous)] if ambiguous else [known]
+                        return {'dailyWeightSummaries': [{'summaryDate': record.at.date().isoformat(),
+                                 'numOfWeightEntries': len(items), 'allWeightMetrics': items}]}
+
+                    raw = Mock(spec_set=['get_weigh_ins', 'get_daily_weigh_ins', 'add_body_composition',
+                                         'add_weigh_in', 'delete_weigh_in'])
+                    raw.get_weigh_ins.side_effect = details
+                    for name in ('get_daily_weigh_ins', 'add_body_composition', 'add_weigh_in', 'delete_weigh_in'):
+                        getattr(raw, name).side_effect = AssertionError(SECRET)
+                    seal(raw)
+                    adapter = h.GarminMeasurementAPI(raw)
+                    with contextlib.closing(h.database()) as db:
+                        h.set_status(db, record, previous)
+                    expected = 'conflict' if previous == 'pending' else 'uncertain'
+                    for _ in range(2):
+                        with patch.object(h, 'api_client', return_value=adapter) as api:
+                            self.assertEqual(self.run_main()[0], 0)
+                        api.assert_called_once_with()
+                        with contextlib.closing(h.database()) as db:
+                            self.assertEqual(h.get_status(db, record), expected)
+                        summary = json.loads(self.last.read_text())
+                        self.assertEqual(summary['results'], {record.key: expected})
+                        self.assertEqual(summary['local_status_counts'], {expected: 1})
+                        code, report, _ = self.report()
+                        self.assertEqual(code, 0 if expected == 'conflict' else 2)
+                        self.assertEqual(report['status'], 'warning' if expected == 'conflict' else 'error')
+                    ambiguous = False
+                    with patch.object(h, 'api_client', return_value=adapter):
+                        self.assertEqual(self.run_main()[0], 0)
+                    with contextlib.closing(h.database()) as db:
+                        self.assertEqual(h.get_status(db, record), 'verified')
+                    self.assertEqual(self.report()[0], 0)
+                    for name in ('get_daily_weigh_ins', 'add_body_composition', 'add_weigh_in', 'delete_weigh_in'):
+                        getattr(raw, name).assert_not_called()
+                    self.assertEqual((self.export.read_bytes(), (self.tokens / 'oauth.json').read_bytes()), (source, tokens))
+
     def test_future_export_stops_before_api_and_recovers_after_corrected_metadata(self):
         current = h.now()
         previous = self.last.read_bytes()

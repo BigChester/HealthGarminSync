@@ -8,7 +8,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import health_garmin as h
 
@@ -642,6 +642,45 @@ class ReconciliationTests(unittest.TestCase):
         self.write_export([self.r, other]); api = API(); api.fail_chunk = 2
         with self.assertRaises(h.SafeError): self.sync(api)
         self.assertFalse(api.posts)
+
+    def test_snapshot_preserves_anonymous_multiplicity_and_only_deduplicates_known_ids(self):
+        known = row(self.r)
+        for missing_key in (False, True):
+            with self.subTest(missing_key=missing_key):
+                anonymous = dict(known)
+                if missing_key:
+                    del anonymous['samplePk']
+                else:
+                    anonymous['samplePk'] = None
+                api = Mock(spec_set=['get_body_composition'])
+                api.get_body_composition.return_value = {'dateWeightList': [anonymous, dict(anonymous), known]}
+                # Exercise the generic merge contract over two returned chunks;
+                # the validated SDK range endpoint uses disjoint calendar days.
+                snapshot = h.fetch_remote_snapshot(api, AT.date(), (AT + timedelta(days=45)).date())
+                self.assertEqual(api.get_body_composition.call_count, 2)
+                self.assertEqual(len(snapshot['dateWeightList']), 5)
+                self.assertEqual(sum(item.get('samplePk') is None for item in snapshot['dateWeightList']), 4)
+                self.assertEqual(snapshot['dateWeightList'].count(known), 1)
+                self.assertEqual(h.classify_remote(self.r, snapshot), 'conflict')
+
+    def test_snapshot_single_anonymous_matches_and_changed_known_identity_still_stops(self):
+        known = row(self.r)
+        for missing_key in (False, True):
+            with self.subTest(missing_key=missing_key):
+                anonymous = dict(known)
+                if missing_key:
+                    del anonymous['samplePk']
+                else:
+                    anonymous['samplePk'] = None
+                api = Mock(spec_set=['get_body_composition'])
+                api.get_body_composition.return_value = {'dateWeightList': [anonymous]}
+                snapshot = h.fetch_remote_snapshot(api, AT.date(), AT.date())
+                self.assertEqual(snapshot['dateWeightList'], [anonymous])
+                self.assertEqual(h.classify_remote(self.r, snapshot), 'matched')
+        api.get_body_composition.side_effect = [
+            {'dateWeightList': [known]}, {'dateWeightList': [dict(known, weight=71000)]}]
+        with self.assertRaises(h.SafeError):
+            h.fetch_remote_snapshot(api, AT.date(), (AT + timedelta(days=45)).date())
 
     def test_unknown_remote_timestamp_stops_entire_comparison(self):
         item = row(self.r); item['timestampGMT'] = 'unparseable'
