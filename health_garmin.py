@@ -665,26 +665,27 @@ def remote_time(row: dict[str, Any]) -> datetime | None:
     return None
 
 
+def canonical_remote_id(value: Any) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        return None
+    text = str(value)
+    if not text.isdigit():
+        return None
+    try:
+        number = int(text)
+    except ValueError:
+        return None
+    return number if number > 0 else None
+
+
 def original_id_absent(rows: list[dict[str, Any]], original_pk: Any) -> bool:
     """Confirm absence only when every returned row has a usable record ID."""
-    def identifier(value):
-        if isinstance(value, bool) or not isinstance(value, (int, str)):
-            return None
-        text = str(value)
-        if not text.isdigit():
-            return None
-        try:
-            number = int(text)
-        except ValueError:
-            return None
-        return number if number > 0 else None
-
-    target = identifier(original_pk)
+    target = canonical_remote_id(original_pk)
     if target is None:
         raise SafeError("原记录 ID 无法可靠解析，不能确认删除。")
     unidentified = False
     for row in rows:
-        candidate = identifier(row.get("samplePk"))
+        candidate = canonical_remote_id(row.get("samplePk"))
         if candidate == target:
             return False
         unidentified |= candidate is None
@@ -970,6 +971,29 @@ def replacement_preflight(obj: Any, original: dict[str, Any], replacement: Measu
     return targets
 
 
+def unfinished_operation_deletes(history: dict[str, Any], remote_row: dict[str, Any]) -> bool:
+    """Match an issued deletion by canonical ID and its original calendar date."""
+    pk = canonical_remote_id(remote_row.get("samplePk"))
+    if history.get("type") != "full_replacement":
+        original = history.get("original") or {}
+        return (canonical_remote_id(original.get("samplePk")) == pk
+                and original.get("calendarDate") == remote_row["calendarDate"])
+    sent = {canonical_remote_id(event.get("id")) for event in history.get("events", [])
+            if event.get("kind") == "delete_intent"}
+    if pk not in sent:
+        return False  # Unrelated batches do not require their backup to be readable.
+    try:
+        before = json.loads(read_regular_text(Path(history["backup"]) / "remote-before.json"))
+        originals = [row for row in RemoteIndex(before).rows
+                     if canonical_remote_id(row.get("samplePk")) == pk]
+        if len(originals) != 1:
+            raise SafeError("删除意图无法关联唯一原记录。")
+        calendar = date.fromisoformat(originals[0]["calendarDate"]).isoformat()
+    except (OSError, UnicodeError, json.JSONDecodeError, KeyError, TypeError, ValueError, SafeError) as exc:
+        raise SafeError("未完成批次的删除日期无法可靠核对，请先核对操作记录；不重复删除。") from exc
+    return calendar == remote_row["calendarDate"]
+
+
 def reviewed_operation(args: argparse.Namespace, cfg: dict[str, Any], delete_extra: bool = False) -> None:
     """Apply only the selected, unchanged item in a previously saved comparison."""
     path = Path(args.plan).expanduser()
@@ -1041,7 +1065,9 @@ def reviewed_operation(args: argparse.Namespace, cfg: dict[str, Any], delete_ext
         operation_dir = STATE / "operations"
         for existing in operation_dir.glob("*.json"):
             history = json.loads(read_regular_text(existing))
-            if history.get("key") == operation_key and history.get("phase") not in ("verified", "deleted_verified"):
+            if history.get("phase") in ("verified", "deleted_verified", "closed_partial"):
+                continue
+            if history.get("key") == operation_key or unfinished_operation_deletes(history, remote_row):
                 raise SafeError("此记录有未完成的修改，请先核对 state/operations 中的操作记录，不重复删除。")
         print("选定原记录：", json.dumps(remote_row, ensure_ascii=False))
         if measurement:

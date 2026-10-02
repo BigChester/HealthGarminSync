@@ -132,6 +132,70 @@ class ReconciliationTests(unittest.TestCase):
         seal(raw)
         return h.GarminMeasurementAPI(raw)
 
+    def native_deletion_api(self, backend, *, fail_at=1):
+        from importlib.metadata import PackageNotFoundError
+        try:
+            if h.version('garminconnect') != h.REQUIRED_GARMIN_VERSION:
+                self.skipTest('Requires the pinned Garmin SDK')
+        except PackageNotFoundError:
+            self.skipTest('Requires the pinned Garmin SDK')
+        import garminconnect
+        import requests
+        import socket
+        def forbidden(*args, **kwargs):
+            raise AssertionError('No real network/home/login/service')
+        for target, name in ((Path, 'home'), (garminconnect.Garmin, 'login'),
+                             (requests.Session, 'request'), (requests.Session, 'send'),
+                             (socket, 'create_connection'), (socket, 'getaddrinfo'),
+                             (socket.socket, 'connect'), (socket.socket, 'connect_ex')):
+            self.enterContext(patch.object(target, name, forbidden))
+        self.enterContext(patch('subprocess.run', forbidden))
+        try:
+            import curl_cffi
+        except ImportError:
+            pass
+        else:
+            self.enterContext(patch.object(curl_cffi.Curl, 'perform', forbidden))
+        sdk = garminconnect.Garmin(is_cn=True)
+        self.addCleanup(sdk.client.cs.close)
+        self.addCleanup(sdk.client._api_session.close)
+        sdk.client.cs.trust_env = sdk.client._api_session.trust_env = False
+        def request(method, domain, url, **kwargs):
+            self.assertEqual((method, domain), ('DELETE', 'connectapi'))
+            before, pk = url.rsplit('/byversion/', 1)
+            day = before.rsplit('/', 1)[1]
+            backend.deletes.append((pk, day))
+            if len(backend.deletes) == fail_at:
+                raise TimeoutError('synthetic unknown deletion')
+            backend.rows = [item for item in backend.rows
+                            if int(item['samplePk']) != int(pk) or item['calendarDate'] != day]
+            return {'ok': True}
+        sdk.client.request = Mock(side_effect=request)
+        api = self.detailed_api(backend)
+        api.api.delete_weigh_in.side_effect = sdk.delete_weigh_in
+        return api
+
+    def deletion_plan(self, api, records=None):
+        records = [self.r] if records is None else records
+        start, end = min(r.at.date() for r in records), max(r.at.date() for r in records)
+        obj = h.fetch_remote_snapshot(api, start, end)
+        return h.save_comparison(h.comparison_plan(self.db, records, obj, start, end), self.cfg)
+
+    def incomplete_deletion(self, api, *, full=False, remote_id='100'):
+        plan = self.deletion_plan(api)
+        with (patch.object(h, 'api_client', return_value=api), contextlib.redirect_stdout(io.StringIO()),
+              patch('builtins.input', return_value='REPLACE ALL' if full else 'DELETE ' + remote_id)):
+            with self.assertRaises(h.SafeError):
+                if full:
+                    import replace_history
+                    replace_history.execute(argparse.Namespace(plan=str(plan), complete_export=True), self.cfg, api)
+                else:
+                    h.reviewed_operation(argparse.Namespace(plan=str(plan), remote_id=remote_id,
+                                                            complete_export=True), self.cfg, True)
+        path = next((h.STATE / 'operations').glob('*.json'))
+        self.assertEqual(h.read_operation(path)['phase'], 'uncertain')
+        return path
+
     def paused_reviewed_neighbor(self, *, alternate=False, legacy=False):
         other = h.Measurement(AT + timedelta(seconds=30), 71, 24, 'PICOOC')
         source_inbox = self.inbox
@@ -965,6 +1029,119 @@ class ReconciliationTests(unittest.TestCase):
         self.assertNotIn('secret-ticket', json.dumps(journal))
         with self.assertRaises(h.SafeError): self.reviewed(api, path)
         self.assertEqual(len(api.deletes), 1)
+
+    def test_delete_extra_blocks_issued_full_deletes_and_single_canonical_aliases(self):
+        for mode in ('full', 'full_verified_delete', 'single_alias', 'unavailable_backup'):
+            with self.subTest(mode=mode), patch.object(h, 'STATE', self.state / mode):
+                h.private_dir(h.STATE)
+                self.write_export([self.r])
+                extra = row(h.Measurement(AT + timedelta(hours=1), 74, None, 'PICOOC'),
+                            '00100' if mode == 'single_alias' else 100)
+                untouched = row(h.Measurement(AT + timedelta(hours=2), 75, None, 'PICOOC'), 101)
+                backend = API([row(self.r, 300), extra, untouched] if mode == 'single_alias'
+                              else [extra, untouched])
+                api = self.native_deletion_api(backend, fail_at=2 if mode == 'full_verified_delete' else 1)
+                journal = self.incomplete_deletion(api, full=mode != 'single_alias',
+                                                   remote_id='00100' if mode == 'single_alias' else '100')
+                if mode == 'full_verified_delete':
+                    self.assertIn({'kind': 'delete_verified', 'id': '100'},
+                                  [{key: event[key] for key in ('kind', 'id')}
+                                   for event in h.read_operation(journal)['events']])
+                    backend.rows.append(extra)  # A completed DELETE can still be visible again.
+                elif mode == 'single_alias':
+                    backend.rows[1]['samplePk'] = 100
+                plan = self.deletion_plan(api)
+                original_journal, original_rows = journal.read_bytes(), copy.deepcopy(backend.rows)
+                source = (self.inbox / 'health.json').read_bytes()
+                token = h.STATE / 'tokens' / 'synthetic'
+                h.private_dir(token.parent)
+                token.write_bytes(b'synthetic private token')
+                deletes = list(backend.deletes)
+                journals = list((h.STATE / 'operations').glob('*.json'))
+                native_read = h.read_regular_text
+                def unavailable_backup(path, **kwargs):
+                    if mode == 'unavailable_backup' and path.name == 'remote-before.json':
+                        raise FileNotFoundError('private unavailable path')
+                    return native_read(path, **kwargs)
+                args = argparse.Namespace(plan=str(plan), remote_id='100', complete_export=True)
+                with (patch.object(h, 'api_client', return_value=api),
+                      patch.object(h, 'read_regular_text', side_effect=unavailable_backup),
+                      contextlib.redirect_stdout(io.StringIO()),
+                      patch('builtins.input', side_effect=AssertionError('Must stop before confirmation')) as prompt):
+                    with self.assertRaises(h.SafeError):
+                        h.reviewed_operation(args, self.cfg, True)
+                prompt.assert_not_called()
+                self.assertEqual(backend.deletes, deletes)
+                self.assertFalse(backend.posts)
+                self.assertEqual(backend.rows, original_rows)
+                self.assertEqual(journal.read_bytes(), original_journal)
+                self.assertEqual(list((h.STATE / 'operations').glob('*.json')), journals)
+                with contextlib.closing(h.database()) as db:
+                    self.assertIsNone(h.state_row(db, self.r))
+                self.assertEqual((self.inbox / 'health.json').read_bytes(), source)
+                self.assertEqual(token.read_bytes(), b'synthetic private token')
+
+    def test_deletion_guards_allow_unrelated_dates_ids_and_closed_partial_batch(self):
+        for mode in ('other_id', 'full_other_date', 'single_other_date', 'closed_partial'):
+            with self.subTest(mode=mode), patch.object(h, 'STATE', self.state / mode):
+                import replace_history
+                h.private_dir(h.STATE)
+                self.write_export([self.r])
+                extra = row(h.Measurement(AT + timedelta(hours=1), 74, None, 'PICOOC'),
+                            '00100' if mode == 'single_other_date' else 100)
+                second_extra = row(h.Measurement(AT + timedelta(hours=2), 75, None, 'PICOOC'), 101)
+                backend = API([row(self.r, 300), extra] if mode == 'single_other_date'
+                              else [extra] if mode == 'closed_partial' else [extra, second_extra])
+                api = self.native_deletion_api(backend, fail_at=None if mode == 'closed_partial' else 1)
+                if mode == 'closed_partial':
+                    native_get, after_delete_reads = backend.get_body_composition, 0
+                    def fail_before_upload(start, end):
+                        nonlocal after_delete_reads
+                        if backend.deletes:
+                            after_delete_reads += 1
+                            if after_delete_reads == 2:
+                                raise TimeoutError('synthetic pre-upload query failure')
+                        return native_get(start, end)
+                    backend.get_body_composition = fail_before_upload
+                journal = self.incomplete_deletion(api, full=mode != 'single_other_date',
+                                                   remote_id='00100' if mode == 'single_other_date' else '100')
+                records = [self.r]
+                if mode == 'closed_partial':
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        replace_history.close_verified_partial(journal, dict(self.cfg, enabled=False), api)
+                    self.assertEqual(h.read_operation(journal)['phase'], 'closed_partial')
+                    backend.rows.append(extra)
+                elif mode.endswith('other_date'):
+                    other = h.Measurement(AT + timedelta(days=1), 72, 25, 'PICOOC')
+                    records.append(other)
+                    self.write_export(records)
+                    backend.rows = [item for item in backend.rows if int(item['samplePk']) != 100]
+                    backend.rows.append(row(h.Measurement(other.at + timedelta(hours=1), 74, None, 'PICOOC'), 100))
+                original_journal = journal.read_bytes()
+                source = (self.inbox / 'health.json').read_bytes()
+                token = h.STATE / 'tokens' / 'synthetic'
+                h.private_dir(token.parent)
+                token.write_bytes(b'synthetic private token')
+                remote_id = '101' if mode == 'other_id' else '100'
+                plan = self.deletion_plan(api, records)
+                native_read = h.read_regular_text
+                def forbid_unrelated_backup(path, **kwargs):
+                    if mode in ('other_id', 'closed_partial') and path.name == 'remote-before.json':
+                        raise AssertionError('Unrelated or terminal backup must not be read')
+                    return native_read(path, **kwargs)
+                with (patch.object(h, 'api_client', return_value=api),
+                      patch.object(h, 'read_regular_text', side_effect=forbid_unrelated_backup),
+                      patch('builtins.input', return_value='DELETE ' + remote_id),
+                      contextlib.redirect_stdout(io.StringIO())):
+                    h.reviewed_operation(argparse.Namespace(plan=str(plan), remote_id=remote_id,
+                                                            complete_export=True), self.cfg, True)
+                self.assertEqual(len(backend.deletes), 2)
+                expected_day = records[-1].at.date().isoformat()
+                self.assertEqual(backend.deletes[-1], (remote_id, expected_day))
+                self.assertFalse(backend.posts)
+                self.assertEqual(journal.read_bytes(), original_journal)
+                self.assertEqual((self.inbox / 'health.json').read_bytes(), source)
+                self.assertEqual(token.read_bytes(), b'synthetic private token')
 
     def test_delete_extra_requires_complete_export_confirmation(self):
         extra = h.Measurement(AT+timedelta(hours=1), 71, None, 'PICOOC')
