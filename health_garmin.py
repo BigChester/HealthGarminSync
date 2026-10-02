@@ -472,11 +472,18 @@ def database() -> sqlite3.Connection:
 
 
 def set_status(db: sqlite3.Connection, r: Measurement, status: str, detail: str = "") -> None:
+    payload = r.payload()
+    if r.lbm is None:
+        previous = state_row(db, r)
+        if previous and previous["core"] == r.core:
+            retained = json.loads(previous["payload"])
+            if "lbm" in retained:
+                payload["lbm"] = retained["lbm"]
     db.execute("""INSERT INTO uploads VALUES(?,?,?,?,?,?)
         ON CONFLICT(record_id) DO UPDATE SET core=excluded.core,
         payload=excluded.payload,status=excluded.status,
         updated_at=excluded.updated_at,detail=excluded.detail""",
-        (r.key, r.core, json.dumps(r.payload(), ensure_ascii=False), status, now().isoformat(), detail))
+        (r.key, r.core, json.dumps(payload, ensure_ascii=False), status, now().isoformat(), detail))
     db.commit()  # In-flight marker is durable BEFORE submitting a network write.
 
 

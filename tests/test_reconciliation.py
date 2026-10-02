@@ -406,6 +406,73 @@ class ReconciliationTests(unittest.TestCase):
                 summary = json.loads((self.state / 'last_run.json').read_text())
                 self.assertEqual(summary['results'], {self.r.key: action})
 
+    def test_matched_sync_retains_missing_lbm_and_updates_explicit_values(self):
+        original = h.Measurement(AT, 70, 23.5, 'PICOOC', lbm=53.55)
+        cases = [('first', self.r, 53.55), ('recent', self.r, 53.55),
+                 ('manual', self.r, 53.55),
+                 ('new_lbm', h.Measurement(AT, 70, 23.5, 'PICOOC', lbm=54), 54),
+                 ('weight_changed', h.Measurement(AT, 40, 23.5, 'PICOOC'), None),
+                 ('fat_changed', h.Measurement(AT, 70, 24, 'PICOOC'), None)]
+        for mode, current, expected in cases:
+            with (self.subTest(mode=mode), patch.object(h, 'STATE', self.state / mode),
+                  patch.object(h, 'now', return_value=AT + timedelta(days=7))):
+                h.private_dir(h.STATE)
+                with contextlib.closing(h.database()) as db:
+                    h.set_status(db, original, 'verified', 'previous decision')
+                    self.write_export([current])
+                    source = (self.inbox / 'health.json').read_bytes()
+                    token = h.STATE / 'tokens' / 'synthetic'
+                    h.private_dir(token.parent)
+                    token.write_bytes(b'synthetic private token')
+                    if mode in ('recent', 'manual'):
+                        h.write_json(h.STATE / 'last_sync_comparison.json', {})
+                    backend = API([row(current)])
+                    api = self.detailed_api(backend)
+                    with (patch.object(h, 'api_client', return_value=api),
+                          patch('builtins.input', return_value='UPLOAD'),
+                          contextlib.redirect_stdout(io.StringIO())):
+                        h.run_sync(self.cfg, current.key if mode == 'manual' else None)
+                    stored = dict(h.state_row(db, current))
+                    payload = current.payload()
+                    if expected is not None:
+                        payload['lbm'] = expected
+                    self.assertEqual(json.loads(stored['payload']), payload)
+                    self.assertEqual(stored['core'], current.core)
+                    self.assertEqual(stored['status'], 'verified')
+                    self.assertTrue(backend.reads)
+                    self.assertFalse(backend.posts)
+                    self.assertFalse(backend.deletes)
+                    self.assertEqual((self.inbox / 'health.json').read_bytes(), source)
+                    self.assertEqual(token.read_bytes(), b'synthetic private token')
+                    self.assertEqual(current.lbm, 54 if mode == 'new_lbm' else None)
+
+    def test_missing_lbm_survives_durable_upload_and_delayed_verification(self):
+        original = h.Measurement(AT, 70, 23.5, 'PICOOC', lbm=53.55)
+        h.set_status(self.db, original, 'pending')
+        backend = API()
+        backend.visible = False
+        post = backend.add_body_composition
+
+        def observe_post(**kwargs):
+            with contextlib.closing(h.sqlite3.connect(self.state / 'sync.sqlite3')) as reader:
+                payload, status = reader.execute('SELECT payload,status FROM uploads WHERE record_id=?',
+                                                (self.r.key,)).fetchone()
+            self.assertEqual(status, 'inflight')
+            self.assertEqual(json.loads(payload)['lbm'], 53.55)
+            self.assertEqual(set(kwargs), {'timestamp', 'weight', 'percent_fat', 'bmi'})
+            return post(**kwargs)
+
+        backend.add_body_composition = observe_post
+        api = self.detailed_api(backend)
+        self.assertEqual(h.process_record(api, self.db, self.r, sleep=lambda _: None), 'uncertain')
+        self.assertEqual(json.loads(h.state_row(self.db, self.r)['payload'])['lbm'], 53.55)
+        backend.rows = [row(self.r)]
+        self.assertEqual(h.process_record(api, self.db, self.r, sleep=lambda _: None), 'verified')
+        self.assertEqual(json.loads(h.state_row(self.db, self.r)['payload'])['lbm'], 53.55)
+        self.assertEqual(len(backend.posts), 1)
+        self.assertFalse(backend.deletes)
+        self.assertIsNone(self.r.lbm)
+
     def test_idle_historical_sync_finishes_without_login_or_overwriting_review_plan(self):
         h.write_json(self.state / 'last_sync_comparison.json', {})
         for status in ('verified', 'verified_manual', 'ignored'):
