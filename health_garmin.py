@@ -1544,7 +1544,7 @@ def select_comparison_records(records: list[Measurement], db: sqlite3.Connection
     for r in records:
         previous = state_row(db, r)
         bmi_changed = previous is not None and r.bmi is not None and json.loads(previous["payload"]).get("bmi") != r.bmi
-        if first or r.at.date() >= recent or previous is None or previous["status"] not in ("verified", "verified_manual", "ignored") or previous["core"] != r.core or bmi_changed:
+        if first or r.at.astimezone().date() >= recent or previous is None or previous["status"] not in ("verified", "verified_manual", "ignored") or previous["core"] != r.core or bmi_changed:
             selected.append(r)
         elif r.lbm is not None:
             payload = json.loads(previous["payload"])

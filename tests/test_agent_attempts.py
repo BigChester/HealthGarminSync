@@ -1,7 +1,7 @@
 """Background entry evidence using private fixtures; no real service or API."""
 import argparse
 import contextlib
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 import fcntl
 import io
 import json
@@ -274,6 +274,80 @@ class AgentAttemptTests(unittest.TestCase):
             self.assertFalse(backend.deletes)
             self.assertEqual(self.export.read_bytes(), source_bytes)
             self.assertEqual((self.tokens / 'oauth.json').read_bytes(), token)
+
+    def test_equivalent_time_offsets_preserve_recent_rechecks_and_history_lbm_evidence(self):
+        import socket
+        from test_reconciliation import ReconciliationTests
+        def forbidden(*args, **kwargs):
+            raise AssertionError('No real network or service')
+        reference = h.aware('2026-10-02T12:00:00+08:00')
+        local_date = reference.astimezone().date()
+        template = json.loads(self.export.read_text())
+        token = (self.tokens / 'oauth.json').read_bytes()
+        with (patch.object(socket.socket, 'connect', forbidden),
+              patch.object(socket, 'create_connection', forbidden), patch.object(h, 'manage_agent', forbidden),
+              patch.object(h, 'now', return_value=reference)):
+            for days_before_cutoff in (0, 1):
+                with self.subTest(days_before_cutoff=days_before_cutoff):
+                    with contextlib.closing(h.database()) as db:
+                        db.execute('DELETE FROM uploads'); db.commit()
+                    (self.state / 'last_sync_comparison.json').unlink(missing_ok=True)
+                    at = datetime.combine(local_date - timedelta(days=30 + days_before_cutoff),
+                                          datetime.min.time()).replace(minute=30).astimezone()
+                    initial = json.loads(json.dumps(template))
+                    initial['exported_at'] = (reference - timedelta(minutes=5)).isoformat()
+                    for samples in initial['metrics'].values():
+                        for item in samples:
+                            item['at'] = at.isoformat()
+                    self.export.write_text(json.dumps(initial))
+                    old = h.load_measurements(self.cfg)[1][0]
+                    backend = API()
+                    api = ReconciliationTests.detailed_api(self, backend)
+                    with patch.object(h, 'now', return_value=reference), patch.object(h, 'api_client', return_value=api):
+                        self.assertEqual(self.run_agent()[0], 0)
+                    with contextlib.closing(h.database()) as db:
+                        previous = dict(h.state_row(db, old))
+                    self.assertEqual(previous['status'], 'verified')
+                    self.assertEqual(len(backend.posts), 1)
+                    alternate = next(at.astimezone(timezone(timedelta(hours=offset)))
+                                     for offset in (-12, 14)
+                                     if at.astimezone(timezone(timedelta(hours=offset))).date() != at.date())
+                    self.assertNotEqual(alternate.date(), at.date())
+                    changed = json.loads(json.dumps(initial))
+                    for samples in changed['metrics'].values():
+                        for item in samples:
+                            item['at'] = alternate.isoformat()
+                    if days_before_cutoff:
+                        changed['metrics']['lbm'] = [{'at': alternate.isoformat(), 'value': '53.55 kg', 'source': old.source}]
+                    self.export.write_text(json.dumps(changed))
+                    source = self.export.read_bytes()
+                    current = h.load_measurements(self.cfg)[1][0]
+                    self.assertEqual((current.key, current.core), (old.key, old.core))
+                    backend.rows = []
+                    with (patch.object(h, 'now', return_value=reference + timedelta(seconds=10)),
+                          patch.object(h, 'api_client', return_value=api) as factory):
+                        self.assertEqual(self.run_agent()[0], 0)
+                        code, report, checks = self.report()
+                    with contextlib.closing(h.database()) as db:
+                        latest = dict(h.state_row(db, current))
+                    self.assertEqual(factory.call_count, 0 if days_before_cutoff else 1)
+                    self.assertEqual(len(backend.posts), 1)
+                    self.assertFalse(backend.deletes)
+                    summary = json.loads(self.last.read_text())
+                    if days_before_cutoff:
+                        self.assertEqual(summary['results'], {})
+                        self.assertEqual(report['status'], 'ok')
+                        self.assertEqual({key: latest[key] for key in ('core', 'status', 'updated_at', 'detail')},
+                                         {key: previous[key] for key in ('core', 'status', 'updated_at', 'detail')})
+                        self.assertEqual(json.loads(latest['payload']), {**json.loads(previous['payload']), 'lbm': 53.55})
+                    else:
+                        self.assertEqual(latest['status'], 'remote_missing')
+                        self.assertEqual(summary['results'], {current.key: 'remote_missing'})
+                        self.assertEqual(checks['last_run']['status'], 'warn')
+                    self.assertEqual(code, 0)
+                    self.assertEqual(summary['unknown_request_count'], 0)
+                    self.assertEqual(self.export.read_bytes(), source)
+                    self.assertEqual((self.tokens / 'oauth.json').read_bytes(), token)
 
     def test_sync_log_rollover_failure_finishes_batch_but_reports_failed_evidence(self):
         first = h.load_measurements(self.cfg)[1][0]
