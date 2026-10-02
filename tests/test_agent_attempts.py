@@ -534,6 +534,72 @@ class AgentAttemptTests(unittest.TestCase):
                 self.assertEqual(checks['last_agent_attempt']['status'], 'error')
                 self.assertNotIn(fixtures.SECRET, json.dumps(checks['last_agent_attempt']))
 
+    def test_real_entry_clock_rollback_is_diagnosed_without_changing_outcomes_and_recovers(self):
+        import socket
+        def forbidden(*args, **kwargs):
+            raise AssertionError('No real network or service')
+        source, token = self.export.read_bytes(), (self.tokens / 'oauth.json').read_bytes()
+        clock = [h.now()]
+        backend = API()
+        post = backend.add_body_composition
+        def rewind_post(**kwargs):
+            clock[0] -= timedelta(seconds=1)
+            return post(**kwargs)
+        backend.add_body_composition = rewind_post
+        with (patch.object(h, 'now', side_effect=lambda: clock[0]),
+              patch.object(h, 'api_client', return_value=backend),
+              patch.object(h, 'manage_agent', forbidden),
+              patch.object(socket.socket, 'connect', forbidden),
+              patch.object(socket, 'create_connection', forbidden)):
+            for outcome, exception, exit_code in (('completed', None, 0), ('failed', ValueError, 2),
+                                                   ('interrupted', KeyboardInterrupt, 130)):
+                with self.subTest(outcome=outcome):
+                    def fail_sync(*args, **kwargs):
+                        clock[0] -= timedelta(seconds=1)
+                        raise exception()
+                    with contextlib.ExitStack() as stack:
+                        if exception:
+                            stack.enter_context(patch.object(h, 'run_sync', side_effect=fail_sync))
+                        self.assertEqual(self.run_agent()[0], exit_code)
+                    evidence = {}
+                    for name in ('last_attempt.json', 'last_agent_attempt.json'):
+                        evidence[name] = (self.state / name).read_bytes()
+                        value = json.loads(evidence[name])
+                        self.assertEqual(value['outcome'], outcome)
+                        self.assertEqual((h.aware(value['finished_at']) - h.aware(value['started_at'])).total_seconds(), -1)
+                    result, _, checks = self.report()
+                    self.assertEqual(result, 2)
+                    for key in ('last_attempt', 'last_agent_attempt'):
+                        self.assertEqual(checks[key]['status'], 'error')
+                        self.assertIn('结束时间早于开始时间', checks[key]['message'])
+                        self.assertIn('核对 Mac 时间', checks[key]['hint'])
+                        self.assertEqual((self.state / (key + '.json')).read_bytes(), evidence[key + '.json'])
+                    result, text = self.invoke('doctor')
+                    self.assertEqual(result, 2)
+                    self.assertIn('核对 Mac 时间', text)
+                    for name in ('run.lock', 'agent-log.lock'):
+                        with (self.state / name).open('r') as lock:
+                            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    self.assertEqual(self.run_agent()[0], 0)
+                    self.assertEqual(self.report()[0], 0)
+                    self.assertEqual(len(backend.posts), 1)
+                    self.assertFalse(backend.deletes)
+                    self.assertEqual((self.export.read_bytes(), (self.tokens / 'oauth.json').read_bytes()), (source, token))
+
+    def test_clock_order_diagnosis_requires_other_attempt_fields_to_be_valid(self):
+        base = self.completed()
+        base['finished_at'] = (h.aware(base['started_at']) - timedelta(seconds=1)).isoformat()
+        for key, stage in (('last_attempt', 'sync'), ('last_agent_attempt', 'run')):
+            for changes in ({'extra': fixtures.SECRET}, {'stage': 'setup'}, {'error_type': fixtures.SECRET},
+                            {'outcome': 'failed', 'error_type': None}, {'outcome': 'interrupted', 'error_type': []}):
+                with self.subTest(key=key, changes=changes):
+                    value = {**base, 'stage': stage, **changes}
+                    (self.state / (key + '.json')).write_text(json.dumps(value))
+                    result, _, checks = self.report()
+                    self.assertEqual(result, 2)
+                    self.assertIn('结构无效', checks[key]['message'])
+                    self.assertNotIn('Mac 时间', checks[key]['hint'])
+
     def test_corrupt_symlink_or_unreadable_marker_is_error_without_leaking_contents(self):
         self.marker.write_text('{invalid ' + fixtures.SECRET)
         self.assertEqual(self.report()[0], 2)

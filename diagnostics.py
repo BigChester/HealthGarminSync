@@ -39,6 +39,10 @@ class FutureEvidenceError(ValueError):
     pass
 
 
+class ClockOrderEvidenceError(ValueError):
+    pass
+
+
 def evidence_time(text, reference_time):
     stamp = h.aware(text)
     if (stamp - reference_time).total_seconds() > 600:
@@ -69,8 +73,6 @@ def attempt_summary(value, *, allowed_stages=('config', 'sync'),
         if not isinstance(finished, str):
             raise ValueError('invalid attempt finish')
         finished = evidence_time(finished, reference_time)
-        if finished < started:
-            raise ValueError('attempt ended before it started')
         if outcome in ('completed', 'preview'):
             if stage != allowed_stages[-1] or error is not None:
                 raise ValueError('invalid completed attempt')
@@ -78,6 +80,8 @@ def attempt_summary(value, *, allowed_stages=('config', 'sync'),
                 r'[A-Za-z_][A-Za-z0-9_]*' +
                 (r'(?: HTTP (?:400|401|403|404|429|500|502|503|504))?' if allow_http else ''), error)):
             raise ValueError('invalid attempt error category')
+        if finished < started:
+            raise ClockOrderEvidenceError('attempt ended before it started')
     # Never forward exception categories or arbitrary fields to user-facing output.
     return {'outcome': outcome, 'stage': stage, 'started_at': started.isoformat(),
             'finished_at': finished.isoformat() if finished is not None else None}
@@ -301,6 +305,9 @@ def collect():
             add('last_attempt', status, messages[outcome], data=attempt)
         except FileNotFoundError:
             add('last_attempt', 'info', '尚无运行尝试摘要；兼容已有安装。')
+        except ClockOrderEvidenceError:
+            add('last_attempt', 'error', '运行尝试摘要的结束时间早于开始时间。',
+                '核对 Mac 时间和 state/last_attempt.json 中的时间证据。')
         except FutureEvidenceError:
             add('last_attempt', 'error', '运行尝试摘要时间晚于当前 Mac 时间超过十分钟。',
                 '核对 Mac 时间和 state/last_attempt.json 中的时间证据。')
@@ -329,6 +336,9 @@ def collect():
             enabled = cfg is not None and cfg['enabled']
             add('last_agent_attempt', 'warn' if enabled else 'info',
                 '尚无后台入口摘要；兼容已有安装，不能据此确认后台执行。')
+        except ClockOrderEvidenceError:
+            add('last_agent_attempt', 'error', '后台入口摘要的结束时间早于开始时间。',
+                '核对 Mac 时间和 state/last_agent_attempt.json 中的时间证据。')
         except FutureEvidenceError:
             add('last_agent_attempt', 'error', '后台入口摘要时间晚于当前 Mac 时间超过十分钟。',
                 '核对 Mac 时间和 state/last_agent_attempt.json 中的时间证据。')
