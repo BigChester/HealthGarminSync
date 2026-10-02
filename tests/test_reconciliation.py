@@ -320,6 +320,178 @@ class ReconciliationTests(unittest.TestCase):
         self.assertNotIn('muscle_mass', api.posts[0])
         self.assertEqual(journal['phase'], 'verified')
 
+    def test_reviewed_optional_preservation_retains_only_same_core_local_lbm(self):
+        token = self.state / 'synthetic-token'
+        token.write_bytes(b'unchanged local token')
+        save = h.set_status
+        for weight, explicit, expected in ((70, None, 53.55), (70, 54, 54), (71, None, None)):
+            with self.subTest(weight=weight, explicit_lbm=explicit):
+                self.db.execute('DELETE FROM uploads'); self.db.commit()
+                for journal in (self.state / 'operations').glob('*.json'):
+                    journal.unlink()
+                h.set_status(self.db, h.Measurement(AT, 70, None, 'PICOOC', lbm=53.55), 'verified')
+                self.r = h.Measurement(AT, weight, None, 'PICOOC', 22, explicit)
+                self.write_export([self.r])
+                source = (self.inbox / 'health.json').read_bytes()
+                _, records, waiting, _ = h.load_measurements(self.cfg)
+                self.assertEqual(records, [self.r]); self.assertFalse(waiting)
+                backend = API([row(h.Measurement(AT, 70, 23.5, 'PICOOC'))])
+                api = self.detailed_api(backend)
+                plan = h.comparison_plan(self.db, records,
+                    h.fetch_remote_snapshot(api, AT.date(), AT.date()), AT.date(), AT.date())
+                path = h.save_comparison(plan, self.cfg)
+                durable = []
+                def inspect_commit(db, record, status, detail=''):
+                    save(db, record, status, detail)
+                    with contextlib.closing(h.sqlite3.connect(self.state / 'sync.sqlite3')) as reader:
+                        core, payload, stored_status = reader.execute(
+                            'SELECT core,payload,status FROM uploads WHERE record_id=?', (self.r.key,)).fetchone()
+                    self.assertEqual((core, stored_status), (self.r.core, status))
+                    self.assertEqual(json.loads(payload)['fat'], None)
+                    self.assertEqual(json.loads(payload).get('lbm'), expected)
+                    durable.append(status)
+                with patch.object(h, 'set_status', side_effect=inspect_commit):
+                    self.reviewed(api, path)
+                self.assertEqual(durable, ['repair_uncertain', 'pending', 'inflight', 'verified', 'verified'])
+                journal_path = next((self.state / 'operations').glob('*.json'))
+                journal = json.loads(journal_path.read_text())
+                backup = Path(journal['backup']) / 'plan.json'
+                backup_bytes = backup.read_bytes()
+                persisted = h.state_row(self.db, self.r)
+                payload = json.loads(persisted['payload'])
+                self.assertEqual((persisted['core'], persisted['status']), (self.r.core, 'verified'))
+                self.assertEqual(payload.get('lbm'), expected)
+                self.assertEqual(journal['replacement'].get('lbm'), expected)
+                self.assertEqual(journal['measurement'], self.r.payload())
+                self.assertEqual(payload['fat'], None)
+                before = (len(backend.posts), len(backend.deletes))
+                with patch.object(h, 'api_client', return_value=api), contextlib.redirect_stdout(io.StringIO()):
+                    self.assertTrue(h.verify_operation(argparse.Namespace(operation=str(journal_path))))
+                self.sync(api)
+                persisted = h.state_row(self.db, self.r)
+                self.assertEqual((persisted['core'], persisted['status']), (self.r.core, 'verified'))
+                self.assertEqual(json.loads(persisted['payload']).get('lbm'), expected)
+                self.assertEqual((len(backend.posts), len(backend.deletes)), before)
+                self.assertEqual(backend.deletes, [('100', AT.date().isoformat())])
+                self.assertEqual(len(backend.posts), 1)
+                self.assertEqual(set(backend.posts[0]), {'timestamp', 'weight', 'percent_fat', 'bmi'})
+                self.assertEqual((backend.posts[0]['percent_fat'], backend.posts[0]['bmi']), (23.5, 22))
+                self.assertEqual((self.inbox / 'health.json').read_bytes(), source)
+                self.assertEqual(backup.read_bytes(), backup_bytes)
+                self.assertEqual(token.read_bytes(), b'unchanged local token')
+        other = h.Measurement(AT + timedelta(hours=1), 70, None, 'PICOOC')
+        untouched = dict(h.state_row(self.db, self.r))
+        reads = len(backend.reads)
+        with self.assertRaises(h.SafeError):
+            h.process_record(api, self.db, self.r, local_record=other)
+        self.assertEqual(dict(h.state_row(self.db, self.r)), untouched)
+        self.assertEqual(len(backend.reads), reads)
+        self.assertEqual((len(backend.posts), len(backend.deletes)), before)
+
+    def test_reviewed_retained_lbm_survives_resume_and_delayed_verification(self):
+        token = self.state / 'synthetic-token'
+        token.write_bytes(b'unchanged local token')
+        process, save = h.process_record, h.set_status
+        for mode, explicit in ((mode, lbm) for mode in ('timeout_resume', 'delayed_verify', 'auto_matched')
+                               for lbm in (None, 53.55)):
+            with self.subTest(mode=mode, source_lbm=explicit):
+                self.db.execute('DELETE FROM uploads'); self.db.commit()
+                for journal in (self.state / 'operations').glob('*.json'):
+                    journal.unlink()
+                (self.state / 'last_sync_comparison.json').unlink(missing_ok=True)
+                h.set_status(self.db, h.Measurement(AT, 70, None, 'PICOOC', lbm=53.55), 'verified')
+                self.r = h.Measurement(AT, 70, None, 'PICOOC', 22, explicit)
+                self.write_export([self.r])
+                source = (self.inbox / 'health.json').read_bytes()
+                backend = API([row(h.Measurement(AT, 70, 23.5, 'PICOOC'))])
+                backend.visible = False
+                post = backend.add_body_composition
+                def first_post(**kwargs):
+                    post(**kwargs)
+                    if mode == 'timeout_resume':
+                        raise TimeoutError('synthetic uncertain submission')
+                backend.add_body_composition = first_post
+                api = self.detailed_api(backend)
+                plan = self.deletion_plan(api)
+                durable = []
+                def inspect_commit(db, record, status, detail=''):
+                    save(db, record, status, detail)
+                    with contextlib.closing(h.sqlite3.connect(self.state / 'sync.sqlite3')) as reader:
+                        core, payload, stored_status = reader.execute(
+                            'SELECT core,payload,status FROM uploads WHERE record_id=?', (self.r.key,)).fetchone()
+                    self.assertEqual((core, stored_status), (self.r.core, status))
+                    self.assertEqual(json.loads(payload)['fat'], None)
+                    self.assertEqual(json.loads(payload)['lbm'], 53.55)
+                    durable.append(status)
+                with (patch.object(h, 'process_record', side_effect=lambda *a, **kw:
+                                   process(*a, **kw, sleep=lambda _: None)),
+                      patch.object(h, 'set_status', side_effect=inspect_commit)):
+                    with self.assertRaises(h.SafeError): self.reviewed(api, plan)
+                self.assertEqual(durable, ['repair_uncertain', 'pending', 'inflight', 'uncertain'])
+                journal_path = next((self.state / 'operations').glob('*.json'))
+                journal = json.loads(journal_path.read_text())
+                original_measurement = journal['measurement']
+                self.assertEqual(journal['phase'], 'uncertain')
+                self.assertEqual(original_measurement, self.r.payload())
+                self.assertEqual(journal['replacement']['lbm'], 53.55)
+                persisted = h.state_row(self.db, self.r)
+                self.assertEqual((persisted['core'], persisted['status']), (self.r.core, 'uncertain'))
+                self.assertEqual(json.loads(persisted['payload'])['lbm'], 53.55)
+                self.assertEqual(len(backend.posts), 1)
+                backup = Path(journal['backup'])
+                evidence = {path.name: path.read_bytes() for path in backup.glob('*.json')}
+                args = argparse.Namespace(operation=str(journal_path))
+                if mode == 'timeout_resume':
+                    backend.add_body_composition = post
+                    backend.visible = True
+                    api = self.detailed_api(backend)
+                    with (patch.object(h, 'api_client', return_value=api),
+                          patch('builtins.input', return_value='RESUME ' + self.r.key),
+                          contextlib.redirect_stdout(io.StringIO()),
+                          patch.object(h, 'set_status', side_effect=inspect_commit)):
+                        h.resume_operation(args)
+                    self.assertEqual(durable[-3:], ['pending', 'inflight', 'verified'])
+                else:
+                    backend.rows = [row(h.Measurement(AT, 70, 23.5, 'PICOOC', 22), 201)]
+                    if mode == 'auto_matched':
+                        self.sync(api)
+                        persisted = h.state_row(self.db, self.r)
+                        self.assertEqual((persisted['core'], persisted['status']), (self.r.core, 'verified'))
+                        self.assertEqual(json.loads(persisted['payload'])['lbm'], 53.55)
+                        self.assertEqual(json.loads(journal_path.read_text())['phase'], 'uncertain')
+                before = (len(backend.posts), len(backend.deletes))
+                with patch.object(h, 'api_client', return_value=api), contextlib.redirect_stdout(io.StringIO()):
+                    self.assertTrue(h.verify_operation(args))
+                self.sync(api)
+                self.assertEqual(before, (2 if mode == 'timeout_resume' else 1, 1))
+                self.assertEqual(json.loads(journal_path.read_text())['phase'], 'verified')
+                persisted = h.state_row(self.db, self.r)
+                self.assertEqual((persisted['core'], persisted['status']), (self.r.core, 'verified'))
+                self.assertEqual(json.loads(persisted['payload'])['lbm'], 53.55)
+                self.assertEqual((self.inbox / 'health.json').read_bytes(), source)
+                # A later explicit export wins over both kinds of historical journal measurement.
+                self.write_export([h.Measurement(AT, 70, None, 'PICOOC', 22, 54)])
+                source = (self.inbox / 'health.json').read_bytes()
+                self.sync(api)
+                for _ in range(2):
+                    with (patch.object(h, 'api_client', return_value=api),
+                          patch('builtins.input', side_effect=AssertionError('Matched resume must be read-only')),
+                          contextlib.redirect_stdout(io.StringIO())):
+                        self.assertTrue(h.verify_operation(args))
+                        h.resume_operation(args)
+                    self.sync(api)
+                    persisted = h.state_row(self.db, self.r)
+                    self.assertEqual((persisted['core'], persisted['status']), (self.r.core, 'verified'))
+                    self.assertEqual(json.loads(persisted['payload'])['lbm'], 54)
+                self.assertEqual((len(backend.posts), len(backend.deletes)), before)
+                self.assertEqual(json.loads(journal_path.read_text())['measurement'], original_measurement)
+                self.assertEqual({path.name: path.read_bytes() for path in backup.glob('*.json')}, evidence)
+                for submitted in backend.posts:
+                    self.assertEqual(set(submitted), {'timestamp', 'weight', 'percent_fat', 'bmi'})
+                    self.assertEqual((submitted['percent_fat'], submitted['bmi']), (23.5, 22))
+                self.assertEqual((self.inbox / 'health.json').read_bytes(), source)
+                self.assertEqual(token.read_bytes(), b'unchanged local token')
+
     def test_bmi_enrichment_repairs_existing_record_and_verifies_all_fields(self):
         original = self.r
         h.set_status(self.db, original, 'verified')

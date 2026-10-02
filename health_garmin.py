@@ -1072,7 +1072,14 @@ def reviewed_operation(args: argparse.Namespace, cfg: dict[str, Any], delete_ext
                 fat = parse_quantity(str(remote_row["bodyFat"]) + "%", "body_fat", cfg)
             if bmi is None and remote_row.get("bmi") is not None:
                 bmi = parse_quantity(remote_row["bmi"], "bmi", cfg)
-            replacement = Measurement(measurement.at, measurement.weight, fat, measurement.source, bmi, measurement.lbm)
+            lbm = measurement.lbm
+            if lbm is None:
+                previous = state_row(db, measurement)
+                if previous and previous["core"] == measurement.core:
+                    lbm = json.loads(previous["payload"]).get("lbm")
+            replacement = Measurement(measurement.at, measurement.weight, fat, measurement.source, bmi, lbm)
+            local = Measurement(measurement.at, measurement.weight, measurement.fat,
+                                measurement.source, measurement.bmi, lbm)
         pk = str(remote_row.get("samplePk", ""))
         calendar = remote_row.get("calendarDate")
         if not pk.isdigit() or int(pk) <= 0 or not isinstance(calendar, str):
@@ -1133,7 +1140,7 @@ def reviewed_operation(args: argparse.Namespace, cfg: dict[str, Any], delete_ext
         journal_path = operation_dir / (stamp + ".json")
         write_json(journal_path, journal)  # Durable before DELETE, including the original record.
         if measurement:
-            set_status(db, measurement, "repair_uncertain", "Reviewed replacement started; do not resend or delete again")
+            set_status(db, local, "repair_uncertain", "Reviewed replacement started; do not resend or delete again")
         try:
             api.delete_weigh_in(pk, calendar)
             remaining = fetch_remote_snapshot(api, start, end)
@@ -1143,16 +1150,16 @@ def reviewed_operation(args: argparse.Namespace, cfg: dict[str, Any], delete_ext
             write_json(journal_path, journal)
             if measurement:
                 # Replacement optional values were validated before any DELETE.
-                set_status(db, replacement, "pending", "Original removal confirmed; reviewed replacement permitted")
+                set_status(db, local, "pending", "Original removal confirmed; reviewed replacement permitted")
                 journal["phase"] = "uploading"
                 write_json(journal_path, journal)
                 scoped_api = ReviewedReplacementAPI(api, replacement, reviewed_targets)
-                result = process_record(scoped_api, db, replacement, reviewed=True)
+                result = process_record(scoped_api, db, replacement, reviewed=True, local_record=local)
                 journal["phase"] = "verified" if result == "verified" else "uncertain"
                 write_json(journal_path, journal)
                 if result != "verified":
                     raise SafeError("修复提交后尚未读回匹配，停止；只读核对，不重复提交。")
-                set_status(db, measurement, "verified", "Reviewed replacement matched Apple values; optional remote fields preserved")
+                set_status(db, local, "verified", "Reviewed replacement matched Apple values; optional remote fields preserved")
             print("操作完成；备份：", backup)
         except Exception as exc:
             journal["phase"] = "uncertain"
@@ -1169,6 +1176,23 @@ def read_operation(path: Path) -> dict[str, Any]:
     except ValueError:
         raise SafeError("操作记录必须位于本项目 state/operations 目录。")
     return json.loads(read_regular_text(path))
+
+
+def local_operation_record(journal: dict[str, Any], r: Measurement, db: sqlite3.Connection) -> Measurement:
+    """Keep Apple identity and the latest local LBM separate from replacement values."""
+    payload = journal.get("measurement")
+    if not payload:
+        return r  # Legacy operations may contain only a replacement.
+    local = Measurement(**{**payload, "at": aware(payload["at"])})
+    if local.key != r.key:
+        raise SafeError("操作记录中的 Apple 测量与替换目标不一致，不能保存本地状态。")
+    previous = state_row(db, local)
+    current_lbm = (json.loads(previous["payload"]).get("lbm")
+                   if previous and previous["core"] == local.core else None)
+    lbm = local.lbm if local.lbm is not None else r.lbm
+    if current_lbm is not None:
+        lbm = current_lbm
+    return Measurement(local.at, local.weight, local.fat, local.source, local.bmi, lbm)
 
 
 def record_failed_check(path: Path, journal: dict[str, Any]) -> None:
@@ -1211,7 +1235,8 @@ def verify_operation(args: argparse.Namespace) -> bool:
     if r is not None:
         if matched:
             with contextlib.closing(database()) as db, db:
-                set_status(db, r, "verified", "Delayed reviewed-operation verification matched")
+                set_status(db, local_operation_record(journal, r, db), "verified",
+                           "Delayed reviewed-operation verification matched")
             journal["phase"] = "verified"
     else:
         if matched:
@@ -1278,7 +1303,8 @@ def resume_operation(args: argparse.Namespace) -> None:
     original_pk = str(journal["original"]["samplePk"])
     if classify_remote(r, obj) == "matched":
         with contextlib.closing(database()) as db, db:
-            set_status(db, r, "verified", "Reviewed operation already matched; no resume upload")
+            set_status(db, local_operation_record(journal, r, db), "verified",
+                       "Reviewed operation already matched; no resume upload")
         journal["phase"] = "verified"
         write_json(path, journal)
         print("远端已匹配，无需继续上传。")
@@ -1302,12 +1328,13 @@ def resume_operation(args: argparse.Namespace) -> None:
     journal["resumed_at"] = now().isoformat()
     write_json(path, journal)
     with contextlib.closing(database()) as db, db:
-        set_status(db, r, "pending", "User confirmed remote absence for reviewed operation resume")
+        local = local_operation_record(journal, r, db)
+        set_status(db, local, "pending", "User confirmed remote absence for reviewed operation resume")
         try:
-            result = process_record(api, db, r, reviewed=True)
+            result = process_record(api, db, r, reviewed=True, local_record=local)
         except Exception as exc:
             journal.update(phase="uncertain", error=safe_exception(exc))
-            for save in (lambda: set_status(db, r, "repair_uncertain", "Resume preflight failed; do not resend"),
+            for save in (lambda: set_status(db, local, "repair_uncertain", "Resume preflight failed; do not resend"),
                          lambda: write_json(path, journal)):
                 try:
                     save()
@@ -1365,31 +1392,34 @@ def remote_for(api: Any, r: Measurement) -> Any:
 
 
 def process_record(api: Any, db: sqlite3.Connection, r: Measurement, sleep=time.sleep,
-                   reviewed: bool = False) -> str:
-    row = state_row(db, r)
+                   reviewed: bool = False, *, local_record: Measurement | None = None) -> str:
+    local = r if local_record is None else local_record
+    if local.key != r.key:
+        raise SafeError("本地测量与提交目标不一致，不能保存上传状态。")
+    row = state_row(db, local)
     previous = row["status"] if row else "pending"
     if previous == "ignored":
         return previous
     # Reading errors happen before the write and are safe to try on the next run.
     classification = classify_remote(r, remote_for(api, r))
     if classification == "matched":
-        set_status(db, r, "verified", "Read-back matched time, weight, fat and available BMI")
+        set_status(db, local, "verified", "Read-back matched time, weight, fat and available BMI")
         return "verified"
     if not reviewed and r.key in active_operations():
-        set_status(db, r, "repair_uncertain", "Unfinished reviewed operation; verify or explicitly resume its journal")
+        set_status(db, local, "repair_uncertain", "Unfinished reviewed operation; verify or explicitly resume its journal")
         return "repair_uncertain"
     if previous in ("inflight", "uncertain", "repair_uncertain"):
         # Never blindly re-POST an uncertain write, even when an immediate read is empty.
-        set_status(db, r, "uncertain", "Awaiting remote visibility or explicit manual resolution")
+        set_status(db, local, "uncertain", "Awaiting remote visibility or explicit manual resolution")
         return "uncertain"
     if classification == "absent" and previous in ("verified", "verified_manual", "verified_conflict", "remote_missing"):
-        set_status(db, r, "remote_missing", "Previously verified record is missing; explicit absence confirmation required")
+        set_status(db, local, "remote_missing", "Previously verified record is missing; explicit absence confirmation required")
         return "remote_missing"
     if classification == "conflict":
         result = "verified_conflict" if previous in ("verified", "verified_manual", "verified_conflict", "remote_missing") else "conflict"
-        set_status(db, r, result, "Existing remote values differ or timestamp correspondence is ambiguous")
+        set_status(db, local, result, "Existing remote values differ or timestamp correspondence is ambiguous")
         return result
-    set_status(db, r, "inflight", "Network write may occur; do not blindly retry")
+    set_status(db, local, "inflight", "Network write may occur; do not blindly retry")
     try:
         if r.fat is None and r.bmi is None:
             response = api.add_weigh_in(weight=r.weight, unitKey="kg",
@@ -1403,17 +1433,17 @@ def process_record(api: Any, db: sqlite3.Connection, r: Measurement, sleep=time.
         if isinstance(response, dict):
             result = response.get("detailedImportResult", {})
             if isinstance(result, dict) and result.get("failures"):
-                set_status(db, r, "uncertain", "Garmin import response reported failures; inspect remotely")
+                set_status(db, local, "uncertain", "Garmin import response reported failures; inspect remotely")
                 return "uncertain"
         for delay in (0, 3, 7):
             if delay:
                 sleep(delay)
             if classify_remote(r, remote_for(api, r)) == "matched":
-                set_status(db, r, "verified", "Read-back matched after upload")
+                set_status(db, local, "verified", "Read-back matched after upload")
                 return "verified"
-        set_status(db, r, "uncertain", "Submitted but not verified by remote read-back")
+        set_status(db, local, "uncertain", "Submitted but not verified by remote read-back")
     except Exception as exc:
-        set_status(db, r, "uncertain", safe_exception(exc))
+        set_status(db, local, "uncertain", safe_exception(exc))
     return "uncertain"
 
 
