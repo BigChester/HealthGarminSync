@@ -41,6 +41,7 @@ class RemoteDetailTests(unittest.TestCase):
     def test_repeated_known_identity_cannot_satisfy_daily_count(self):
         first = self.obj['dailyWeightSummaries'][0]['allWeightMetrics'][0]
         for duplicate in (dict(first), dict(first, samplePk=str(first['samplePk'])),
+                          dict(first, samplePk='00100'),
                           dict(first, weight=71000)):
             with self.subTest(duplicate=duplicate):
                 self.obj['dailyWeightSummaries'][0]['allWeightMetrics'] = [first, duplicate]
@@ -48,6 +49,17 @@ class RemoteDetailTests(unittest.TestCase):
                     self.api.get_body_composition('2020-02-19', '2020-02-21')
                 self.assertNotIn(str(first['samplePk']), str(raised.exception))
                 self.assertNotIn('71000', str(raised.exception))
+
+    def test_daily_details_reject_known_aliases_and_existing_raw_duplicates(self):
+        first = self.obj['dailyWeightSummaries'][0]['allWeightMetrics'][0]
+        for pk in (100, '100', '00100', 'opaque'):
+            with self.subTest(identity=pk):
+                original = dict(first, samplePk='opaque') if pk == 'opaque' else first
+                self.raw.get_daily_weigh_ins.return_value = {'dateWeightList': [original, dict(original, samplePk=pk)]}
+                with self.assertRaises(h.SafeError) as raised:
+                    self.api.get_body_composition('2020-02-20', '2020-02-20')
+                self.assertNotIn(str(pk), str(raised.exception))
+                self.assertNotIn(str(first['weight']), str(raised.exception))
 
     def test_distinct_known_ids_and_anonymous_details_keep_existing_contract(self):
         first, second = self.obj['dailyWeightSummaries'][0]['allWeightMetrics']

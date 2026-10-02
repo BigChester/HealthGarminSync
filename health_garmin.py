@@ -645,7 +645,7 @@ class GarminMeasurementAPI:
         end = end or start
         if start == end:
             obj = self.api.get_daily_weigh_ins(start)
-            RemoteIndex(obj)
+            self._validate_full_details(obj)
             return obj
         obj = self.api.get_weigh_ins(start, end)
         if not isinstance(obj, dict) or not isinstance(obj.get("dailyWeightSummaries"), list):
@@ -663,17 +663,24 @@ class GarminMeasurementAPI:
             date.fromisoformat(day)
             if any(not isinstance(row, dict) or row.get("calendarDate") != day for row in items):
                 raise SafeError("Garmin 每日明细的测量日期不一致，停止。")
-            identities = set()
-            for row in items:
-                if row.get("samplePk") is not None:
-                    identity = (str(row["samplePk"]), str(row["calendarDate"]))
-                    if identity in identities:
-                        raise SafeError("Garmin 每日称重明细包含重复记录，停止。")
-                    identities.add(identity)
             rows.extend(items)
         result = {"dateWeightList": rows}
-        RemoteIndex(result)
+        self._validate_full_details(result)
         return result
+
+    @staticmethod
+    def _validate_full_details(obj: Any) -> None:
+        rows = RemoteIndex(obj).rows
+        identities = set()
+        for row in rows:
+            raw = row.get("samplePk")
+            if raw is None:
+                continue
+            pk = canonical_remote_id(raw)
+            identity = (pk if pk is not None else str(raw), str(row.get("calendarDate")))
+            if identity in identities:
+                raise SafeError("Garmin 完整称重明细包含重复记录，停止。")
+            identities.add(identity)
 
 
 def safe_exception(exc: Exception) -> str:

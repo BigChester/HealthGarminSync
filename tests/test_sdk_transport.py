@@ -6,9 +6,11 @@ from importlib.metadata import PackageNotFoundError, version
 import io
 import json
 import logging
+import os
 from pathlib import Path
 import socket
 import struct
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -204,6 +206,86 @@ class SDKTransportTests(unittest.TestCase):
     def assert_durable_status(self, status):
         with contextlib.closing(h.database()) as independent:
             self.assertEqual(h.get_status(independent, self.r), status)
+
+    def test_canonical_aliases_cannot_hide_existing_measurement_and_trigger_sync_post(self):
+        earlier = h.Measurement(self.r.at - timedelta(minutes=5), 68, 20, 'PICOOC', 21)
+        self.rows = [fixtures.row(earlier, 100), fixtures.row(self.r, 101)]
+        actual = list(self.rows)
+        token = self.state / 'synthetic-token'; token.write_bytes(b'unchanged token')
+        h.write_json(h.CONFIG, {**self.cfg, 'is_cn': True})
+        root_logger = logging.getLogger()
+        self.addCleanup(root_logger.setLevel, root_logger.level)
+        corrupt = True
+        def server(method, path, pool):
+            if method == 'POST':
+                # Red regression: the request reaches a server that already has this measurement.
+                self.assertEqual(path, '/upload-service/upload')
+                self.assert_durable_status('inflight')
+                self.rows.append(fixtures.row(self.r, 201))
+                raise self.urllib3.exceptions.ReadTimeoutError(pool, path, 'synthetic accepted duplicate')
+            self.assertEqual(method, 'GET')
+            if corrupt and '/weight/range/' in path:
+                first = self.rows[0]
+                items = [first, dict(first, samplePk='00100')]
+                return 200, {'dailyWeightSummaries': [{'summaryDate': first['calendarDate'],
+                            'numOfWeightEntries': 2, 'allWeightMetrics': items}]}
+            return 200, self.read_payload(path)
+        self.handler = server
+        complete = self.api.get_body_composition(self.r.at.date().isoformat(), self.r.at.date().isoformat())
+        self.assertEqual(h.classify_remote(self.r, complete), 'matched')
+        def run():
+            output, errors = io.StringIO(), io.StringIO()
+            previous_umask = os.umask(0o077)
+            try:
+                with (patch.object(h, 'api_client', return_value=self.api), patch.object(sys, 'argv', ['hg', 'run']),
+                      contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors)):
+                    result = h.main()
+            finally:
+                os.umask(previous_umask)
+            return result, output.getvalue() + errors.getvalue()
+        code, output = run()
+        self.assertEqual(code, 2)
+        self.assertIn('重复记录', output)
+        self.assertNotIn('00100', output)
+        self.assertNotIn('68000', output)
+        self.assertEqual(json.loads((self.state / 'last_attempt.json').read_text())['outcome'], 'failed')
+        self.assertFalse((self.state / 'last_run.json').exists())
+        self.assertIsNone(h.state_row(self.db, self.r))
+        self.assertFalse(self.db.execute('SELECT * FROM request_times').fetchall())
+        self.assertEqual(self.rows, actual)
+        corrupt = False
+        self.assertEqual(run()[0], 0)
+        self.assert_durable_status('verified')
+        self.assertEqual(json.loads((self.state / 'last_run.json').read_text())['results'], {self.r.key: 'verified'})
+        self.assertEqual(self.rows, actual)
+        self.assertFalse(any(request['method'] in ('POST', 'DELETE') for request in self.sent))
+        self.assertEqual(token.read_bytes(), b'unchanged token')
+        self.assert_source_untouched()
+
+    def test_native_daily_identity_guard_keeps_date_anonymous_and_opaque_readonly_contracts(self):
+        first = fixtures.row(self.r, 100)
+        self.rows = [first, dict(first, samplePk='00100')]
+        with self.assertRaises(h.SafeError) as raised:
+            self.api.get_body_composition(self.r.at.date().isoformat(), self.r.at.date().isoformat())
+        self.assertNotIn('00100', str(raised.exception))
+        self.assertNotIn(str(first['weight']), str(raised.exception))
+        missing = {key: value for key, value in first.items() if key != 'samplePk'}
+        cases = [('different_date', [first, fixtures.row(h.Measurement(self.r.at + timedelta(days=1),
+                                                                       71, 24, 'PICOOC', 23), '00100')], 'matched'),
+                 ('anonymous', [dict(first, samplePk=None), dict(first, samplePk=None)], 'conflict'),
+                 ('missing_id', [missing, dict(missing)], 'conflict')]
+        cases.extend((repr(pk), [dict(first, samplePk=pk)], 'matched') for pk in (None, True, 100.0, 'opaque', 0, -1))
+        for name, rows, classification in cases:
+            with self.subTest(identity=name):
+                self.rows = rows
+                snapshot = h.fetch_remote_snapshot(self.api, self.r.at.date(),
+                                                   (self.r.at + timedelta(days=1)).date(), targets=[self.r])
+                self.assertEqual(snapshot['dateWeightList'], rows)
+                self.assertEqual(h.classify_remote(self.r, snapshot), classification)
+                daily = self.api.get_body_composition(self.r.at.date().isoformat(), self.r.at.date().isoformat())
+                self.assertEqual(daily['dateWeightList'], [r for r in rows if r['calendarDate'] == first['calendarDate']])
+        self.assertTrue(all(request['method'] == 'GET' for request in self.sent))
+        self.assert_source_untouched()
 
     def test_mutating_methods_send_once_on_transient_failure(self):
         for name, operation in self.operations().items():
