@@ -1,4 +1,5 @@
 """Background entry evidence using private fixtures; no real service or API."""
+import argparse
 import contextlib
 from datetime import timedelta
 import fcntl
@@ -129,6 +130,92 @@ class AgentAttemptTests(unittest.TestCase):
         self.assertEqual(self.value()['outcome'], 'completed')
         self.assertEqual(json.loads((self.state / 'last_attempt.json').read_text())['outcome'], 'preview')
         self.assertEqual(self.last.read_bytes(), old_last)
+
+    def test_ignored_native_unknown_request_survives_idle_summary_until_explicit_resolution(self):
+        from test_sdk_transport import SDKTransportTests, fit_weight_timestamp
+        sdk = SDKTransportTests()
+        self.addCleanup(sdk.doCleanups)
+        sdk.setUp()
+        old = h.load_measurements(self.cfg)[1][0]
+        source, token = self.export.read_bytes(), (self.tokens / 'oauth.json').read_bytes()
+        process = h.process_record
+        with (patch.object(h, 'BASE', self.base), patch.object(h, 'STATE', self.state),
+              patch.object(h, 'CONFIG', self.config_path), patch.object(Path, 'home', return_value=self.home)):
+            with (patch.object(h, 'api_client', return_value=sdk.api),
+                  patch.object(h, 'process_record', side_effect=lambda *a, **k: process(*a, **k, sleep=lambda _: None))):
+                self.assertEqual(self.run_agent()[0], 0)
+            wire = fit_weight_timestamp(sdk.fit_files[-1])
+            self.assertEqual(wire, old.at.astimezone(h.UTC).replace(microsecond=0))
+            with patch('builtins.input', return_value='IGNORE'), contextlib.redirect_stdout(io.StringIO()):
+                h.resolve_record(argparse.Namespace(record_id=old.key, present=False, absent=False, ignore=True))
+            with contextlib.closing(h.database()) as db:
+                ignored = dict(h.state_row(db, old))
+                self.assertEqual(ignored['status'], 'ignored')
+            for empty in (False, True):
+                with self.subTest(empty_export=empty):
+                    if empty:
+                        value = json.loads(self.export.read_text())
+                        value['metrics'] = {'weight': []}
+                        self.export.write_text(json.dumps(value))
+                    source = self.export.read_bytes()
+                    with patch.object(h, 'api_client', side_effect=AssertionError('Idle run must not authenticate')):
+                        self.assertEqual(self.run_agent()[0], 0)
+                    summary = json.loads(self.last.read_text())
+                    self.assertEqual(summary['results'], {})
+                    self.assertEqual(summary['local_status_counts'], {'ignored': 1})
+                    self.assertEqual(summary['unknown_request_count'], 1)
+                    code, _, checks = self.report()
+                    self.assertEqual(code, 2)
+                    self.assertEqual(checks['last_run']['status'], 'error')
+                    self.assertEqual(checks['last_run']['data']['unknown_request_count'], 1)
+                    self.assertIn('不要重复提交', checks['last_run']['hint'])
+                    self.assertEqual(checks['last_agent_attempt']['status'], 'info')
+                    code, text = self.invoke('doctor')
+                    self.assertEqual(code, 2)
+                    self.assertIn('请求结果未确定', text)
+                    with contextlib.closing(h.database()) as db:
+                        self.assertEqual(dict(h.state_row(db, old)), ignored)
+                        self.assertEqual(h.unknown_request_context(db)[0][2], wire)
+                    self.assertEqual(self.export.read_bytes(), source)
+                    self.assertEqual((self.tokens / 'oauth.json').read_bytes(), token)
+            # Explicit receipt/absence resolves requests; ignoring an unsent task does not create one.
+            for choice in ('PRESENT', 'ABSENT', 'never_sent'):
+                if choice == 'PRESENT':
+                    record = old
+                else:
+                    record = h.Measurement(old.at + timedelta(days=1 if choice == 'ABSENT' else 2),
+                                           old.weight, old.fat, old.source)
+                    if choice == 'ABSENT':
+                        with contextlib.closing(h.database()) as db:
+                            self.assertEqual(process(sdk.api, db, record, sleep=lambda _: None), 'uncertain')
+                    else:
+                        with contextlib.closing(h.database()) as db:
+                            h.set_status(db, record, 'pending')
+                    with patch('builtins.input', return_value='IGNORE'), contextlib.redirect_stdout(io.StringIO()):
+                        h.resolve_record(argparse.Namespace(record_id=record.key, present=False, absent=False, ignore=True))
+                if choice != 'never_sent':
+                    with patch('builtins.input', return_value=choice), contextlib.redirect_stdout(io.StringIO()):
+                        h.resolve_record(argparse.Namespace(record_id=record.key, present=choice == 'PRESENT',
+                                                           absent=choice == 'ABSENT', ignore=False))
+                with patch.object(h, 'api_client', side_effect=AssertionError('Empty export must not authenticate')):
+                    self.assertEqual(self.run_agent()[0], 0)
+                self.assertEqual(json.loads(self.last.read_text())['unknown_request_count'], 0)
+                self.assertEqual(self.report()[0], 0)
+                self.assertEqual(self.export.read_bytes(), source)
+                self.assertEqual((self.tokens / 'oauth.json').read_bytes(), token)
+            self.assertEqual(sum(request['method'] == 'POST' for request in sdk.sent), 2)
+            self.assertFalse(any(request['method'] == 'DELETE' for request in sdk.sent))
+
+    def test_empty_export_without_database_records_zero_unknown_requests_without_creating_it(self):
+        value = json.loads(self.export.read_text())
+        value['metrics'] = {'weight': []}
+        self.export.write_text(json.dumps(value))
+        with (patch.object(h, 'database', side_effect=AssertionError('No database should be opened')),
+              patch.object(h, 'api_client', side_effect=AssertionError('No API should be created'))):
+            self.assertEqual(self.run_agent()[0], 0)
+        self.assertFalse((self.state / 'sync.sqlite3').exists())
+        self.assertEqual(json.loads(self.last.read_text())['unknown_request_count'], 0)
+        self.assertEqual(self.report()[0], 0)
 
     def test_sync_log_rollover_failure_finishes_batch_but_reports_failed_evidence(self):
         first = h.load_measurements(self.cfg)[1][0]

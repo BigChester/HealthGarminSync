@@ -553,9 +553,10 @@ class RunAttemptTests(unittest.TestCase):
         self.assertEqual(self.attempt()['outcome'], 'completed')
         summary = json.loads(self.last.read_text())
         self.assertEqual(set(summary), {'run_at', 'exports', 'complete_measurements', 'waiting_pairs',
-                                        'results', 'local_status_counts'})
+                                        'results', 'local_status_counts', 'unknown_request_count'})
         self.assertEqual(summary['results'], {})
         self.assertEqual(summary['local_status_counts'], {})
+        self.assertEqual(summary['unknown_request_count'], 0)
         self.assertFalse((self.state / 'sync.sqlite3').exists())
         api.assert_not_called()
         api = API()

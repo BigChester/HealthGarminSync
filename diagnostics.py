@@ -257,9 +257,12 @@ def collect():
                     or any(key not in RESULTS or type(count) is not int or count < 0
                            for key, count in local_counts.items())):
                 raise ValueError('invalid local status counts')
+            unknown_count = last.get('unknown_request_count', 0)
+            if type(unknown_count) is not int or unknown_count < 0:
+                raise ValueError('invalid unknown request count')
             statuses = set(counts) | {key for key, count in local_counts.items() if count > 0}
             stale = cfg is not None and cfg['enabled'] and (reference_time - ran_at).total_seconds() > STALE_SECONDS
-            if UNCERTAIN_RESULTS.intersection(statuses):
+            if unknown_count or UNCERTAIN_RESULTS.intersection(statuses):
                 status = 'error'
                 message = '最近运行摘要包含请求结果未确定的记录。'
                 hint = '先用 ./hg compare 查询并人工核对；结果未确定时不要重复提交。'
@@ -280,6 +283,8 @@ def collect():
                     status = 'warn'
                 hint = (hint + ' ' if hint else '') + '最近运行摘要距今超过两小时；请核对任务与设备状态。'
             data = {'run_at': ran_at.isoformat(), 'results': counts}
+            if 'unknown_request_count' in last:
+                data['unknown_request_count'] = unknown_count
             if 'local_status_counts' in last:
                 data['local_status_counts'] = local_counts
                 if status in ('error', 'warn') and any(local_counts.values()):

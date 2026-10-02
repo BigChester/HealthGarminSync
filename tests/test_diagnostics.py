@@ -907,6 +907,29 @@ finally:
         self.assertEqual(code, 0)
         self.assertEqual(checks['last_run']['status'], 'info')
 
+    def test_unknown_request_snapshot_count_is_optional_strict_and_controls_severity(self):
+        base = {'run_at': h.now().isoformat(), 'results': {}, 'local_status_counts': {'ignored': 1}}
+        for value, expected in ((None, 'info'), (0, 'info'), (1, 'error')):
+            with self.subTest(count=value):
+                summary = dict(base)
+                if value is not None:
+                    summary['unknown_request_count'] = value
+                self.last.write_text(json.dumps(summary))
+                code, _, checks = self.report()
+                self.assertEqual(code, 2 if expected == 'error' else 0)
+                self.assertEqual(checks['last_run']['status'], expected)
+                if value is None:
+                    self.assertNotIn('unknown_request_count', checks['last_run']['data'])
+                else:
+                    self.assertEqual(checks['last_run']['data']['unknown_request_count'], value)
+        for invalid in (True, False, -1, '1', 1.0, None, [], {}):
+            with self.subTest(invalid=invalid):
+                self.last.write_text(json.dumps(dict(base, unknown_request_count=invalid)))
+                code, _, checks = self.report()
+                self.assertEqual(code, 2)
+                self.assertIn('结构无效', checks['last_run']['message'])
+                self.assertNotIn('data', checks['last_run'])
+
     def test_invalid_local_status_counts_are_errors_without_private_details(self):
         for counts in (None, [], {SECRET: 1}, {'uncertain': -1}, {'uncertain': True},
                        {'verified': '1'}, {'verified': 1.5}, {'verified': {}}, {'verified': None}):
