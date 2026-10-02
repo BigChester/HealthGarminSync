@@ -170,7 +170,7 @@ def collect():
             children = list(h.STATE.iterdir())
             state_available = True
             invalid_file = None
-            runtime_names = ('run.lock', 'agent-log.lock', 'sync.log', 'last_attempt.json.tmp',
+            runtime_names = ('run.lock', 'agent-log.lock', 'sync.log', 'sync.sqlite3', 'last_attempt.json.tmp',
                              'last_agent_attempt.json.tmp', 'last_run.json.tmp')
             sync_backups = ('sync.log.1', 'sync.log.2', 'sync.log.3')
             log_names = ['agent.out.log', 'agent.err.log']
@@ -187,7 +187,7 @@ def collect():
                             break
                         continue
                     access = os.W_OK if name in runtime_names else 0
-                    if name in readwrite_logs:
+                    if name in readwrite_logs or name == 'sync.sqlite3':
                         access = os.R_OK | os.W_OK
                     if not stat.S_ISREG(mode) or (access and not os.access(path, access)):
                         invalid_file = name

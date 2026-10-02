@@ -98,7 +98,7 @@ class DoctorTests(unittest.TestCase):
         for path in [self.root, *self.root.rglob('*')]:
             mode = path.stat(follow_symlinks=False).st_mode
             result[str(path.relative_to(self.root))] = (
-                stat.S_IMODE(mode), path.read_bytes() if stat.S_ISREG(mode) else None)
+                stat.S_IMODE(mode), path.read_bytes() if stat.S_ISREG(mode) and path.suffix != '.sqlite3' else None)
         return result
 
     def invoke(self, *arguments):
@@ -116,6 +116,8 @@ class DoctorTests(unittest.TestCase):
         def read_without_tokens(path, *args, **kwargs):
             if self.tokens in path.parents:
                 raise AssertionError('token content read')
+            if path.suffix == '.sqlite3':
+                raise AssertionError('database content read')
             if path.parent == self.state and re.fullmatch(r'agent\.(?:out|err)\.log(?:\.[0-9]+)?', path.name):
                 raise AssertionError('background log content read')
             return original_read(path, *args, **kwargs)
@@ -124,6 +126,8 @@ class DoctorTests(unittest.TestCase):
             path = Path(path)
             if mode not in ('r', 'rb') or path == self.tokens or self.tokens in path.parents:
                 raise AssertionError('unsafe local file access')
+            if path.suffix == '.sqlite3':
+                raise AssertionError('database content read')
             if path.parent == self.state and re.fullmatch(r'agent\.(?:out|err)\.log(?:\.[0-9]+)?', path.name):
                 raise AssertionError('background log content read')
             return original_open(path, mode, *args, **kwargs)
@@ -392,6 +396,110 @@ finally:
                         self.assertEqual(checks['last_agent_attempt']['status'], 'info')
                     finally:
                         path.unlink() if kind == 'fifo' else path.rmdir()
+
+    def test_database_metadata_diagnoses_real_cli_type_and_permission_failures(self):
+        script = '''import contextlib, io, json, os, pathlib, socket, sys
+from unittest.mock import patch
+sys.path[:0] = [sys.argv[1], str(pathlib.Path(sys.argv[1]) / 'tests')]
+from test_diagnostics import DoctorTests, SECRET
+from test_reconciliation import row
+import health_garmin as h
+fixture = DoctorTests()
+fixture.setUp()
+try:
+    kind = sys.argv[2]
+    database = fixture.state / 'sync.sqlite3'
+    if kind != 'missing':
+        connection = h.database()
+        connection.close()
+    if kind in ('symlink', 'directory', 'fifo'):
+        outside = fixture.root / 'outside.sqlite3'
+        database.rename(outside)
+        if kind == 'symlink':
+            database.symlink_to(outside)
+        elif kind == 'directory':
+            database.mkdir()
+        else:
+            os.mkfifo(database, 0o600)
+    elif kind in ('readonly', 'writeonly'):
+        database.chmod(0o400 if kind == 'readonly' else 0o200)
+    native_open, native_connect = pathlib.Path.open, h.sqlite3.connect
+    def file_open(path, *args, **kwargs):
+        if path.suffix == '.sqlite3':
+            raise AssertionError('database content read as file')
+        return native_open(path, *args, **kwargs)
+    def connect(path, *args, **kwargs):
+        if pathlib.Path(path) != database or database.is_symlink():
+            raise AssertionError('outside SQLite connection')
+        return native_connect(path, *args, **kwargs)
+    def forbidden(*args, **kwargs):
+        raise AssertionError('unexpected network/service/mutation')
+    socket.create_connection = socket.getaddrinfo = forbidden
+    socket.socket.connect = socket.socket.connect_ex = forbidden
+    h.manage_agent = forbidden
+    calls = {'api': 0, 'get': 0, 'post': 0, 'delete': 0}
+    class API:
+        def get_body_composition(self, start, end):
+            calls['get'] += 1
+            return {'dateWeightList': [row(h.load_measurements(h.config())[1][0])]}
+        def add_body_composition(self, *args, **kwargs):
+            calls['post'] += 1
+            return forbidden()
+        add_weigh_in = add_body_composition
+        def delete_weigh_in(self, *args, **kwargs):
+            calls['delete'] += 1
+            return forbidden()
+    def client(*args, **kwargs):
+        calls['api'] += 1
+        return API()
+    source, token = fixture.export.read_bytes(), (fixture.tokens / 'oauth.json').read_bytes()
+    expected = 0 if kind in ('missing', 'normal') else 2
+    with patch.object(pathlib.Path, 'open', file_open), patch.object(h.sqlite3, 'connect', connect):
+        code, _, checks = fixture.report()
+        fixture.assertEqual(code, expected)
+        fixture.assertEqual(checks['state']['status'], 'info' if expected == 0 else 'error')
+        fixture.assertEqual(checks['last_run']['status'], 'info')
+        fixture.assertEqual(checks['last_agent_attempt']['status'], 'info')
+        text_code, text = fixture.invoke('doctor')
+        fixture.assertEqual(text_code, expected)
+        if expected:
+            fixture.assertIn('state/sync.sqlite3', text)
+        h.api_client = client
+        sys.argv = ['hg', 'run']
+        output, errors = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
+            fixture.assertEqual(h.main(), expected)
+        fixture.assertNotIn(SECRET, errors.getvalue())
+        fixture.assertEqual(fixture.report()[0], expected)
+    expected_calls = 1 if kind in ('missing', 'normal', 'readonly') else 0
+    fixture.assertEqual(calls, {'api': expected_calls, 'get': expected_calls, 'post': 0, 'delete': 0})
+    attempt = json.loads((fixture.state / 'last_attempt.json').read_text())
+    fixture.assertEqual(attempt['outcome'], 'completed' if expected == 0 else 'failed')
+    fixture.assertEqual(fixture.export.read_bytes(), source)
+    fixture.assertEqual((fixture.tokens / 'oauth.json').read_bytes(), token)
+finally:
+    fixture.doCleanups()
+'''
+        for kind in ('missing', 'normal', 'symlink', 'directory', 'fifo', 'readonly', 'writeonly'):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as isolated:
+                child = subprocess.Popen([sys.executable, '-B', '-c', script,
+                    str(Path(__file__).resolve().parents[1]), kind], cwd=isolated,
+                    env={'HOME': isolated, 'TMPDIR': isolated}, stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE, text=True)
+                try:
+                    try:
+                        stdout, stderr = child.communicate(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        child.kill()
+                        child.communicate(timeout=2)
+                        self.fail('database path blocked the command')
+                    self.assertEqual(child.returncode, 0, stdout + stderr)
+                finally:
+                    if child.poll() is None:
+                        child.kill()
+                    child.communicate(timeout=2)
+                    for pipe in (child.stdout, child.stderr):
+                        pipe.close()
 
     def test_healthy_setup_returns_parseable_safe_report_and_only_queries_service(self):
         result, report, checks = self.report()
