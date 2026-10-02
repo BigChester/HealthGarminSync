@@ -5,7 +5,7 @@ from datetime import timedelta
 import io
 import json
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch, seal
 import unittest
 
 import health_garmin as h
@@ -23,6 +23,93 @@ class BulkReplacementTests(unittest.TestCase):
         args = argparse.Namespace(plan=str(path), complete_export=complete)
         with patch('builtins.input', return_value=answer), contextlib.redirect_stdout(io.StringIO()):
             bulk.execute(args, self.cfg, api)
+
+    def detailed_api(self, backend):
+        raw = Mock(spec_set=['get_weigh_ins', 'get_daily_weigh_ins', 'add_body_composition',
+                             'add_weigh_in', 'delete_weigh_in'])
+        def summaries(start, end):
+            rows = backend.get_body_composition(start, end)['dateWeightList']
+            days = {}
+            for item in rows:
+                days.setdefault(item['calendarDate'], []).append(item)
+            return {'dailyWeightSummaries': [
+                {'summaryDate': day, 'numOfWeightEntries': len(items), 'allWeightMetrics': items}
+                for day, items in sorted(days.items())
+            ]}
+        raw.get_weigh_ins.side_effect = summaries
+        raw.get_daily_weigh_ins.side_effect = lambda day: backend.get_body_composition(day, day)
+        raw.add_body_composition.side_effect = backend.add_body_composition
+        raw.add_weigh_in.side_effect = backend.add_weigh_in
+        raw.delete_weigh_in.side_effect = backend.delete_weigh_in
+        seal(raw)
+        return h.GarminMeasurementAPI(raw)
+
+    def test_delete_readback_unknown_or_same_normalized_id_stops_entire_batch(self):
+        original = h.Measurement(self.r.at + timedelta(hours=1), 74, None, 'PICOOC')
+        untouched = row(h.Measurement(self.r.at + timedelta(hours=2), 75, None, 'PICOOC'), 101)
+        source = (self.inbox / 'health.json').read_bytes()
+        for number, replacement_id in enumerate((None, 'invalid-id', '00100')):
+            with self.subTest(readback_id=replacement_id), patch.object(h, 'STATE', self.state / str(number)):
+                h.private_dir(h.STATE)
+                token = h.STATE / 'tokens' / 'synthetic.json'
+                h.write_json(token, {'synthetic': 'private-cache'})
+                token_bytes = token.read_bytes()
+                backend = API([row(original, 100), untouched])
+                delete = backend.delete_weigh_in
+                def incomplete_identity(pk, day):
+                    if pk == '100':
+                        backend.deletes.append((pk, day))
+                        backend.rows[0]['samplePk'] = replacement_id
+                    else:
+                        delete(pk, day)
+                backend.delete_weigh_in = incomplete_identity
+                api = self.detailed_api(backend)
+                with contextlib.closing(h.database()) as db:
+                    obj = h.fetch_remote_snapshot(api, self.r.at.date(), self.r.at.date())
+                    path = h.save_comparison(h.comparison_plan(db, [self.r], obj,
+                        self.r.at.date(), self.r.at.date()), self.cfg)
+                    with (patch.object(h, 'api_client', side_effect=AssertionError('No login')),
+                          patch('socket.create_connection', side_effect=AssertionError('No network')),
+                          patch('subprocess.run', side_effect=AssertionError('No service')),
+                          patch.object(Path, 'home', side_effect=AssertionError('No real home'))):
+                        with self.assertRaises(h.SafeError):
+                            self.invoke(api, path)
+                    self.assertEqual(backend.deletes, [('100', original.at.date().isoformat())])
+                    self.assertFalse(backend.posts)
+                    self.assertEqual(backend.rows[1], untouched)
+                    self.assertIsNone(h.state_row(db, self.r))
+                job = h.read_operation(next((h.STATE / 'operations').glob('full-*.json')))
+                self.assertEqual(job['phase'], 'uncertain')
+                self.assertEqual([(event['kind'], event['id']) for event in job['events']],
+                                 [('delete_intent', '100')])
+                self.assertEqual((self.inbox / 'health.json').read_bytes(), source)
+                self.assertEqual((Path(job['backup']) / 'exports' / 'health.json').read_bytes(), source)
+                self.assertEqual(token.read_bytes(), token_bytes)
+
+    def test_complete_delete_readback_allows_remaining_deletes_and_one_upload(self):
+        extras = [row(h.Measurement(self.r.at + timedelta(hours=n), 73 + n, None, 'PICOOC'), 99 + n)
+                  for n in (1, 2)]
+        backend = API(extras)
+        api = self.detailed_api(backend)
+        source = (self.inbox / 'health.json').read_bytes()
+        token = self.state / 'tokens' / 'synthetic.json'
+        h.write_json(token, {'synthetic': 'private-cache'})
+        token_bytes = token.read_bytes()
+        obj = h.fetch_remote_snapshot(api, self.r.at.date(), self.r.at.date())
+        path = h.save_comparison(h.comparison_plan(self.db, [self.r], obj,
+            self.r.at.date(), self.r.at.date()), self.cfg)
+        self.invoke(api, path)
+        self.assertEqual(backend.deletes, [('100', self.r.at.date().isoformat()),
+                                          ('101', self.r.at.date().isoformat())])
+        self.assertEqual(len(backend.posts), 1)
+        self.assertEqual(h.get_status(self.db, self.r), 'verified')
+        job = h.read_operation(next((self.state / 'operations').glob('full-*.json')))
+        self.assertEqual(job['phase'], 'verified')
+        self.assertEqual([event['kind'] for event in job['events']],
+                         ['delete_intent', 'delete_verified', 'delete_intent', 'delete_verified',
+                          'upload_intent', 'upload_verified'])
+        self.assertEqual((self.inbox / 'health.json').read_bytes(), source)
+        self.assertEqual(token.read_bytes(), token_bytes)
 
     def test_full_replacement_preserves_match_removes_near_conflict_and_extra(self):
         first = self.r
