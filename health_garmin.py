@@ -802,6 +802,34 @@ def active_operations() -> set[str]:
     return active
 
 
+def unknown_request_context(db: sqlite3.Connection) -> list[tuple[str, datetime, str]]:
+    """Keep unknown writes associated with their time when an export renames a source."""
+    context = []
+    for row in db.execute("SELECT record_id,payload FROM uploads WHERE status IN ('inflight','uncertain','repair_uncertain')"):
+        payload = json.loads(row["payload"])
+        context.append((row["record_id"], aware(payload["at"]), "未确定测量 " + row["record_id"]))
+    for path in (STATE / "operations").glob("*.json"):
+        if path.is_symlink():
+            raise SafeError("操作记录不能是符号链接。")
+        journal = json.loads(read_regular_text(path))
+        if journal.get("phase") in ("verified", "deleted_verified", "closed_partial"):
+            continue
+        payloads = (journal.get("targets", []) if journal.get("type") == "full_replacement"
+                    else [journal.get("measurement") or journal.get("replacement")])
+        for payload in payloads:
+            if payload:
+                record = Measurement(**{**payload, "at": aware(payload["at"])})
+                context.append((record.key, record.at, "未完成操作 " + path.name + "；测量 " + record.key))
+    return context
+
+
+def unknown_source_alias(r: Measurement, context: list[tuple[str, datetime, str]]) -> str | None:
+    for key, at, detail in context:
+        if key != r.key and abs((r.at - at).total_seconds()) <= 1:
+            return detail + " 与当前测量时间重叠；来源修订不能授权重复提交"
+    return None
+
+
 def fetch_remote_snapshot(api: Any, start: date, end: date) -> dict[str, Any]:
     """Fetch all chunks before any write; pad dates for UTC/local midnight boundaries."""
     cursor, final = start - timedelta(days=1), end + timedelta(days=1)
@@ -830,6 +858,7 @@ def comparison_plan(db: sqlite3.Connection, records: list[Measurement], obj: Any
     index = RemoteIndex(obj)
     entries, claimed, owners = [], set(), {}
     active = active_operations()
+    unknown = unknown_request_context(db)
     for r in records:
         kind, candidates, reason = index.decide(r)
         # A unique exact row does not own unrelated measurements in its minute.
@@ -842,6 +871,8 @@ def comparison_plan(db: sqlite3.Connection, records: list[Measurement], obj: Any
             action, reason = "ignored", "用户已明确忽略"
         elif kind != "matched" and (status in ("inflight", "uncertain", "repair_uncertain") or r.key in active):
             action, reason = "uncertain", "之前的请求结果未确定，只读核对，不重复提交"
+        elif kind != "matched" and (alias := unknown_source_alias(r, unknown)):
+            action, reason = "uncertain", alias
         elif kind == "missing" and status in ("verified", "verified_manual", "verified_conflict", "remote_missing"):
             action, reason = "review_missing", "以前已验证的记录远端缺失；核对后用 resolve --absent 允许补传"
         entry = {"id": r.key, "action": action, "reason": reason, "local_status": status,
@@ -1472,6 +1503,9 @@ def process_record(api: Any, db: sqlite3.Connection, r: Measurement, sleep=time.
     if not reviewed and r.key in active_operations():
         persist("repair_uncertain", "Unfinished reviewed operation; verify or explicitly resume its journal")
         return "repair_uncertain"
+    if not reviewed and (alias := unknown_source_alias(r, unknown_request_context(db))):
+        print(alias)
+        return "uncertain"  # Do not create another unknown marker for a request never sent.
     if previous in ("inflight", "uncertain", "repair_uncertain"):
         # Never blindly re-POST an uncertain write, even when an immediate read is empty.
         persist("uncertain", "Awaiting remote visibility or explicit manual resolution")
@@ -1891,6 +1925,8 @@ def resolve_record(args: argparse.Namespace) -> None:
         elif args.absent:
             if r.key in active_operations():
                 raise SafeError("此测量有未完成的修复操作，请使用 verify-operation 或 resume-operation 保留备份字段。")
+            if alias := unknown_source_alias(r, unknown_request_context(db)):
+                raise SafeError(alias + "；请先核对旧测量或操作。")
             if row["status"] in ("verified", "verified_manual"):
                 raise SafeError("已验证记录不开放自动重置，避免误重复。")
             if input("确认 Garmin 未收到该记录，允许下一次尝试上传，输入 ABSENT：").strip() == "ABSENT":

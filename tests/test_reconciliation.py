@@ -506,6 +506,185 @@ class ReconciliationTests(unittest.TestCase):
         self.assertEqual((len(backend.posts), len(backend.deletes)), (1, 1))
         return api, backend, journal
 
+    def test_unknown_automatic_upload_survives_source_and_value_revisions(self):
+        self.cfg['allowed_sources'] = ['PICOOC', 'OTHER']
+        token = self.state / 'synthetic-token'
+        token.write_bytes(b'unchanged local token')
+        for error, offset, changed, allowed, resolved in ((TimeoutError, 0, False, False, None),
+                (KeyboardInterrupt, 1, True, False, None), (TimeoutError, 1.000001, True, True, None),
+                (TimeoutError, 0, True, True, 'pending'), (TimeoutError, 0, False, True, 'verified_manual'),
+                (TimeoutError, 0, False, True, 'verified')):
+            with self.subTest(error=error.__name__, offset=offset, resolved=resolved):
+                self.db.execute('DELETE FROM uploads'); self.db.commit()
+                (self.state / 'last_sync_comparison.json').unlink(missing_ok=True)
+                self.write_export([self.r])
+                backend = API(); backend.visible = False
+                api = self.native_deletion_api(backend, fail_at=None)
+                native_post = backend.add_body_composition
+                def accepted_timeout(**kw):
+                    native_post(**kw)
+                    raise error('synthetic accepted upload')
+                api.api.add_body_composition.side_effect = accepted_timeout
+                if error is KeyboardInterrupt:
+                    with self.assertRaises(KeyboardInterrupt):
+                        self.sync(api)
+                else:
+                    self.sync(api)
+                self.assertEqual(h.get_status(self.db, self.r), 'inflight' if error is KeyboardInterrupt else 'uncertain')
+                if resolved == 'verified':
+                    backend.rows = [row(self.r, 201)]
+                    self.sync(api)
+                elif resolved:
+                    with patch('builtins.input', return_value='ABSENT' if resolved == 'pending' else 'PRESENT'), \
+                            contextlib.redirect_stdout(io.StringIO()):
+                        h.resolve_record(argparse.Namespace(record_id=self.r.key,
+                            present=resolved == 'verified_manual', absent=resolved == 'pending', ignore=False))
+                    if resolved == 'verified_manual':
+                        backend.rows = [row(self.r, 201)]
+                old = dict(h.state_row(self.db, self.r))
+                if resolved:
+                    self.assertEqual(old['status'], resolved)
+                current = h.Measurement((AT + timedelta(seconds=offset)).astimezone(h.UTC),
+                                        72 if changed else 70, 24 if changed else 23.5,
+                                        'OTHER', 22 if changed else None)
+                self.write_export([current])
+                source = (self.inbox / 'health.json').read_bytes()
+                self.assertEqual(h.load_measurements(self.cfg)[1], [current])
+                api.api.add_body_composition.side_effect = native_post
+                backend.visible = True
+                self.sync(api)
+                summary = json.loads((self.state / 'last_run.json').read_text())
+                readonly = resolved in ('verified', 'verified_manual')
+                self.assertEqual(len(backend.posts), 2 if allowed and not readonly else 1)
+                self.assertFalse(backend.deletes)
+                self.assertEqual(dict(h.state_row(self.db, self.r)), old)
+                if allowed:
+                    self.assertEqual(h.get_status(self.db, current), 'verified')
+                else:
+                    self.assertIsNone(h.state_row(self.db, current))
+                    self.assertEqual(summary['results'][current.key], 'uncertain')
+                    plan = json.loads((self.state / 'plans' / 'sync-latest.json').read_text())
+                    self.assertIn(self.r.key, plan['entries'][0]['reason'])
+                    # A delayed matching read may complete the current alias without another POST.
+                    backend.rows = [row(current, 201)]
+                    self.sync(api)
+                    self.assertEqual(h.get_status(self.db, current), 'verified')
+                    self.assertEqual(len(backend.posts), 1)
+                self.assertEqual((self.inbox / 'health.json').read_bytes(), source)
+                self.assertEqual(token.read_bytes(), b'unchanged local token')
+
+    def test_unfinished_reviewed_targets_protect_source_aliases_without_unknown_database_rows(self):
+        import replace_history as bulk
+        self.cfg['allowed_sources'] = ['PICOOC', 'OTHER']
+        token = self.state / 'synthetic-token'
+        token.write_bytes(b'unchanged local token')
+        for kind in ('single', 'single_marker', 'legacy_replacement', 'full'):
+            with self.subTest(kind=kind):
+                self.db.execute('DELETE FROM uploads'); self.db.commit()
+                for journal in (self.state / 'operations').glob('*.json'):
+                    journal.unlink()
+                (self.state / 'last_sync_comparison.json').unlink(missing_ok=True)
+                self.write_export([self.r])
+                backend = API([dict(row(self.r), bodyFat=None)])
+                api = self.native_deletion_api(backend, fail_at=1)
+                plan = self.deletion_plan(api)
+                native_write = h.write_json
+                def legacy_write(path, value):
+                    if kind == 'legacy_replacement' and path.parent.name == 'operations':
+                        value = {key: item for key, item in value.items() if key != 'measurement'}
+                    native_write(path, value)
+                with patch.object(h, 'write_json', side_effect=legacy_write), self.assertRaises(h.SafeError):
+                    if kind == 'full':
+                        with patch('builtins.input', return_value='REPLACE ALL'), contextlib.redirect_stdout(io.StringIO()):
+                            bulk.execute(argparse.Namespace(plan=str(plan), complete_export=True), self.cfg, api)
+                    else:
+                        self.reviewed(api, plan)
+                journal = next((self.state / 'operations').glob('*.json'))
+                self.assertEqual(h.read_operation(journal)['phase'], 'uncertain')
+                if kind == 'single_marker':
+                    self.assertEqual(h.get_status(self.db, self.r), 'repair_uncertain')
+                elif kind != 'full':
+                    # An explicit local PRESENT decision does not finish a reviewed journal.
+                    with patch('builtins.input', return_value='PRESENT'), contextlib.redirect_stdout(io.StringIO()):
+                        h.resolve_record(argparse.Namespace(record_id=self.r.key, present=True, absent=False, ignore=False))
+                    self.assertEqual(h.get_status(self.db, self.r), 'verified_manual')
+                else:
+                    self.assertIsNone(h.state_row(self.db, self.r))
+                journal_bytes = journal.read_bytes()
+                backup = Path(h.read_operation(journal)['backup'])
+                backup_bytes = {p.name: p.read_bytes() for p in backup.glob('*.json')}
+                backend.rows = []  # A delayed DELETE became visible; its unknown operation remains active.
+                current = h.Measurement(AT, 72, 24, 'OTHER', 22)
+                self.write_export([current])
+                source = (self.inbox / 'health.json').read_bytes()
+                self.assertEqual(h.load_measurements(self.cfg)[1], [current])
+                for _ in range(2):
+                    self.sync(api)
+                    summary = json.loads((self.state / 'last_run.json').read_text())
+                    self.assertEqual(summary['results'][current.key], 'uncertain')
+                    self.assertIsNone(h.state_row(self.db, current))
+                plan_obj = json.loads((self.state / 'plans' / 'sync-latest.json').read_text())
+                self.assertIn(self.r.key if kind == 'single_marker' else journal.name, plan_obj['entries'][0]['reason'])
+                self.assertEqual((len(backend.posts), len(backend.deletes)), (0, 1))
+                backend.rows = [row(current, 201)]
+                self.sync(api)
+                self.assertEqual(h.get_status(self.db, current), 'verified')
+                self.assertEqual((len(backend.posts), len(backend.deletes)), (0, 1))
+                self.assertEqual(journal.read_bytes(), journal_bytes)
+                self.assertEqual({p.name: p.read_bytes() for p in backup.glob('*.json')}, backup_bytes)
+                self.assertEqual((self.inbox / 'health.json').read_bytes(), source)
+                self.assertEqual(token.read_bytes(), b'unchanged local token')
+
+    def test_alias_absence_resolution_waits_for_original_unknown_request(self):
+        self.cfg['allowed_sources'] = ['PICOOC', 'OTHER']
+        current = h.Measurement(AT, 72, 24, 'OTHER', 22)
+        self.write_export([current])
+        backend = API([row(h.Measurement(AT, 71, 24, 'PICOOC'))])
+        api = self.native_deletion_api(backend, fail_at=None)
+        self.sync(api)
+        self.assertEqual(h.get_status(self.db, current), 'conflict')
+        current_row = dict(h.state_row(self.db, current))
+        self.write_export([self.r])
+        backend.rows = [dict(row(self.r), bodyFat=None)]
+        backend.visible = False
+        native_post = backend.add_body_composition
+        def accepted_timeout(**kw):
+            native_post(**kw)
+            raise TimeoutError('synthetic accepted upload')
+        api.api.add_body_composition.side_effect = accepted_timeout
+        with self.assertRaises(h.SafeError):
+            self.reviewed(api, self.deletion_plan(api))
+        journal = next((self.state / 'operations').glob('*.json'))
+        journal_bytes = journal.read_bytes()
+        self.write_export([current])
+        source = (self.inbox / 'health.json').read_bytes()
+        token = self.state / 'synthetic-token'; token.write_bytes(b'unchanged local token')
+        self.sync(api)
+        self.assertEqual(dict(h.state_row(self.db, current)), current_row)
+        args = argparse.Namespace(record_id=current.key, present=False, absent=True, ignore=False)
+        with patch('builtins.input') as prompt, contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaisesRegex(h.SafeError, self.r.key):
+                h.resolve_record(args)
+        prompt.assert_not_called()
+        self.assertEqual(dict(h.state_row(self.db, current)), current_row)
+        self.assertEqual(journal.read_bytes(), journal_bytes)
+        self.assertEqual((len(backend.posts), len(backend.deletes)), (1, 1))
+        # A successful historical check releases the active protection, without changing this alias.
+        backend.rows = [row(self.r, 201)]
+        with patch.object(h, 'api_client', return_value=api), contextlib.redirect_stdout(io.StringIO()):
+            self.assertTrue(h.verify_operation(argparse.Namespace(operation=str(journal))))
+        backend.rows = []
+        with patch('builtins.input', return_value='ABSENT'), contextlib.redirect_stdout(io.StringIO()):
+            h.resolve_record(args)
+        self.assertEqual(h.get_status(self.db, current), 'pending')
+        backend.visible = True
+        api.api.add_body_composition.side_effect = native_post
+        self.sync(api)
+        self.assertEqual(h.get_status(self.db, current), 'verified')
+        self.assertEqual((len(backend.posts), len(backend.deletes)), (2, 1))
+        self.assertEqual((self.inbox / 'health.json').read_bytes(), source)
+        self.assertEqual(token.read_bytes(), b'unchanged local token')
+
     def test_old_matched_operations_preserve_current_export_revisions_and_ignore_choice(self):
         token = self.state / 'synthetic-token'
         token.write_bytes(b'unchanged local token')
