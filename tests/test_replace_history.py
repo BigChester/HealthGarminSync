@@ -20,6 +20,7 @@ class BulkReplacementTests(unittest.TestCase):
     tearDown = fixtures.ReconciliationTests.tearDown
     write_export = fixtures.ReconciliationTests.write_export
     plan = fixtures.ReconciliationTests.plan
+    native_deletion_api = fixtures.ReconciliationTests.native_deletion_api
     def invoke(self, api, path, answer='REPLACE ALL', complete=True):
         args = argparse.Namespace(plan=str(path), complete_export=complete)
         with patch('builtins.input', return_value=answer), contextlib.redirect_stdout(io.StringIO()):
@@ -301,6 +302,85 @@ class BulkReplacementTests(unittest.TestCase):
         scoped = bulk.TargetAPI(api, self.r, [self.r])
         self.assertEqual(h.classify_remote(self.r, h.remote_for(scoped, self.r)), 'conflict')
         self.assertFalse(api.posts)
+
+    def paused_two_day_batch(self):
+        other = h.Measurement(self.r.at + timedelta(days=1), 71, 24, 'PICOOC')
+        records = [self.r, other]
+        self.write_export(records)
+        backend = API([dict(row(self.r, 100), bodyFat=None), dict(row(other, 101), bodyFat=None)])
+        api = self.native_deletion_api(backend, fail_at=None)
+        native_get, stopped = backend.get_body_composition, False
+        def fail_next_day(start, end):
+            nonlocal stopped
+            if start == end == other.at.date().isoformat() and backend.posts and not stopped:
+                stopped = True
+                raise TimeoutError('synthetic day-two interruption')
+            return native_get(start, end)
+        backend.get_body_composition = fail_next_day
+        obj = h.fetch_remote_snapshot(api, self.r.at.date(), other.at.date())
+        plan = h.save_comparison(h.comparison_plan(self.db, records, obj,
+                                 self.r.at.date(), other.at.date()), self.cfg)
+        with self.assertRaises(h.SafeError):
+            self.invoke(api, plan)
+        journal = next((h.STATE / 'operations').glob('full-*.json'))
+        self.assertEqual(h.read_operation(journal)['phase'], 'uncertain')
+        self.assertEqual(len(backend.deletes), 1)
+        self.assertEqual(len(backend.posts), 1)
+        return api, backend, journal, other
+
+    def test_partial_close_normalizes_only_known_ids_and_preserves_other_evidence(self):
+        for case in ('integer', 'string', 'leading_zero', 'anonymous_upload', 'weight', 'date',
+                     'unknown_id', 'invalid_id', 'body_fat', 'extra'):
+            with self.subTest(case=case), patch.object(h, 'STATE', self.state / case):
+                h.private_dir(h.STATE)
+                api, backend, journal, other = self.paused_two_day_batch()
+                original_job = h.read_operation(journal)
+                journal_bytes = journal.read_bytes()
+                backup = Path(original_job['backup']) / 'remote-before.json'
+                backup_bytes = backup.read_bytes()
+                source = (self.inbox / 'health.json').read_bytes()
+                token = h.STATE / 'tokens' / 'synthetic'
+                h.private_dir(token.parent)
+                token.write_bytes(b'synthetic private token')
+                untouched = next(item for item in backend.rows if item['samplePk'] == 101)
+                if case == 'string':
+                    untouched['samplePk'] = '101'
+                elif case == 'leading_zero':
+                    untouched['samplePk'] = '00101'
+                elif case == 'anonymous_upload':
+                    next(item for item in backend.rows if item['samplePk'] == 201)['samplePk'] = None
+                elif case == 'weight':
+                    untouched.update(samplePk='00101', weight=72000)
+                elif case == 'date':
+                    untouched.update(samplePk='00101', calendarDate=self.r.at.date().isoformat())
+                elif case == 'unknown_id':
+                    untouched['samplePk'] = None
+                elif case == 'invalid_id':
+                    untouched['samplePk'] = 101.0
+                elif case == 'body_fat':
+                    untouched.update(samplePk='00101', bodyFat=22)
+                elif case == 'extra':
+                    backend.rows.append(row(h.Measurement(other.at + timedelta(hours=2), 75, None, 'PICOOC'), 102))
+                remote_before_check = json.loads(json.dumps(backend.rows))
+                with contextlib.redirect_stdout(io.StringIO()):
+                    if case in ('integer', 'string', 'leading_zero', 'anonymous_upload'):
+                        result = bulk.close_verified_partial(journal, dict(self.cfg, enabled=False), api)
+                        self.assertCountEqual(result['dateWeightList'], remote_before_check)
+                        updated = h.read_operation(journal)
+                        self.assertEqual(updated['phase'], 'closed_partial')
+                        for key, value in original_job.items():
+                            if key != 'phase':
+                                self.assertEqual(updated[key], value)
+                    else:
+                        with self.assertRaises(h.SafeError):
+                            bulk.close_verified_partial(journal, dict(self.cfg, enabled=False), api)
+                        self.assertEqual(journal.read_bytes(), journal_bytes)
+                self.assertEqual(len(backend.deletes), 1)
+                self.assertEqual(len(backend.posts), 1)
+                self.assertEqual(backend.rows, remote_before_check)
+                self.assertEqual(backup.read_bytes(), backup_bytes)
+                self.assertEqual((self.inbox / 'health.json').read_bytes(), source)
+                self.assertEqual(token.read_bytes(), b'synthetic private token')
 
     def test_partial_close_refuses_any_unverified_upload_intent(self):
         path = self.state / 'operations' / 'full-test.json'

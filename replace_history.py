@@ -79,8 +79,20 @@ def close_verified_partial(path, cfg, api):
             raise h.SafeError('此前上传无法读回匹配，不能关闭批次。')
         added.add(indices[0])
     before = json.loads(h.read_regular_text(Path(job['backup']) / 'remote-before.json'))
-    untouched = [r for r in before['dateWeightList'] if str(r['samplePk']) not in removed]
-    remaining = [r for i, r in enumerate(index.rows) if i not in added]
+    def canonical_rows(rows):
+        normalized = []
+        for row in rows:
+            pk = h.canonical_remote_id(row.get('samplePk'))
+            normalized.append({**row, 'samplePk': pk} if pk is not None else row)
+        return normalized
+    removed_ids = {h.canonical_remote_id(pk) for pk in removed}
+    if None in removed_ids:
+        raise h.SafeError('删除记录 ID 无法可靠核对，不能关闭批次。')
+    current = canonical_rows(index.rows)
+    untouched = [r for r in canonical_rows(before['dateWeightList'])
+                 if h.canonical_remote_id(r.get('samplePk')) not in removed_ids]
+    remaining_raw = [r for i, r in enumerate(index.rows) if i not in added]
+    remaining = [r for i, r in enumerate(current) if i not in added]
     # Older versions backed up dateRange's last-per-day response. A paused batch
     # that has deleted nothing may supplement those rows with earlier same-day
     # details, while keeping the original evidence intact.
@@ -93,9 +105,9 @@ def close_verified_partial(path, cfg, api):
         older_same_day = all(r['calendarDate'] in prior_by_day and h.remote_time(r) < h.remote_time(prior_by_day[r['calendarDate']]) for r in hidden)
         if old_intact and hidden and older_same_day:
             h.write_json(Path(job['backup']) / 'remote-before-details-reconstructed.json',
-                         {'dateWeightList': remaining, 'basis': 'Original summary rows intact; only earlier same-day details supplemented; no deletions issued'})
+                         {'dateWeightList': remaining_raw, 'basis': 'Original summary rows intact; only earlier same-day details supplemented; no deletions issued'})
             untouched = remaining
-    if any(str(r['samplePk']) in removed for r in index.rows) or signature(untouched) != signature(remaining):
+    if any(h.canonical_remote_id(r.get('samplePk')) in removed_ids for r in current) or signature(untouched) != signature(remaining):
         raise h.SafeError('远端出现意外变化，不能关闭批次。')
     job['phase'] = 'closed_partial'
     job['closed_at'] = h.now().isoformat()
