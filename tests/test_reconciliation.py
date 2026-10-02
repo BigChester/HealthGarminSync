@@ -341,8 +341,8 @@ class ReconciliationTests(unittest.TestCase):
                     h.fetch_remote_snapshot(api, AT.date(), AT.date()), AT.date(), AT.date())
                 path = h.save_comparison(plan, self.cfg)
                 durable = []
-                def inspect_commit(db, record, status, detail=''):
-                    save(db, record, status, detail)
+                def inspect_commit(db, record, status, detail='', **kwargs):
+                    save(db, record, status, detail, **kwargs)
                     with contextlib.closing(h.sqlite3.connect(self.state / 'sync.sqlite3')) as reader:
                         core, payload, stored_status = reader.execute(
                             'SELECT core,payload,status FROM uploads WHERE record_id=?', (self.r.key,)).fetchone()
@@ -414,8 +414,8 @@ class ReconciliationTests(unittest.TestCase):
                 api = self.detailed_api(backend)
                 plan = self.deletion_plan(api)
                 durable = []
-                def inspect_commit(db, record, status, detail=''):
-                    save(db, record, status, detail)
+                def inspect_commit(db, record, status, detail='', **kwargs):
+                    save(db, record, status, detail, **kwargs)
                     with contextlib.closing(h.sqlite3.connect(self.state / 'sync.sqlite3')) as reader:
                         core, payload, stored_status = reader.execute(
                             'SELECT core,payload,status FROM uploads WHERE record_id=?', (self.r.key,)).fetchone()
@@ -511,7 +511,7 @@ class ReconciliationTests(unittest.TestCase):
         token = self.state / 'synthetic-token'
         token.write_bytes(b'unchanged local token')
         for error, offset, changed, allowed, resolved in ((TimeoutError, 0, False, False, None),
-                (KeyboardInterrupt, 1, True, False, None), (TimeoutError, 1.000001, True, True, None),
+                (KeyboardInterrupt, 1, True, False, None), (TimeoutError, 2.000001, True, True, None),
                 (TimeoutError, 0, True, True, 'pending'), (TimeoutError, 0, False, True, 'verified_manual'),
                 (TimeoutError, 0, False, True, 'verified')):
             with self.subTest(error=error.__name__, offset=offset, resolved=resolved):
@@ -572,6 +572,248 @@ class ReconciliationTests(unittest.TestCase):
                     self.assertEqual(len(backend.posts), 1)
                 self.assertEqual((self.inbox / 'health.json').read_bytes(), source)
                 self.assertEqual(token.read_bytes(), b'unchanged local token')
+
+    def test_reviewed_weight_only_identity_uses_actual_retained_fit_timestamp_for_unknown_guard(self):
+        import test_sdk_transport as transport
+        if not transport.PINNED_SDK:
+            self.skipTest('Requires the installed, pinned Garmin SDK')
+        sdk = transport.SDKTransportTests('runTest')
+        try:
+            sdk.setUp()
+            sdk.enterContext(patch('subprocess.run', side_effect=transport.forbidden))
+            sdk.cfg['allowed_sources'] = ['PICOOC', 'OTHER']
+            old = h.Measurement(AT + timedelta(seconds=1.500001), 70, None, 'PICOOC', lbm=53.55)
+            candidate = h.Measurement(AT, 72, None, 'OTHER', lbm=54)
+            original = row(h.Measurement(old.at, 71, 23.5, 'PICOOC', 22))
+            sdk.rows = [original]
+            # Establish an explicit permission for a different source before the older request becomes unknown.
+            self.write_export.__func__(sdk, [candidate])
+            with patch.object(h, 'api_client', return_value=sdk.api), contextlib.redirect_stdout(io.StringIO()):
+                h.run_sync(sdk.cfg)
+            self.assertEqual(h.get_status(sdk.db, candidate), 'conflict')
+            with patch('builtins.input', return_value='ABSENT'), contextlib.redirect_stdout(io.StringIO()):
+                h.resolve_record(argparse.Namespace(record_id=candidate.key, present=False, absent=True, ignore=False))
+            candidate_before = dict(h.state_row(sdk.db, candidate))
+            self.assertEqual(candidate_before['status'], 'pending')
+            self.write_export.__func__(sdk, [old])
+            self.assertEqual(h.load_measurements(sdk.cfg)[1], [old])
+            saved_source = (sdk.inbox / 'health.json').read_bytes()
+            plan = h.save_comparison(h.comparison_plan(sdk.db, [old], {'dateWeightList': [original]},
+                                                       old.at.date(), old.at.date()), sdk.cfg)
+            wire_times = []
+            def server(method, path, pool):
+                if method == 'DELETE':
+                    sdk.rows = []
+                    return 200, {'ok': True}
+                if method == 'POST':
+                    self.assertEqual(path, '/upload-service/upload')
+                    wire_times.append(transport.fit_weight_timestamp(sdk.fit_files[-1]))
+                    with contextlib.closing(h.database()) as independent:
+                        self.assertEqual(h.get_status(independent, old), 'inflight')
+                        wire_at = independent.execute('SELECT wire_at FROM request_times WHERE record_id=?', (old.key,)).fetchone()[0]
+                        self.assertEqual(h.aware(wire_at), wire_times[-1])
+                    raise sdk.urllib3.exceptions.ReadTimeoutError(pool, path, 'synthetic accepted hidden FIT upload')
+                self.assertEqual(method, 'GET')
+                return 200, sdk.read_payload(path)
+            sdk.handler = server
+            args = argparse.Namespace(plan=str(plan), record_id=old.key, remote_id='100', complete_export=True)
+            with (patch.object(h, 'api_client', return_value=sdk.api),
+                  patch('builtins.input', return_value='REPLACE ' + old.key), contextlib.redirect_stdout(io.StringIO())):
+                with self.assertRaises(h.SafeError):
+                    h.reviewed_operation(args, sdk.cfg)
+            self.assertEqual(wire_times, [AT.astimezone(h.UTC) + timedelta(seconds=1)])
+            self.assertGreater(abs((old.at - candidate.at).total_seconds()), 1)
+            self.assertEqual((sdk.fit_values[-1][1]['percent_fat'], sdk.fit_values[-1][1]['bmi']), (23.5, 22))
+            self.assertIsNone(sdk.fit_values[-1][1]['muscle_mass'])
+            journal_path = next((sdk.state / 'operations').glob('*.json'))
+            journal = h.read_operation(journal_path)
+            self.assertEqual(journal['measurement'], old.payload())
+            self.assertEqual((journal['replacement']['fat'], journal['replacement']['bmi']), (23.5, 22))
+            self.assertEqual(journal['phase'], 'uncertain')
+            old_before = dict(h.state_row(sdk.db, old))
+            self.assertEqual(old_before['status'], 'uncertain')
+            self.assertEqual(json.loads(old_before['payload']), old.payload())
+            self.assertEqual((sdk.inbox / 'health.json').read_bytes(), saved_source)
+            # Resolve the local marker only: the journal's actual FIT mode must still protect the pending alias.
+            with patch('builtins.input', return_value='PRESENT'), contextlib.redirect_stdout(io.StringIO()):
+                h.resolve_record(argparse.Namespace(record_id=old.key, present=True, absent=False, ignore=False))
+            old_before = dict(h.state_row(sdk.db, old))
+            self.assertEqual(old_before['status'], 'verified_manual')
+            journal_bytes = journal_path.read_bytes()
+            backup = Path(journal['backup'])
+            evidence = {p.name: p.read_bytes() for p in backup.glob('*.json')}
+            token = sdk.state / 'synthetic-token'; token.write_bytes(b'unchanged local token')
+            self.write_export.__func__(sdk, [candidate])
+            source = (sdk.inbox / 'health.json').read_bytes()
+            self.assertEqual(h.load_measurements(sdk.cfg)[1], [candidate])
+            with patch.object(h, 'api_client', return_value=sdk.api), contextlib.redirect_stdout(io.StringIO()):
+                h.run_sync(sdk.cfg)
+                self.assertEqual(h.process_record(sdk.api, sdk.db, candidate), 'uncertain')
+            latest = json.loads((sdk.state / 'plans' / 'sync-latest.json').read_text())
+            self.assertEqual(latest['entries'][0]['action'], 'uncertain')
+            self.assertIn(journal_path.name, latest['entries'][0]['reason'])
+            with patch('builtins.input') as prompt, contextlib.redirect_stdout(io.StringIO()):
+                with self.assertRaisesRegex(h.SafeError, journal_path.name):
+                    h.resolve_record(argparse.Namespace(record_id=candidate.key, present=False, absent=True, ignore=False))
+            prompt.assert_not_called()
+            self.assertEqual(dict(h.state_row(sdk.db, candidate)), candidate_before)
+            self.assertEqual(dict(h.state_row(sdk.db, old)), old_before)
+            self.assertEqual(journal_path.read_bytes(), journal_bytes)
+            self.assertEqual({p.name: p.read_bytes() for p in backup.glob('*.json')}, evidence)
+            self.assertEqual(sum(request['method'] == 'POST' for request in sdk.sent), 1)
+            self.assertEqual(sum(request['method'] == 'DELETE' for request in sdk.sent), 1)
+            self.assertEqual((sdk.inbox / 'health.json').read_bytes(), source)
+            self.assertEqual(token.read_bytes(), b'unchanged local token')
+        finally:
+            sdk.doCleanups()
+
+    def test_new_unknown_request_keeps_latest_source_revision_and_blocks_old_completed_resume(self):
+        import test_sdk_transport as transport
+        if not transport.PINNED_SDK:
+            self.skipTest('Requires the installed, pinned Garmin SDK')
+        sdk = transport.SDKTransportTests('runTest')
+        try:
+            sdk.setUp()
+            sdk.enterContext(patch('subprocess.run', side_effect=transport.forbidden))
+            old = h.Measurement(AT + timedelta(seconds=1.500001), 70, 23.5, 'PICOOC', 22, 53.55)
+            self.write_export.__func__(sdk, [old])
+            self.assertEqual(h.load_measurements(sdk.cfg)[1], [old])
+            original = row(h.Measurement(old.at, 71, 23.5, 'PICOOC', 22))
+            sdk.rows = [original]
+            def server(method, path, pool):
+                if method == 'DELETE':
+                    sdk.rows = []
+                    return 200, {'ok': True}
+                if method == 'POST':
+                    self.assertEqual(path, '/upload-service/upload')
+                    wire_at = transport.fit_weight_timestamp(sdk.fit_files[-1])
+                    with contextlib.closing(h.database()) as independent:
+                        self.assertEqual(h.get_status(independent, old), 'inflight')
+                        saved = independent.execute('SELECT wire_at FROM request_times WHERE record_id=?', (old.key,)).fetchone()[0]
+                        self.assertEqual(h.aware(saved), wire_at)
+                    if sum(request['method'] == 'POST' for request in sdk.sent) == 1:
+                        sdk.rows = [row(h.Measurement(wire_at, old.weight, old.fat, old.source, old.bmi), 201)]
+                        return 200, {'detailedImportResult': {'successes': [{}], 'failures': []}}
+                    raise sdk.urllib3.exceptions.ReadTimeoutError(pool, path, 'synthetic accepted hidden FIT upload')
+                self.assertEqual(method, 'GET')
+                return 200, sdk.read_payload(path)
+            sdk.handler = server
+            plan = h.save_comparison(h.comparison_plan(sdk.db, [old], {'dateWeightList': [original]},
+                                                       old.at.date(), old.at.date()), sdk.cfg)
+            with (patch.object(h, 'api_client', return_value=sdk.api),
+                  patch('builtins.input', return_value='REPLACE ' + old.key), contextlib.redirect_stdout(io.StringIO())):
+                h.reviewed_operation(argparse.Namespace(plan=str(plan), record_id=old.key,
+                                                        remote_id='100', complete_export=True), sdk.cfg)
+            journal = next((sdk.state / 'operations').glob('*.json'))
+            self.assertEqual(h.read_operation(journal)['phase'], 'verified')
+            journal_bytes = journal.read_bytes()
+            backup = Path(h.read_operation(journal)['backup'])
+            evidence = {p.name: p.read_bytes() for p in backup.glob('*.json')}
+            sdk.rows = []
+            with (patch.object(h, 'now', return_value=AT + timedelta(hours=2)),
+                  patch.object(h, 'api_client', return_value=sdk.api), contextlib.redirect_stdout(io.StringIO())):
+                h.run_sync(sdk.cfg)
+            self.assertEqual(h.get_status(sdk.db, old), 'remote_missing')
+            with patch('builtins.input', return_value='ABSENT'), contextlib.redirect_stdout(io.StringIO()):
+                h.resolve_record(argparse.Namespace(record_id=old.key, present=False, absent=True, ignore=False))
+            with patch.object(h, 'api_client', return_value=sdk.api), contextlib.redirect_stdout(io.StringIO()):
+                h.run_sync(sdk.cfg)
+            self.assertEqual(h.get_status(sdk.db, old), 'uncertain')
+            latest = h.Measurement(old.at, 72, old.fat, old.source, old.bmi, 54)
+            self.write_export.__func__(sdk, [latest])
+            self.assertEqual(h.load_measurements(sdk.cfg)[1], [latest])
+            source = (sdk.inbox / 'health.json').read_bytes()
+            token = sdk.state / 'synthetic-token'; token.write_bytes(b'unchanged local token')
+            with patch.object(h, 'api_client', return_value=sdk.api), contextlib.redirect_stdout(io.StringIO()):
+                h.run_sync(sdk.cfg)
+            current = dict(h.state_row(sdk.db, latest))
+            self.assertEqual(current['core'], latest.core)
+            self.assertEqual(json.loads(current['payload']), latest.payload())
+            self.assertEqual(current['status'], 'uncertain')
+            wire = sdk.db.execute('SELECT wire_at FROM request_times WHERE record_id=?', (old.key,)).fetchone()[0]
+            self.assertEqual(h.aware(wire), AT.astimezone(h.UTC) + timedelta(seconds=1))
+            with (patch.object(h, 'api_client', return_value=sdk.api), patch('builtins.input') as prompt,
+                  contextlib.redirect_stdout(io.StringIO())):
+                with self.assertRaisesRegex(h.SafeError, '本地测量已修订'):
+                    h.resume_operation(argparse.Namespace(operation=str(journal)))
+            prompt.assert_not_called()
+            self.assertEqual(dict(h.state_row(sdk.db, latest)), current)
+            self.assertEqual(journal.read_bytes(), journal_bytes)
+            # Late visibility can confirm the historical operation without clearing the newer unknown request.
+            sdk.rows = [row(h.Measurement(h.aware(wire), old.weight, old.fat, old.source, old.bmi), 202)]
+            with (patch.object(h, 'api_client', return_value=sdk.api), patch('builtins.input') as prompt,
+                  contextlib.redirect_stdout(io.StringIO())):
+                self.assertTrue(h.verify_operation(argparse.Namespace(operation=str(journal))))
+                h.resume_operation(argparse.Namespace(operation=str(journal)))
+            prompt.assert_not_called()
+            self.assertEqual(dict(h.state_row(sdk.db, latest)), current)
+            self.assertEqual(sdk.db.execute('SELECT wire_at FROM request_times WHERE record_id=?', (old.key,)).fetchone()[0], wire)
+            for field in ('measurement', 'replacement', 'original', 'backup'):
+                self.assertEqual(h.read_operation(journal)[field], json.loads(journal_bytes)[field])
+            self.assertEqual({p.name: p.read_bytes() for p in backup.glob('*.json')}, evidence)
+            self.assertEqual(sum(request['method'] == 'POST' for request in sdk.sent), 2)
+            self.assertEqual(sum(request['method'] == 'DELETE' for request in sdk.sent), 1)
+            self.assertEqual((sdk.inbox / 'health.json').read_bytes(), source)
+            self.assertEqual(token.read_bytes(), b'unchanged local token')
+        finally:
+            sdk.doCleanups()
+
+    def test_legacy_unknown_database_keeps_original_fit_time_across_optional_source_revision(self):
+        import test_sdk_transport as transport
+        if not transport.PINNED_SDK:
+            self.skipTest('Requires the installed, pinned Garmin SDK')
+        sdk = transport.SDKTransportTests('runTest')
+        try:
+            sdk.setUp()
+            sdk.enterContext(patch('subprocess.run', side_effect=transport.forbidden))
+            sdk.cfg['allowed_sources'] = ['PICOOC', 'OTHER']
+            old = h.Measurement(AT + timedelta(seconds=1.500001), 70, 23.5, 'PICOOC', 22, 53.55)
+            self.write_export.__func__(sdk, [old])
+            wire_times = []
+            def server(method, path, pool):
+                if method == 'POST':
+                    self.assertEqual(path, '/upload-service/upload')
+                    wire_times.append(transport.fit_weight_timestamp(sdk.fit_files[-1]))
+                    raise sdk.urllib3.exceptions.ReadTimeoutError(pool, path, 'synthetic accepted hidden FIT upload')
+                self.assertEqual(method, 'GET')
+                return 200, sdk.read_payload(path)
+            sdk.handler = server
+            with patch.object(h, 'api_client', return_value=sdk.api), contextlib.redirect_stdout(io.StringIO()):
+                h.run_sync(sdk.cfg)
+            self.assertEqual(h.get_status(sdk.db, old), 'uncertain')
+            self.assertEqual(wire_times, [AT.astimezone(h.UTC) + timedelta(seconds=1)])
+            # This is exactly the previous six-column database format, with no separate wire evidence.
+            sdk.db.execute('DROP TABLE request_times'); sdk.db.commit()
+            self.assertEqual(len(sdk.db.execute('PRAGMA table_info(uploads)').fetchall()), 6)
+            middle = h.Measurement(old.at, old.weight, None, old.source, lbm=54)
+            self.write_export.__func__(sdk, [middle])
+            self.assertEqual(h.load_measurements(sdk.cfg)[1], [middle])
+            with patch.object(h, 'api_client', return_value=sdk.api), contextlib.redirect_stdout(io.StringIO()):
+                h.run_sync(sdk.cfg)
+            current = dict(h.state_row(sdk.db, middle))
+            self.assertEqual(current['core'], middle.core)
+            self.assertEqual(json.loads(current['payload']), middle.payload())
+            self.assertEqual(current['status'], 'uncertain')
+            wire = sdk.db.execute('SELECT wire_at FROM request_times WHERE record_id=?', (old.key,)).fetchone()[0]
+            self.assertEqual(h.aware(wire), wire_times[0])
+            candidate = h.Measurement(AT, 72, None, 'OTHER')
+            self.write_export.__func__(sdk, [candidate])
+            source = (sdk.inbox / 'health.json').read_bytes()
+            self.assertEqual(h.load_measurements(sdk.cfg)[1], [candidate])
+            token = sdk.state / 'synthetic-token'; token.write_bytes(b'unchanged local token')
+            with patch.object(h, 'api_client', return_value=sdk.api), contextlib.redirect_stdout(io.StringIO()):
+                h.run_sync(sdk.cfg)
+                self.assertEqual(h.process_record(sdk.api, sdk.db, candidate), 'uncertain')
+            self.assertIsNone(h.state_row(sdk.db, candidate))
+            self.assertEqual(dict(h.state_row(sdk.db, middle)), current)
+            self.assertEqual(sdk.db.execute('SELECT wire_at FROM request_times WHERE record_id=?', (old.key,)).fetchone()[0], wire)
+            self.assertEqual(sum(request['method'] == 'POST' for request in sdk.sent), 1)
+            self.assertFalse(any(request['method'] == 'DELETE' for request in sdk.sent))
+            self.assertFalse(list((sdk.state / 'operations').glob('*.json')))
+            self.assertEqual((sdk.inbox / 'health.json').read_bytes(), source)
+            self.assertEqual(token.read_bytes(), b'unchanged local token')
+        finally:
+            sdk.doCleanups()
 
     def test_unfinished_reviewed_targets_protect_source_aliases_without_unknown_database_rows(self):
         import replace_history as bulk

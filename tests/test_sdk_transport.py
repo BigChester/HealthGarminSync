@@ -8,6 +8,7 @@ import json
 import logging
 from pathlib import Path
 import socket
+import struct
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -25,6 +26,38 @@ except PackageNotFoundError:
 
 def forbidden(*args, **kwargs):
     raise AssertionError('Real network, login or user-home access is forbidden')
+
+
+def fit_weight_timestamp(data):
+    """Decode the actual FIT weight message's uint32 timestamp, including definitions."""
+    cursor = data[0]
+    end = cursor + struct.unpack_from('<I', data, 4)[0]
+    definitions = {}
+    while cursor < end:
+        header = data[cursor]
+        cursor += 1
+        if header & 0x80:
+            raise AssertionError('Unexpected compressed FIT timestamp')
+        local = header & 0x0f
+        if header & 0x40:
+            endian = '<' if data[cursor + 1] == 0 else '>'
+            global_message = struct.unpack_from(endian + 'H', data, cursor + 2)[0]
+            count = data[cursor + 4]
+            cursor += 5
+            fields = [tuple(data[cursor + i * 3:cursor + i * 3 + 3]) for i in range(count)]
+            cursor += count * 3
+            definitions[local] = global_message, endian, fields
+        else:
+            global_message, endian, fields = definitions[local]
+            for number, size, base_type in fields:
+                value = data[cursor:cursor + size]
+                cursor += size
+                if global_message == 30 and number == 253:
+                    if size != 4 or base_type & 0x1f != 6:
+                        raise AssertionError('Unexpected FIT weight timestamp type')
+                    seconds = struct.unpack(endian + 'I', value)[0] + 631065600
+                    return h.datetime.fromtimestamp(seconds, h.UTC)
+    raise AssertionError('Missing FIT weight timestamp')
 
 
 @unittest.skipUnless(PINNED_SDK, 'Requires the installed, pinned Garmin SDK')
@@ -331,6 +364,134 @@ class SDKTransportTests(unittest.TestCase):
         post = next(request for request in self.sent if request['method'] == 'POST')
         self.assertIn(self.fit_files[-1], post['body'])
         self.assert_source_untouched()
+
+    def test_unknown_requests_protect_actual_fit_and_json_precision_overlap(self):
+        token = self.state / 'synthetic-token'
+        token.write_bytes(b'unchanged local token')
+        cases = (
+            ('fit_forward', '.999888', '1.999889', True, True, False, True),
+            ('fit_raw_boundary', '.999888', '1.999888', True, True, False, True),
+            ('fit_same_source', '.999888', '1.999889', True, True, True, True),
+            ('fit_reverse_boundary', '1.000001', '0', True, True, False, True),
+            ('fit_reverse_outside', '1.000001', '-.000001', True, True, False, False),
+            ('fit_two_seconds', '.999888', '2.999888', True, True, False, False),
+            ('json_forward', '.999888', '1.999889', False, False, False, True),
+            ('json_reverse_boundary', '1.000001', '0', False, False, False, True),
+            ('json_reverse_outside', '1.000001', '-.000001', False, False, False, False),
+            ('old_fit_new_json', '1.000001', '0', True, False, False, True),
+            ('old_json_new_fit', '.999888', '1.999889', False, True, False, True),
+        )
+        epoch = h.aware('2020-02-20T00:00:00+00:00')
+        for name, old_offset, new_offset, old_fit, new_fit, same_source, blocked in cases:
+            with self.subTest(case=name):
+                self.db.execute('DELETE FROM uploads'); self.db.commit()
+                self.sent.clear(); self.rows = []
+                old = h.Measurement(epoch + timedelta(seconds=float(old_offset)), 70,
+                                    23.5 if old_fit else None, 'PICOOC')
+                candidate = h.Measurement(epoch + timedelta(seconds=float(new_offset)), 71,
+                                          24 if new_fit else None, 'PICOOC' if same_source else 'NEW')
+                wire_times = []
+                def server(method, path, pool):
+                    if method == 'POST':
+                        if '/upload' in path:
+                            wire_times.append(fit_weight_timestamp(self.fit_files[-1]))
+                        else:
+                            payload = json.loads(self.sent[-1]['body'])
+                            wire_times.append(h.aware(payload['gmtTimestamp'] + '+00:00'))
+                        return 200, {'detailedImportResult': {'successes': [{}], 'failures': []}}
+                    return 200, self.read_payload(path)
+                self.handler = server
+                self.assertEqual(h.process_record(self.api, self.db, old, sleep=lambda _: None), 'uncertain')
+                previous = dict(h.state_row(self.db, old))
+                expected_old = old.at.replace(microsecond=0 if old_fit else old.at.microsecond // 1000 * 1000)
+                self.assertEqual(wire_times, [expected_old])
+                with contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(h.process_record(self.api, self.db, candidate, sleep=lambda _: None), 'uncertain')
+                self.assertEqual(dict(h.state_row(self.db, old)), previous)
+                self.assertEqual(sum(request['method'] == 'POST' for request in self.sent), 1 if blocked else 2)
+                if blocked:
+                    self.assertIsNone(h.state_row(self.db, candidate))
+                else:
+                    self.assertEqual(h.state_row(self.db, candidate)['status'], 'uncertain')
+                    self.assertGreater(abs((wire_times[1] - old.at).total_seconds()), 1)
+                    self.assertGreater(abs((wire_times[0] - candidate.at).total_seconds()), 1)
+                self.assertFalse(any(request['method'] == 'DELETE' for request in self.sent))
+                self.assertEqual(token.read_bytes(), b'unchanged local token')
+                self.assert_source_untouched()
+
+    def test_precision_overlap_does_not_change_existing_readonly_matched_contract(self):
+        old = h.Measurement(h.aware('2020-02-20T00:00:00.200000+00:00'), 70, 23.5, 'PICOOC')
+        self.assertEqual(h.process_record(self.api, self.db, old, sleep=lambda _: None), 'uncertain')
+        previous = dict(h.state_row(self.db, old))
+        actual = fit_weight_timestamp(self.fit_files[-1])
+        renamed = h.Measurement(old.at + timedelta(milliseconds=200), 70, 23.5, 'NEW')
+        self.rows = [fixtures.row(h.Measurement(actual, 70, 23.5, 'REMOTE'), 200)]
+        self.assertEqual(h.process_record(self.api, self.db, renamed), 'verified')
+        self.assertEqual(dict(h.state_row(self.db, old)), previous)
+        self.assertEqual(sum(request['method'] == 'POST' for request in self.sent), 1)
+        self.assert_source_untouched()
+
+    def test_same_key_optional_revision_preserves_unknown_request_wire_mode(self):
+        token = self.state / 'synthetic-token'
+        token.write_bytes(b'unchanged local token')
+        old = h.Measurement(h.aware('2020-02-20T00:00:01.500001+00:00'), 70, 23.5, 'PICOOC')
+        middle = h.Measurement(old.at, 70, None, 'PICOOC')
+        candidate = h.Measurement(h.aware('2020-02-20T00:00:00+00:00'), 71, None, 'NEW')
+        self.cfg['allowed_sources'] = ['PICOOC', 'NEW']
+        for mode in ('process_missing', 'process_conflict', 'sync_missing', 'sync_conflict', 'sync_repair'):
+            with self.subTest(mode=mode):
+                self.db.execute('DELETE FROM uploads'); self.db.commit()
+                self.sent.clear(); self.rows = []
+                (self.state / 'last_sync_comparison.json').unlink(missing_ok=True)
+                def server(method, path, pool):
+                    return 200, ({'detailedImportResult': {'successes': [{}], 'failures': []}}
+                                 if method == 'POST' else self.read_payload(path))
+                self.handler = server
+                fixtures.ReconciliationTests.write_export(self, [old])
+                self.source_bytes = (self.inbox / 'health.json').read_bytes()
+                self.assertEqual(h.load_measurements(self.cfg)[1], [old])
+                self.assertEqual(h.process_record(self.api, self.db, old, sleep=lambda _: None), 'uncertain')
+                wire = fit_weight_timestamp(self.fit_files[-1])
+                self.assertEqual(wire.isoformat(), '2020-02-20T00:00:01+00:00')
+                self.assertEqual(abs((wire - candidate.at).total_seconds()), 1)
+                self.assert_source_untouched()
+                current = h.Measurement(old.at, 70, None, 'PICOOC', 22) if mode == 'sync_repair' else middle
+                fixtures.ReconciliationTests.write_export(self, [current])
+                self.source_bytes = (self.inbox / 'health.json').read_bytes()
+                self.assertEqual(h.load_measurements(self.cfg)[1], [current])
+                if mode.endswith('conflict'):
+                    self.rows = [fixtures.row(h.Measurement(wire, 72, 25, 'REMOTE'), 200)]
+                elif mode == 'sync_repair':
+                    self.rows = [fixtures.row(h.Measurement(wire, 70, 23.5, 'REMOTE'), 200)]
+                with contextlib.redirect_stdout(io.StringIO()):
+                    if mode.startswith('sync'):
+                        with patch.object(h, 'api_client', return_value=self.api):
+                            h.run_sync(self.cfg)
+                    else:
+                        self.assertEqual(h.process_record(self.api, self.db, current), 'uncertain')
+                persisted = h.state_row(self.db, old)
+                self.assertEqual(persisted['core'], current.core)
+                self.assertEqual(json.loads(persisted['payload']), current.payload())
+                self.assertIn(persisted['status'], ('inflight', 'uncertain', 'repair_uncertain'))
+                self.assert_source_untouched()
+                self.rows = []
+                fixtures.ReconciliationTests.write_export(self, [candidate])
+                self.source_bytes = (self.inbox / 'health.json').read_bytes()
+                self.assertEqual(h.load_measurements(self.cfg)[1], [candidate])
+                with contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(h.process_record(self.api, self.db, candidate, sleep=lambda _: None), 'uncertain')
+                self.assertIsNone(h.state_row(self.db, candidate))
+                self.assertEqual(sum(request['method'] == 'POST' for request in self.sent), 1)
+                self.assertEqual(h.state_row(self.db, old)['core'], current.core)
+                self.assertEqual(json.loads(h.state_row(self.db, old)['payload']), current.payload())
+                with patch('builtins.input', return_value='ABSENT'), contextlib.redirect_stdout(io.StringIO()):
+                    h.resolve_record(argparse.Namespace(record_id=old.key, present=False, absent=True, ignore=False))
+                self.assertEqual(h.state_row(self.db, old)['status'], 'pending')
+                self.assertEqual(h.process_record(self.api, self.db, candidate, sleep=lambda _: None), 'uncertain')
+                self.assertEqual(sum(request['method'] == 'POST' for request in self.sent), 2)
+                self.assertFalse(any(request['method'] == 'DELETE' for request in self.sent))
+                self.assertEqual(token.read_bytes(), b'unchanged local token')
+                self.assert_source_untouched()
 
     def test_deleted_but_timed_out_review_keeps_journal_and_verify_never_redeletes(self):
         original = fixtures.row(self.r)

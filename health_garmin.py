@@ -463,6 +463,8 @@ def database() -> sqlite3.Connection:
         db.execute("""CREATE TABLE IF NOT EXISTS uploads (
            record_id TEXT PRIMARY KEY, core TEXT NOT NULL, payload TEXT NOT NULL,
            status TEXT NOT NULL, updated_at TEXT NOT NULL, detail TEXT NOT NULL)""")
+        db.execute("""CREATE TABLE IF NOT EXISTS request_times (
+           record_id TEXT PRIMARY KEY, wire_at TEXT NOT NULL)""")
         db.commit()
         dbpath.chmod(0o600)
     except BaseException:
@@ -471,10 +473,22 @@ def database() -> sqlite3.Connection:
     return db
 
 
-def set_status(db: sqlite3.Connection, r: Measurement, status: str, detail: str = "") -> None:
+def set_status(db: sqlite3.Connection, r: Measurement, status: str, detail: str = "", *, request: Measurement | None = None) -> None:
+    previous = state_row(db, r)
+    if (previous and previous["status"] in ("inflight", "uncertain", "repair_uncertain")
+            and status in ("inflight", "uncertain", "repair_uncertain")):
+        # Capture the old-format fallback before a source revision changes it.
+        payload = json.loads(previous["payload"])
+        original = Measurement(**{**payload, "at": aware(payload["at"])})
+        db.execute("INSERT OR IGNORE INTO request_times VALUES (?,?)",
+                   (r.key, measurement_wire_time(original).isoformat()))
+    elif status == "inflight":
+        db.execute("INSERT OR REPLACE INTO request_times VALUES (?,?)",
+                   (r.key, measurement_wire_time(request or r).isoformat()))
+    elif status not in ("uncertain", "repair_uncertain"):
+        db.execute("DELETE FROM request_times WHERE record_id=?", (r.key,))
     payload = r.payload()
     if r.lbm is None:
-        previous = state_row(db, r)
         if previous and previous["core"] == r.core:
             retained = json.loads(previous["payload"])
             if "lbm" in retained:
@@ -802,12 +816,28 @@ def active_operations() -> set[str]:
     return active
 
 
-def unknown_request_context(db: sqlite3.Connection) -> list[tuple[str, datetime, str]]:
+def measurement_wire_time(r: Measurement) -> datetime:
+    at = r.at.astimezone(UTC)
+    # FIT encodes whole seconds; add_weigh_in receives a millisecond timestamp.
+    microsecond = 0 if r.fat is not None or r.bmi is not None else at.microsecond // 1000 * 1000
+    return at.replace(microsecond=microsecond)
+
+
+def unknown_request_context(db: sqlite3.Connection) -> list[tuple[str, datetime, datetime, str]]:
     """Keep unknown writes associated with their time when an export renames a source."""
     context = []
-    for row in db.execute("SELECT record_id,payload FROM uploads WHERE status IN ('inflight','uncertain','repair_uncertain')"):
+    for row in db.execute("""SELECT uploads.record_id,payload,wire_at FROM uploads
+                           LEFT JOIN request_times USING(record_id)
+                           WHERE status IN ('inflight','uncertain','repair_uncertain')"""):
         payload = json.loads(row["payload"])
-        context.append((row["record_id"], aware(payload["at"]), "未确定测量 " + row["record_id"]))
+        record = Measurement(**{**payload, "at": aware(payload["at"])})
+        wire_at = aware(row["wire_at"]) if row["wire_at"] is not None else measurement_wire_time(record)
+        context.append((row["record_id"], record.at, wire_at, "未确定测量 " + row["record_id"]))
+    return context + unknown_operation_context()
+
+
+def unknown_operation_context() -> list[tuple[str, datetime, datetime, str]]:
+    context = []
     for path in (STATE / "operations").glob("*.json"):
         if path.is_symlink():
             raise SafeError("操作记录不能是符号链接。")
@@ -819,7 +849,10 @@ def unknown_request_context(db: sqlite3.Connection) -> list[tuple[str, datetime,
         for payload in payloads:
             if payload:
                 record = Measurement(**{**payload, "at": aware(payload["at"])})
-                context.append((record.key, record.at, "未完成操作 " + path.name + "；测量 " + record.key))
+                sent = journal.get("replacement") if journal.get("type") != "full_replacement" else None
+                request = Measurement(**{**sent, "at": aware(sent["at"])}) if sent else record
+                context.append((record.key, record.at, measurement_wire_time(request),
+                                "未完成操作 " + path.name + "；测量 " + record.key))
     return context
 
 
@@ -828,16 +861,26 @@ def verified_source_context(db: sqlite3.Connection) -> list[tuple[str, datetime,
             for row in db.execute("SELECT record_id,payload FROM uploads WHERE status IN ('verified','verified_manual','verified_conflict','remote_missing')")]
 
 
+def source_alias_overlap(r: Measurement, key: str, at: datetime, wire_at: datetime | None = None) -> bool:
+    if key == r.key:
+        return False
+    current, previous = r.at.astimezone(UTC), at.astimezone(UTC)
+    return (abs((current - previous).total_seconds()) <= 1
+            or wire_at is not None and (abs((measurement_wire_time(r) - previous).total_seconds()) <= 1
+                                       or abs((current - wire_at).total_seconds()) <= 1))
+
+
 def source_alias_detail(r: Measurement, context: list[tuple[str, datetime, str]]) -> str | None:
     for key, at, detail in context:
-        if key != r.key and abs((r.at - at).total_seconds()) <= 1:
+        if source_alias_overlap(r, key, at):
             return detail
     return None
 
 
-def unknown_source_alias(r: Measurement, context: list[tuple[str, datetime, str]]) -> str | None:
-    if detail := source_alias_detail(r, context):
-        return detail + " 与当前测量时间重叠；来源修订不能授权重复提交"
+def unknown_source_alias(r: Measurement, context: list[tuple[str, datetime, datetime, str]]) -> str | None:
+    for key, at, wire_at, detail in context:
+        if source_alias_overlap(r, key, at, wire_at):
+            return detail + " 与当前测量时间重叠；来源或时间修订不能授权重复提交"
     return None
 
 
@@ -1271,7 +1314,7 @@ def operation_state_changed(journal: dict[str, Any], local: Measurement, db: sql
 
 
 def save_snapshot_status(db: sqlite3.Connection, local: Measurement, status: str, detail: str,
-                         *, protect_revision: bool = True) -> bool:
+                         *, protect_revision: bool = True, request: Measurement | None = None) -> bool:
     """Save an operation snapshot without overwriting a revised or ignored task."""
     if snapshot_state_changed(db, local, protect_revision=protect_revision):
         print("本地测量已修订或忽略，保留现有上传状态。")
@@ -1281,7 +1324,7 @@ def save_snapshot_status(db: sqlite3.Connection, local: Measurement, status: str
                    if previous and previous["core"] == local.core else None)
     if current_lbm is not None:
         local = Measurement(local.at, local.weight, local.fat, local.source, local.bmi, current_lbm)
-    set_status(db, local, status, detail)
+    set_status(db, local, status, detail, request=request)
     return True
 
 
@@ -1508,8 +1551,8 @@ def process_record(api: Any, db: sqlite3.Connection, r: Measurement, sleep=time.
         raise SafeError("本地测量与提交目标不一致，不能保存上传状态。")
     def persist(status, detail):
         if local_record is not None:
-            return save_snapshot_status(db, local, status, detail)
-        set_status(db, local, status, detail)
+            return save_snapshot_status(db, local, status, detail, request=r if status == "inflight" else None)
+        set_status(db, local, status, detail, request=r if status == "inflight" else None)
         return True
     row = state_row(db, local)
     previous = row["status"] if row else "pending"
