@@ -367,11 +367,11 @@ class BulkReplacementTests(unittest.TestCase):
         self.assertEqual(h.classify_remote(self.r, h.remote_for(scoped, self.r)), 'conflict')
         self.assertFalse(api.posts)
 
-    def paused_two_day_batch(self):
+    def paused_two_day_batch(self, second_id=101):
         other = h.Measurement(self.r.at + timedelta(days=1), 71, 24, 'PICOOC')
         records = [self.r, other]
         self.write_export(records)
-        backend = API([dict(row(self.r, 100), bodyFat=None), dict(row(other, 101), bodyFat=None)])
+        backend = API([dict(row(self.r, 100), bodyFat=None), dict(row(other, second_id), bodyFat=None)])
         api = self.native_deletion_api(backend, fail_at=None)
         native_get, stopped = backend.get_body_composition, False
         def fail_next_day(start, end):
@@ -391,6 +391,98 @@ class BulkReplacementTests(unittest.TestCase):
         self.assertEqual(len(backend.deletes), 1)
         self.assertEqual(len(backend.posts), 1)
         return api, backend, journal, other
+
+    def test_partial_close_uses_durable_dates_for_reused_ids_and_legacy_unique_ids(self):
+        for mode in ('dated', 'alias', 'legacy_unique', 'legacy_ambiguous', 'wrong_day', 'invalid_day'):
+            with self.subTest(mode=mode), patch.object(h, 'STATE', self.state / mode):
+                h.private_dir(h.STATE)
+                api, backend, journal, other = self.paused_two_day_batch(
+                    second_id=101 if mode == 'legacy_unique' else 100)
+                original = h.read_operation(journal)
+                deletes = [e for e in original['events'] if e['kind'].startswith('delete_')]
+                self.assertEqual([e['calendarDate'] for e in deletes], [self.r.at.date().isoformat()] * 2)
+                if mode.startswith('legacy_'):
+                    for event in deletes:
+                        event.pop('calendarDate')
+                elif mode in ('wrong_day', 'invalid_day'):
+                    for event in deletes:
+                        event['calendarDate'] = other.at.date().isoformat() if mode == 'wrong_day' else '2020-02-30'
+                if mode != 'dated' and mode != 'alias':
+                    h.write_json(journal, original)
+                if mode == 'alias':
+                    next(item for item in backend.rows if item['samplePk'] == 100)['samplePk'] = '00100'
+                journal_bytes = journal.read_bytes()
+                backup = Path(original['backup'])
+                evidence = {p.name: p.read_bytes() for p in backup.glob('*.json')}
+                source = (self.inbox / 'health.json').read_bytes()
+                token = h.STATE / 'tokens' / 'synthetic'
+                h.private_dir(token.parent)
+                token.write_bytes(b'synthetic private token')
+                remote = json.loads(json.dumps(backend.rows))
+                with contextlib.redirect_stdout(io.StringIO()):
+                    if mode in ('dated', 'alias', 'legacy_unique'):
+                        result = bulk.close_verified_partial(journal, dict(self.cfg, enabled=False), api)
+                        self.assertCountEqual(result['dateWeightList'], remote)
+                        updated = h.read_operation(journal)
+                        self.assertEqual(updated['phase'], 'closed_partial')
+                        self.assertEqual(updated['partial_verification'], {'uploads': 1, 'deletes': 1, 'remote_count': 2})
+                        self.assertEqual(updated['events'], original['events'])
+                    else:
+                        with self.assertRaises(h.SafeError):
+                            bulk.close_verified_partial(journal, dict(self.cfg, enabled=False), api)
+                        self.assertEqual(journal.read_bytes(), journal_bytes)
+                self.assertEqual(backend.deletes, [('100', self.r.at.date().isoformat())])
+                self.assertEqual(len(backend.posts), 1)
+                self.assertEqual(backend.rows, remote)
+                self.assertEqual({p.name: p.read_bytes() for p in backup.glob('*.json')}, evidence)
+                self.assertEqual((self.inbox / 'health.json').read_bytes(), source)
+                self.assertEqual(token.read_bytes(), b'synthetic private token')
+
+    def test_partial_close_rejects_second_unverified_delete_with_reused_id(self):
+        other = h.Measurement(self.r.at + timedelta(days=1), 71, 24, 'PICOOC')
+        records = [self.r, other]
+        self.write_export(records)
+        source = (self.inbox / 'health.json').read_bytes()
+        token = self.state / 'tokens' / 'synthetic'
+        h.private_dir(token.parent)
+        token.write_bytes(b'synthetic private token')
+        backend = API([dict(row(r, 100), bodyFat=None) for r in records])
+        api = self.native_deletion_api(backend, fail_at=None)
+        sdk = api.api.delete_weigh_in.side_effect.__self__
+        request = sdk.client.request.side_effect
+        def accepted_then_timeout(method, domain, url, **kwargs):
+            response = request(method, domain, url, **kwargs)
+            if len(backend.deletes) == 2:
+                raise TimeoutError('synthetic accepted second deletion')
+            return response
+        sdk.client.request.side_effect = accepted_then_timeout
+        obj = h.fetch_remote_snapshot(api, self.r.at.date(), other.at.date())
+        plan = h.save_comparison(h.comparison_plan(self.db, records, obj,
+            self.r.at.date(), other.at.date()), self.cfg)
+        with self.assertRaises(h.SafeError):
+            self.invoke(api, plan)
+        journal = next((self.state / 'operations').glob('full-*.json'))
+        job = h.read_operation(journal)
+        delete_events = [e for e in job['events'] if e['kind'].startswith('delete_')]
+        self.assertEqual([(e['kind'], e['id'], e['calendarDate']) for e in delete_events],
+                         [('delete_intent', '100', self.r.at.date().isoformat()),
+                          ('delete_verified', '100', self.r.at.date().isoformat()),
+                          ('delete_intent', '100', other.at.date().isoformat())])
+        self.assertEqual(backend.deletes, [('100', r.at.date().isoformat()) for r in records])
+        self.assertEqual(len(backend.posts), 1)
+        journal_bytes = journal.read_bytes()
+        backup = Path(job['backup'])
+        evidence = {p.name: p.read_bytes() for p in backup.glob('*.json')}
+        remote = json.loads(json.dumps(backend.rows))
+        with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(h.SafeError):
+            bulk.close_verified_partial(journal, dict(self.cfg, enabled=False), api)
+        self.assertEqual(journal.read_bytes(), journal_bytes)
+        self.assertEqual(backend.rows, remote)
+        self.assertEqual(len(backend.deletes), 2)
+        self.assertEqual(len(backend.posts), 1)
+        self.assertEqual({p.name: p.read_bytes() for p in backup.glob('*.json')}, evidence)
+        self.assertEqual((self.inbox / 'health.json').read_bytes(), source)
+        self.assertEqual(token.read_bytes(), b'synthetic private token')
 
     def test_partial_close_normalizes_only_known_ids_and_preserves_other_evidence(self):
         for case in ('integer', 'string', 'leading_zero', 'anonymous_upload', 'weight', 'date',

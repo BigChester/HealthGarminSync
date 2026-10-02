@@ -1,5 +1,5 @@
 """Explicit full-history replacement with a durable backup and no automatic retry."""
-from collections import defaultdict
+from collections import Counter, defaultdict
 import contextlib
 from datetime import date
 import json
@@ -60,14 +60,39 @@ def close_verified_partial(path, cfg, api):
     events = job['events']
     sent = {e['id'] for e in events if e['kind'] == 'upload_intent'}
     confirmed = {e['id'] for e in events if e['kind'] == 'upload_verified'}
-    deleted = {e['id'] for e in events if e['kind'] == 'delete_intent'}
-    removed = {e['id'] for e in events if e['kind'] == 'delete_verified'}
+    delete_events = [e for e in events if e['kind'] == 'delete_intent']
+    removed_events = [e for e in events if e['kind'] == 'delete_verified']
+    deleted = Counter(h.canonical_remote_id(e['id']) for e in delete_events)
+    removed = Counter(h.canonical_remote_id(e['id']) for e in removed_events)
     if sent != confirmed or deleted != removed:
         raise h.SafeError('存在未确定请求，不能关闭批次或开始另一批。')
     start, end = date.fromisoformat(job['start']), date.fromisoformat(job['end'])
     targets = load_targets(cfg, start, end)
     if [r.payload() for r in targets] != job['targets']:
         raise h.SafeError('源数据已变化，不能关闭批次。')
+    before = json.loads(h.read_regular_text(Path(job['backup']) / 'remote-before.json'))
+    def deletion_identity(event):
+        pk = h.canonical_remote_id(event['id'])
+        originals = [r for r in before['dateWeightList']
+                     if h.canonical_remote_id(r.get('samplePk')) == pk]
+        if 'calendarDate' in event:
+            originals = [r for r in originals if r.get('calendarDate') == event['calendarDate']]
+        if pk is None or len(originals) != 1:
+            raise h.SafeError('删除意图无法关联唯一原记录及日期，不能关闭批次。')
+        calendar = originals[0].get('calendarDate')
+        try:
+            if not isinstance(calendar, str) or date.fromisoformat(calendar).isoformat() != calendar:
+                raise ValueError('invalid calendar date')
+        except ValueError as exc:
+            raise h.SafeError('删除日期无法可靠核对，不能关闭批次。') from exc
+        return pk, calendar
+    deleted = Counter(deletion_identity(e) for e in delete_events)
+    removed = Counter(deletion_identity(e) for e in removed_events)
+    if deleted != removed:
+        raise h.SafeError('存在未确定请求，不能关闭批次或开始另一批。')
+    removed_ids = set(removed)
+    def identity(row):
+        return h.canonical_remote_id(row.get('samplePk')), row.get('calendarDate')
     obj = h.fetch_remote_snapshot(api, start, end)
     index = h.RemoteIndex(obj)
     added = set()
@@ -78,19 +103,15 @@ def close_verified_partial(path, cfg, api):
         if kind != 'matched':
             raise h.SafeError('此前上传无法读回匹配，不能关闭批次。')
         added.add(indices[0])
-    before = json.loads(h.read_regular_text(Path(job['backup']) / 'remote-before.json'))
     def canonical_rows(rows):
         normalized = []
         for row in rows:
             pk = h.canonical_remote_id(row.get('samplePk'))
             normalized.append({**row, 'samplePk': pk} if pk is not None else row)
         return normalized
-    removed_ids = {h.canonical_remote_id(pk) for pk in removed}
-    if None in removed_ids:
-        raise h.SafeError('删除记录 ID 无法可靠核对，不能关闭批次。')
     current = canonical_rows(index.rows)
     untouched = [r for r in canonical_rows(before['dateWeightList'])
-                 if h.canonical_remote_id(r.get('samplePk')) not in removed_ids]
+                 if identity(r) not in removed_ids]
     remaining_raw = [r for i, r in enumerate(index.rows) if i not in added]
     remaining = [r for i, r in enumerate(current) if i not in added]
     # Older versions backed up dateRange's last-per-day response. A paused batch
@@ -107,11 +128,11 @@ def close_verified_partial(path, cfg, api):
             h.write_json(Path(job['backup']) / 'remote-before-details-reconstructed.json',
                          {'dateWeightList': remaining_raw, 'basis': 'Original summary rows intact; only earlier same-day details supplemented; no deletions issued'})
             untouched = remaining
-    if any(h.canonical_remote_id(r.get('samplePk')) in removed_ids for r in current) or signature(untouched) != signature(remaining):
+    if any(identity(r) in removed_ids for r in current) or signature(untouched) != signature(remaining):
         raise h.SafeError('远端出现意外变化，不能关闭批次。')
     job['phase'] = 'closed_partial'
     job['closed_at'] = h.now().isoformat()
-    job['partial_verification'] = {'uploads': len(confirmed), 'deletes': len(removed),
+    job['partial_verification'] = {'uploads': len(confirmed), 'deletes': sum(removed.values()),
                                    'remote_count': len(index.rows)}
     h.write_json(path, job)
     print('已独立核验并关闭部分批次：', job['partial_verification'], '；不会重复已完成请求。', flush=True)
@@ -236,8 +257,11 @@ def execute(args, cfg, api=None):
                'start': start.isoformat(), 'end': end.isoformat(), 'targets': payloads,
                'record_ids': [r.key for r in records], 'backup': str(backup), 'events': []}
         h.write_json(journal_path, job)
-        def event(kind, identity):
-            job['events'].append({'at': h.now().isoformat(), 'kind': kind, 'id': identity})
+        def event(kind, identity, calendar=None):
+            entry = {'at': h.now().isoformat(), 'kind': kind, 'id': identity}
+            if calendar is not None:
+                entry['calendarDate'] = calendar
+            job['events'].append(entry)
             h.write_json(journal_path, job)
         try:
             days = sorted(set(original_days) | set(targets_by_day))
@@ -251,12 +275,12 @@ def execute(args, cfg, api=None):
                     pk = str(row['samplePk'])
                     if (pk, row['calendarDate']) in keep:
                         continue
-                    event('delete_intent', pk)
+                    event('delete_intent', pk, day.isoformat())
                     api.delete_weigh_in(pk, day.isoformat())
                     after = h.RemoteIndex(api.get_body_composition(day.isoformat(), day.isoformat())).rows
                     if not h.original_id_absent(after, pk, calendar=day.isoformat()):
                         raise h.SafeError('删除后旧记录仍可见，暂停，不重复删除。')
-                    event('delete_verified', pk)
+                    event('delete_verified', pk, day.isoformat())
                 for r in targets_by_day[day]:
                     target_api = TargetAPI(api, r, records)
                     kind = h.classify_remote(r, h.remote_for(target_api, r))
