@@ -194,6 +194,45 @@ class BulkReplacementTests(unittest.TestCase):
         self.assertEqual((self.inbox / 'health.json').read_bytes(), source)
         self.assertEqual(token.read_bytes(), token_bytes)
 
+    def test_native_batch_keeps_same_id_only_on_its_matched_calendar_day(self):
+        other = h.Measurement(self.r.at + timedelta(days=1), 71, 24, 'PICOOC')
+        records = [self.r, other]
+        self.write_export(records)
+        source = (self.inbox / 'health.json').read_bytes()
+        for matched in (False, True):
+            with self.subTest(second_day_matched=matched), patch.object(h, 'STATE', self.state / str(matched)):
+                h.private_dir(h.STATE)
+                token = h.STATE / 'tokens' / 'synthetic.json'
+                h.write_json(token, {'synthetic': 'private-cache'})
+                token_bytes = token.read_bytes()
+                keeper = row(self.r, 100)
+                second = row(other, 100) if matched else dict(row(other, 100), bodyFat=None)
+                backend = API([keeper, second])
+                api = self.native_deletion_api(backend, fail_at=None)
+                with contextlib.closing(h.database()) as db:
+                    obj = h.fetch_remote_snapshot(api, self.r.at.date(), other.at.date())
+                    path = h.save_comparison(h.comparison_plan(db, records, obj,
+                        self.r.at.date(), other.at.date()), self.cfg)
+                    output = io.StringIO()
+                    with patch('builtins.input', return_value='REPLACE ALL'), contextlib.redirect_stdout(output):
+                        bulk.execute(argparse.Namespace(plan=str(path), complete_export=True), self.cfg, api)
+                    self.assertIn('目标 2 条；保留匹配 ' + ('2' if matched else '1') +
+                                  ' 条；删除旧记录 ' + ('0' if matched else '1') +
+                                  ' 条；重建/新增 ' + ('0' if matched else '1') + ' 条。', output.getvalue())
+                    self.assertEqual([h.get_status(db, record) for record in records], ['verified', 'verified'])
+                job = h.read_operation(next((h.STATE / 'operations').glob('full-*.json')))
+                self.assertEqual(job['phase'], 'verified')
+                self.assertEqual(backend.deletes, [] if matched else [('100', other.at.date().isoformat())])
+                self.assertEqual(len(backend.posts), 0 if matched else 1)
+                self.assertEqual(backend.rows[0], keeper)
+                self.assertEqual([event['kind'] for event in job['events']], [] if matched else
+                                 ['delete_intent', 'delete_verified', 'upload_intent', 'upload_verified'])
+                backup = Path(job['backup'])
+                self.assertEqual(json.loads((backup / 'remote-before.json').read_text()), obj)
+                self.assertEqual((backup / 'exports' / 'health.json').read_bytes(), source)
+                self.assertEqual((self.inbox / 'health.json').read_bytes(), source)
+                self.assertEqual(token.read_bytes(), token_bytes)
+
     def test_native_batch_deletes_reused_id_only_on_each_original_calendar_day(self):
         other = h.Measurement(self.r.at + timedelta(days=1), 71, 24, 'PICOOC')
         records = [self.r, other]

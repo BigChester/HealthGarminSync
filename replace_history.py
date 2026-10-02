@@ -199,9 +199,10 @@ def execute(args, cfg, api=None):
                 row = index.rows[candidates[0]]
                 # Retain only records whose Garmin day agrees with the source day.
                 if row['calendarDate'] == r.at.date().isoformat():
-                    keep.add(str(row['samplePk']))
+                    keep.add((str(row['samplePk']), row['calendarDate']))
             targets_by_day[r.at.date()].append(r)
-        deletes = sum(str(row['samplePk']) not in keep for rows in original_days.values() for row in rows)
+        deletes = sum((str(row['samplePk']), row['calendarDate']) not in keep
+                      for rows in original_days.values() for row in rows)
         uploads = len(records) - len(keep)
         print(f'完整替换：目标 {len(records)} 条；保留匹配 {len(keep)} 条；删除旧记录 {deletes} 条；重建/新增 {uploads} 条。', flush=True)
         if input('确认以完整 Apple 历史为准，输入 REPLACE ALL：').strip() != 'REPLACE ALL':
@@ -248,7 +249,7 @@ def execute(args, cfg, api=None):
                     raise h.SafeError('待处理日期 Garmin 数据已变化，暂停。')
                 for row in current:
                     pk = str(row['samplePk'])
-                    if pk in keep:
+                    if (pk, row['calendarDate']) in keep:
                         continue
                     event('delete_intent', pk)
                     api.delete_weigh_in(pk, day.isoformat())
