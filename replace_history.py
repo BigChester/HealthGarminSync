@@ -215,6 +215,9 @@ def execute(args, cfg, api=None):
             h.private_dir(destination.parent)
             shutil.copyfile(source, destination)
             destination.chmod(0o600)
+        backed_up = load_targets(dict(cfg, inbox=str(backup / 'exports')), start, end)
+        if payloads != [r.payload() for r in backed_up]:
+            raise h.SafeError('Apple 导出备份与已确认的测量不一致，未执行替换；请重新对账。')
         journal_path = h.STATE / 'operations' / ('full-' + stamp + '.json')
         job = {'type': 'full_replacement', 'key': 'full-' + stamp, 'phase': 'replacing',
                'start': start.isoformat(), 'end': end.isoformat(), 'targets': payloads,

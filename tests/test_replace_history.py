@@ -5,6 +5,7 @@ from datetime import timedelta
 import io
 import json
 from pathlib import Path
+import threading
 from unittest.mock import Mock, patch, seal
 import unittest
 
@@ -43,6 +44,87 @@ class BulkReplacementTests(unittest.TestCase):
         raw.delete_weigh_in.side_effect = backend.delete_weigh_in
         seal(raw)
         return h.GarminMeasurementAPI(raw)
+
+    def assert_concurrent_export_backup_rejected(self, intermediate):
+        source = self.inbox / 'health.json'
+        original = source.read_bytes()
+        token = self.state / 'tokens' / 'synthetic'
+        h.private_dir(token.parent)
+        token.write_bytes(b'synthetic private token')
+        backend = API([dict(row(self.r), bodyFat=None)])
+        api = self.detailed_api(backend)
+        obj = h.fetch_remote_snapshot(api, self.r.at.date(), self.r.at.date())
+        plan = h.save_comparison(h.comparison_plan(self.db, [self.r], obj,
+            self.r.at.date(), self.r.at.date()), self.cfg)
+        begin, ready, copied, restored = [threading.Event() for _ in range(4)]
+        failures = []
+        def exporter():
+            try:
+                if not begin.wait(2):
+                    raise AssertionError('Copy did not start')
+                with source.open('wb') as stream:
+                    stream.write(intermediate)
+                    stream.flush()
+                    ready.set()
+                    if not copied.wait(2):
+                        raise AssertionError('Copy did not finish')
+                    stream.seek(0)
+                    stream.write(original)
+                    stream.truncate()
+                    stream.flush()
+            except BaseException as exc:
+                failures.append(exc)
+            finally:
+                restored.set()
+        worker = threading.Thread(target=exporter, daemon=True)
+        native_copy = bulk.shutil.copyfile
+        def concurrent_copy(src, dst):
+            self.assertEqual(src, source)
+            begin.set()
+            self.assertTrue(ready.wait(2))
+            try:
+                return native_copy(src, dst)
+            finally:
+                copied.set()
+                self.assertTrue(restored.wait(2))
+        worker.start()
+        try:
+            with (patch.object(bulk.shutil, 'copyfile', side_effect=concurrent_copy),
+                  patch.object(h, 'api_client', side_effect=AssertionError('No login')),
+                  patch.object(Path, 'home', side_effect=AssertionError('No real home')),
+                  patch('socket.socket', side_effect=AssertionError('No network')),
+                  patch('subprocess.run', side_effect=AssertionError('No service'))):
+                with self.assertRaises(h.SafeError):
+                    self.invoke(api, plan)
+        finally:
+            begin.set()
+            copied.set()
+            worker.join(2)
+        self.assertFalse(worker.is_alive())
+        self.assertFalse(failures)
+        self.assertFalse(backend.deletes)
+        self.assertFalse(backend.posts)
+        self.assertEqual(backend.rows, [dict(row(self.r), bodyFat=None)])
+        self.assertIsNone(h.state_row(self.db, self.r))
+        self.assertFalse(list((self.state / 'operations').glob('*.json')))
+        backup = next((self.state / 'backups').glob('full-*'))
+        self.assertEqual((backup / 'exports' / source.name).read_bytes(), intermediate)
+        self.assertEqual(json.loads((backup / 'targets.json').read_text()), [self.r.payload()])
+        self.assertEqual(source.read_bytes(), original)
+        self.assertEqual(token.read_bytes(), b'synthetic private token')
+
+    def test_torn_export_copy_is_rejected_even_after_active_source_recovers(self):
+        original = (self.inbox / 'health.json').read_bytes()
+        intermediate = original[:len(original) // 2]
+        with self.assertRaises(json.JSONDecodeError):
+            json.loads(intermediate)
+        self.assert_concurrent_export_backup_rejected(intermediate)
+
+    def test_valid_backup_with_different_targets_is_rejected_after_source_recovers(self):
+        obj = json.loads((self.inbox / 'health.json').read_text())
+        obj['metrics']['weight'][0]['value'] = self.r.weight + 1
+        intermediate = json.dumps(obj).encode('utf-8')
+        self.assert_concurrent_export_backup_rejected(intermediate)
 
     def test_delete_readback_unknown_or_same_normalized_id_stops_entire_batch(self):
         original = h.Measurement(self.r.at + timedelta(hours=1), 74, None, 'PICOOC')
