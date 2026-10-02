@@ -685,6 +685,132 @@ class ReconciliationTests(unittest.TestCase):
         self.assertEqual((self.inbox / 'health.json').read_bytes(), source)
         self.assertEqual(token.read_bytes(), b'unchanged local token')
 
+    def test_verified_source_alias_missing_requires_explicit_absence_confirmation(self):
+        self.cfg['allowed_sources'] = ['PICOOC', 'OTHER']
+        token = self.state / 'synthetic-token'; token.write_bytes(b'unchanged local token')
+        for prior in ('verified', 'verified_manual', 'remote_missing'):
+            for changed in (False, True):
+                with self.subTest(prior=prior, changed=changed), patch.object(h, 'now', return_value=AT + timedelta(hours=2)):
+                    self.db.execute('DELETE FROM uploads'); self.db.commit()
+                    (self.state / 'last_sync_comparison.json').unlink(missing_ok=True)
+                    self.write_export([self.r])
+                    backend = API(); api = self.native_deletion_api(backend, fail_at=None)
+                    self.sync(api)
+                    self.assertEqual(h.get_status(self.db, self.r), 'verified')
+                    if prior == 'verified_manual':
+                        with patch('builtins.input', return_value='PRESENT'), contextlib.redirect_stdout(io.StringIO()):
+                            h.resolve_record(argparse.Namespace(record_id=self.r.key, present=True, absent=False, ignore=False))
+                    backend.rows = []
+                    if prior == 'remote_missing':
+                        self.sync(api)
+                    original = dict(h.state_row(self.db, self.r))
+                    self.assertEqual(original['status'], prior)
+                    current = h.Measurement(AT.astimezone(h.UTC), 72 if changed else 70,
+                                            24 if changed else 23.5, 'OTHER', 22 if changed else None, 54)
+                    self.write_export([current])
+                    source = (self.inbox / 'health.json').read_bytes()
+                    self.assertEqual(h.load_measurements(self.cfg)[1], [current])
+                    for _ in range(2):
+                        self.sync(api)
+                        self.assertEqual(h.get_status(self.db, current), 'remote_missing')
+                        self.assertEqual(json.loads(h.state_row(self.db, current)['payload']), current.payload())
+                        summary = json.loads((self.state / 'last_run.json').read_text())
+                        self.assertEqual(summary['results'][current.key], 'remote_missing')
+                        plan = json.loads((self.state / 'plans' / 'sync-latest.json').read_text())
+                        self.assertEqual(plan['entries'][0]['action'], 'review_missing')
+                        self.assertIn(self.r.key, plan['entries'][0]['reason'])
+                        self.assertEqual((len(backend.posts), len(backend.deletes)), (1, 0))
+                        self.assertEqual(dict(h.state_row(self.db, self.r)), original)
+                    with patch('builtins.input', return_value='ABSENT'), contextlib.redirect_stdout(io.StringIO()):
+                        h.resolve_record(argparse.Namespace(record_id=current.key, present=False, absent=True, ignore=False))
+                    self.assertEqual(h.get_status(self.db, current), 'pending')
+                    self.sync(api)
+                    self.sync(api)
+                    self.assertEqual(h.get_status(self.db, current), 'verified')
+                    self.assertEqual((len(backend.posts), len(backend.deletes)), (2, 0))
+                    self.assertEqual(dict(h.state_row(self.db, self.r)), original)
+                    self.assertFalse(list((self.state / 'operations').glob('*.json')))
+                    self.assertEqual((self.inbox / 'health.json').read_bytes(), source)
+                    self.assertEqual(token.read_bytes(), b'unchanged local token')
+
+    def test_verified_alias_controls_keep_matching_conflicting_and_unrelated_measurements(self):
+        self.cfg['allowed_sources'] = ['PICOOC', 'OTHER']
+        for case in ('matched', 'conflict', 'different_time', 'verified_conflict'):
+            with self.subTest(case=case), patch.object(h, 'now', return_value=AT + timedelta(hours=2)):
+                self.db.execute('DELETE FROM uploads'); self.db.commit()
+                (self.state / 'last_sync_comparison.json').unlink(missing_ok=True)
+                self.write_export([self.r])
+                backend = API(); api = self.native_deletion_api(backend, fail_at=None)
+                self.sync(api)
+                if case == 'verified_conflict':
+                    backend.rows[0]['weight'] = 71000
+                    self.sync(api)
+                    self.assertEqual(h.get_status(self.db, self.r), 'verified_conflict')
+                if case in ('different_time', 'verified_conflict'):
+                    backend.rows = []
+                original = dict(h.state_row(self.db, self.r))
+                current = h.Measurement(AT + timedelta(minutes=2 if case == 'different_time' else 0),
+                                        72 if case == 'conflict' else 70, 23.5, 'OTHER')
+                self.write_export([current])
+                source = (self.inbox / 'health.json').read_bytes()
+                self.assertEqual(h.load_measurements(self.cfg)[1], [current])
+                self.sync(api)
+                self.assertEqual(h.get_status(self.db, current),
+                    'conflict' if case == 'conflict' else 'remote_missing' if case == 'verified_conflict' else 'verified')
+                self.assertEqual((len(backend.posts), len(backend.deletes)), (2 if case == 'different_time' else 1, 0))
+                self.assertEqual(dict(h.state_row(self.db, self.r)), original)
+                self.assertEqual((self.inbox / 'health.json').read_bytes(), source)
+
+    def test_direct_process_rechecks_verified_alias_history_without_overriding_unknown_protection(self):
+        self.cfg['allowed_sources'] = ['PICOOC', 'OTHER']
+        backend = API(); api = self.native_deletion_api(backend, fail_at=None)
+        with patch.object(h, 'now', return_value=AT + timedelta(hours=2)):
+            self.sync(api)
+            backend.rows = []
+            self.sync(api)
+        with patch('builtins.input', return_value='ABSENT'), contextlib.redirect_stdout(io.StringIO()):
+            h.resolve_record(argparse.Namespace(record_id=self.r.key, present=False, absent=True, ignore=False))
+        current = h.Measurement(AT, 72, 24, 'OTHER', 22)
+        self.write_export([current])
+        source = (self.inbox / 'health.json').read_bytes()
+        self.assertEqual(h.load_measurements(self.cfg)[1], [current])
+        plan = h.comparison_plan(self.db, [current], {'dateWeightList': []}, AT.date(), AT.date())
+        self.assertEqual(plan['entries'][0]['action'], 'missing')
+        # A user's newer PRESENT decision invalidates the previously permissive plan.
+        with patch('builtins.input', return_value='PRESENT'), contextlib.redirect_stdout(io.StringIO()):
+            h.resolve_record(argparse.Namespace(record_id=self.r.key, present=True, absent=False, ignore=False))
+        original = dict(h.state_row(self.db, self.r))
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(h.process_record(api, self.db, current), 'remote_missing')
+        self.assertIn(self.r.key, h.state_row(self.db, current)['detail'])
+        self.assertEqual((len(backend.posts), len(backend.deletes)), (1, 0))
+        self.assertEqual(dict(h.state_row(self.db, self.r)), original)
+        with patch('builtins.input', return_value='ABSENT'), contextlib.redirect_stdout(io.StringIO()):
+            h.resolve_record(argparse.Namespace(record_id=current.key, present=False, absent=True, ignore=False))
+        # Even an explicitly pending alias cannot supersede a new unknown request at this time.
+        self.write_export([self.r])
+        backend.visible = False
+        native_post = backend.add_body_composition
+        def accepted_timeout(**kw):
+            native_post(**kw)
+            raise TimeoutError('synthetic accepted request')
+        api.api.add_body_composition.side_effect = accepted_timeout
+        with patch.object(h, 'now', return_value=AT + timedelta(hours=2)):
+            self.sync(api)
+        with patch('builtins.input', return_value='ABSENT'), contextlib.redirect_stdout(io.StringIO()):
+            h.resolve_record(argparse.Namespace(record_id=self.r.key, present=False, absent=True, ignore=False))
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(h.process_record(api, self.db, self.r), 'uncertain')
+        original = dict(h.state_row(self.db, self.r))
+        current_row = dict(h.state_row(self.db, current))
+        self.write_export([current])
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(h.process_record(api, self.db, current), 'uncertain')
+        self.assertEqual(dict(h.state_row(self.db, current)), current_row)
+        self.assertEqual(dict(h.state_row(self.db, self.r)), original)
+        self.assertEqual((len(backend.posts), len(backend.deletes)), (2, 0))
+        self.assertEqual((self.inbox / 'health.json').read_bytes(), source)
+
     def test_old_matched_operations_preserve_current_export_revisions_and_ignore_choice(self):
         token = self.state / 'synthetic-token'
         token.write_bytes(b'unchanged local token')

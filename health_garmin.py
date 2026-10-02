@@ -823,10 +823,27 @@ def unknown_request_context(db: sqlite3.Connection) -> list[tuple[str, datetime,
     return context
 
 
-def unknown_source_alias(r: Measurement, context: list[tuple[str, datetime, str]]) -> str | None:
+def verified_source_context(db: sqlite3.Connection) -> list[tuple[str, datetime, str]]:
+    return [(row["record_id"], aware(json.loads(row["payload"])["at"]), "以前已验证的测量 " + row["record_id"])
+            for row in db.execute("SELECT record_id,payload FROM uploads WHERE status IN ('verified','verified_manual','verified_conflict','remote_missing')")]
+
+
+def source_alias_detail(r: Measurement, context: list[tuple[str, datetime, str]]) -> str | None:
     for key, at, detail in context:
         if key != r.key and abs((r.at - at).total_seconds()) <= 1:
-            return detail + " 与当前测量时间重叠；来源修订不能授权重复提交"
+            return detail
+    return None
+
+
+def unknown_source_alias(r: Measurement, context: list[tuple[str, datetime, str]]) -> str | None:
+    if detail := source_alias_detail(r, context):
+        return detail + " 与当前测量时间重叠；来源修订不能授权重复提交"
+    return None
+
+
+def missing_source_alias(r: Measurement, context: list[tuple[str, datetime, str]]) -> str | None:
+    if detail := source_alias_detail(r, context):
+        return detail + " 与当前测量时间重叠且远端缺失；核对后用 resolve --absent 允许补传"
     return None
 
 
@@ -859,6 +876,7 @@ def comparison_plan(db: sqlite3.Connection, records: list[Measurement], obj: Any
     entries, claimed, owners = [], set(), {}
     active = active_operations()
     unknown = unknown_request_context(db)
+    verified = verified_source_context(db)
     for r in records:
         kind, candidates, reason = index.decide(r)
         # A unique exact row does not own unrelated measurements in its minute.
@@ -873,6 +891,8 @@ def comparison_plan(db: sqlite3.Connection, records: list[Measurement], obj: Any
             action, reason = "uncertain", "之前的请求结果未确定，只读核对，不重复提交"
         elif kind != "matched" and (alias := unknown_source_alias(r, unknown)):
             action, reason = "uncertain", alias
+        elif kind == "missing" and not (previous and status == "pending") and (alias := missing_source_alias(r, verified)):
+            action, reason = "review_missing", alias
         elif kind == "missing" and status in ("verified", "verified_manual", "verified_conflict", "remote_missing"):
             action, reason = "review_missing", "以前已验证的记录远端缺失；核对后用 resolve --absent 允许补传"
         entry = {"id": r.key, "action": action, "reason": reason, "local_status": status,
@@ -1510,6 +1530,10 @@ def process_record(api: Any, db: sqlite3.Connection, r: Measurement, sleep=time.
         # Never blindly re-POST an uncertain write, even when an immediate read is empty.
         persist("uncertain", "Awaiting remote visibility or explicit manual resolution")
         return "uncertain"
+    if (classification == "absent" and not reviewed and not (row and previous == "pending")
+            and (alias := missing_source_alias(r, verified_source_context(db)))):
+        persist("remote_missing", alias)
+        return "remote_missing"
     if classification == "absent" and previous in ("verified", "verified_manual", "verified_conflict", "remote_missing"):
         persist("remote_missing", "Previously verified record is missing; explicit absence confirmation required")
         return "remote_missing"
