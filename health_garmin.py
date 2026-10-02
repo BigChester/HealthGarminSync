@@ -621,6 +621,13 @@ class GarminMeasurementAPI:
             date.fromisoformat(day)
             if any(not isinstance(row, dict) or row.get("calendarDate") != day for row in items):
                 raise SafeError("Garmin 每日明细的测量日期不一致，停止。")
+            identities = set()
+            for row in items:
+                if row.get("samplePk") is not None:
+                    identity = (str(row["samplePk"]), str(row["calendarDate"]))
+                    if identity in identities:
+                        raise SafeError("Garmin 每日称重明细包含重复记录，停止。")
+                    identities.add(identity)
             rows.extend(items)
         result = {"dateWeightList": rows}
         RemoteIndex(result)

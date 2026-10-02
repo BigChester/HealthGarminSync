@@ -10,7 +10,7 @@ import subprocess
 import sys
 import time
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, patch, seal
 
 import health_garmin as h
 import test_diagnostics as fixtures
@@ -352,6 +352,73 @@ class RunAttemptTests(unittest.TestCase):
         self.assertEqual(self.last.read_bytes(), prior)
         self.assertFalse(api.posts)
         self.assertFalse(api.deletes)
+
+    def test_duplicate_range_details_stop_all_writes_and_recover_from_complete_snapshot(self):
+        self.cfg['settle_seconds'] = 0
+        self.save_config()
+        current = h.load_measurements(self.cfg)[1][0]
+        older = h.Measurement(current.at - timedelta(days=45), 72, 24, current.source)
+        data = json.loads(self.export.read_text())
+        for metric, value in (('weight', older.weight), ('body_fat', f'{older.fat}%')):
+            data['metrics'][metric].append({'at': older.at.isoformat(), 'value': value, 'source': older.source})
+        self.export.write_text(json.dumps(data))
+        source, tokens = self.export.read_bytes(), (self.tokens / 'oauth.json').read_bytes()
+        groups = []
+        for number, record in enumerate((older, current)):
+            neighbor = h.Measurement(record.at + timedelta(hours=1), 74, 27, record.source)
+            groups.append((record.at.date().isoformat(), row(record, 100 + number), row(neighbor, 200 + number)))
+        for malformed_chunk in (1, 2):
+            with self.subTest(malformed_chunk=malformed_chunk):
+                with contextlib.closing(h.database()) as db, db:
+                    db.execute('DELETE FROM uploads')
+                prior = self.last.read_bytes()
+                malformed = True
+
+                def details(start, end):
+                    summaries = []
+                    for number, (day, existing, other) in enumerate(groups, start=1):
+                        if not start <= day <= end:
+                            continue
+                        if malformed and number == malformed_chunk:
+                            items = [dict(other), dict(other)]
+                        elif malformed and malformed_chunk == 2 and number == 1:
+                            # An earlier valid chunk omits a pending source;
+                            # later malformed data must still stop all writes.
+                            items = []
+                        else:
+                            items = [existing, other]
+                        summaries.append({'summaryDate': day, 'numOfWeightEntries': len(items),
+                                          'allWeightMetrics': items})
+                    return {'dailyWeightSummaries': summaries}
+
+                raw = Mock(spec_set=['get_weigh_ins', 'get_daily_weigh_ins', 'add_body_composition',
+                                     'add_weigh_in', 'delete_weigh_in'])
+                raw.get_weigh_ins.side_effect = details
+                raw.get_daily_weigh_ins.side_effect = AssertionError('daily endpoint unexpected')
+                for name in ('add_body_composition', 'add_weigh_in', 'delete_weigh_in'):
+                    getattr(raw, name).side_effect = AssertionError(SECRET)
+                seal(raw)
+                adapter = h.GarminMeasurementAPI(raw)
+                with patch.object(h, 'api_client', return_value=adapter):
+                    result, _, errors = self.run_main()
+                self.assertEqual(result, 2)
+                self.assertNotIn(SECRET, errors)
+                self.assertEqual(raw.get_weigh_ins.call_count, malformed_chunk)
+                self.assertEqual(self.last.read_bytes(), prior)
+                self.assertEqual(self.attempt()['outcome'], 'failed')
+                with contextlib.closing(h.database()) as db:
+                    self.assertEqual(db.execute('SELECT COUNT(*) FROM uploads').fetchone()[0], 0)
+                self.assertEqual(self.report()[0], 2)
+                malformed = False
+                with patch.object(h, 'api_client', return_value=adapter):
+                    self.assertEqual(self.run_main()[0], 0)
+                with contextlib.closing(h.database()) as db:
+                    self.assertEqual([h.get_status(db, record) for record in (older, current)], ['verified', 'verified'])
+                self.assertEqual(self.attempt()['outcome'], 'completed')
+                self.assertEqual(self.report()[0], 0)
+                for name in ('get_daily_weigh_ins', 'add_body_composition', 'add_weigh_in', 'delete_weigh_in'):
+                    getattr(raw, name).assert_not_called()
+                self.assertEqual((self.export.read_bytes(), (self.tokens / 'oauth.json').read_bytes()), (source, tokens))
 
     def test_future_export_stops_before_api_and_recovers_after_corrected_metadata(self):
         current = h.now()
