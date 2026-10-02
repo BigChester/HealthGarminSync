@@ -727,6 +727,15 @@ def canonical_remote_id(value: Any) -> int | None:
     return number if number > 0 else None
 
 
+def canonical_remote_row(row: dict[str, Any]) -> dict[str, Any]:
+    """Compare known ID representations without changing saved remote evidence."""
+    result = dict(row)
+    pk = canonical_remote_id(row.get("samplePk"))
+    if pk is not None:
+        result["samplePk"] = str(pk)
+    return result
+
+
 def original_id_absent(rows: list[dict[str, Any]], original_pk: Any, *, calendar: str) -> bool:
     """Confirm absence of the date + ID addressed by the SDK's DELETE endpoint."""
     def record_day(value):
@@ -1175,12 +1184,18 @@ def reviewed_operation(args: argparse.Namespace, cfg: dict[str, Any], delete_ext
     obj = fetch_remote_snapshot(api, start, end, targets=records)
     with contextlib.closing(database()) as db, db:
         fresh = comparison_plan(db, records, obj, start, end)
+        def selected_extra(rows, identifier):
+            pk = canonical_remote_id(identifier)
+            return [r for r in rows if (canonical_remote_id(r.get("samplePk")) == pk
+                    if pk is not None else str(r.get("samplePk")) == identifier)]
+
         if delete_extra:
             if not args.complete_export:
                 raise SafeError("删除多余记录需要 --complete-export，确认已完整导出选定日期内需要保留的 Apple 数据。")
-            old = [r for r in saved["extra_remote"] if str(r.get("samplePk")) == args.remote_id]
-            current = [r for r in fresh["extra_remote"] if str(r.get("samplePk")) == args.remote_id]
-            if len(old) != 1 or len(current) != 1 or old != current:
+            old = selected_extra(saved["extra_remote"], args.remote_id)
+            current = selected_extra(fresh["extra_remote"], args.remote_id)
+            if (len(old) != 1 or len(current) != 1
+                    or canonical_remote_row(old[0]) != canonical_remote_row(current[0])):
                 raise SafeError("多余记录已变化或不再多余，请重新对账。")
             remote_row = current[0]
             measurement = None
@@ -1198,7 +1213,9 @@ def reviewed_operation(args: argparse.Namespace, cfg: dict[str, Any], delete_ext
                 return
             if entry["action"] not in ("repair", "replace") or old[0]["action"] not in ("repair", "replace"):
                 raise SafeError("只能修复唯一对应的缺字段或数值不同记录；不处理歧义或 uncertain。")
-            if old[0]["measurement"] != entry["measurement"] or old[0]["remote"] != entry["remote"]:
+            if (old[0]["measurement"] != entry["measurement"]
+                    or [canonical_remote_row(r) for r in old[0]["remote"]]
+                    != [canonical_remote_row(r) for r in entry["remote"]]):
                 raise SafeError("Apple 或 Garmin 数据已变化，请重新对账。")
             remote_row = entry["remote"][0]
             measurement = next(r for r in records if r.key == args.record_id)
@@ -1251,15 +1268,18 @@ def reviewed_operation(args: argparse.Namespace, cfg: dict[str, Any], delete_ext
         obj = fetch_remote_snapshot(api, start, end, targets=latest_records)
         latest = comparison_plan(db, latest_records, obj, start, end)
         if delete_extra:
-            candidates = [r for r in latest["extra_remote"] if str(r.get("samplePk")) == pk]
-            unchanged = candidates == [remote_row]
+            candidates = selected_extra(latest["extra_remote"], pk)
+            unchanged = [canonical_remote_row(r) for r in candidates] == [canonical_remote_row(remote_row)]
         else:
             candidates = [e for e in latest["entries"] if e["id"] == measurement.key]
             unchanged = (len(candidates) == 1 and candidates[0]["action"] in ("repair", "replace")
                          and candidates[0]["measurement"] == measurement.payload()
-                         and candidates[0]["remote"] == [remote_row])
+                         and [canonical_remote_row(r) for r in candidates[0]["remote"]]
+                         == [canonical_remote_row(remote_row)])
         if not unchanged:
             raise SafeError("确认期间目标数据已变化，未删除；请重新对账。")
+        remote_row = candidates[0] if delete_extra else candidates[0]["remote"][0]
+        pk, calendar = str(remote_row["samplePk"]), remote_row["calendarDate"]
         if measurement:
             reviewed_targets = replacement_preflight(obj, remote_row, replacement, latest_records, saved)
         fresh = latest

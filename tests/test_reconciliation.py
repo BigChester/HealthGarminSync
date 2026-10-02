@@ -62,6 +62,145 @@ class API:
 
 
 class ReconciliationTests(unittest.TestCase):
+    def assert_native_review_id_change(self, kind, phase, *, before_id=100, after_id='00100', change='alias'):
+        import replace_history as bulk
+        import test_sdk_transport as transport
+        if not transport.PINNED_SDK:
+            self.skipTest('Requires the installed, pinned Garmin SDK')
+        sdk = transport.SDKTransportTests('runTest')
+        try:
+            sdk.setUp()
+            sdk.enterContext(patch('subprocess.run', side_effect=transport.forbidden))
+            records = [sdk.r]
+            original = row(sdk.r, before_id)
+            if kind == 'bulk':
+                records.append(h.Measurement(sdk.r.at + timedelta(hours=2), 72, 24, 'PICOOC', 23, 54))
+            elif kind == 'repair':
+                original['bodyFat'] = None
+            else:
+                original = row(h.Measurement(sdk.r.at + timedelta(hours=2), 75, None, 'PICOOC'), before_id)
+            self.write_export.__func__(sdk, records)
+            sdk.rows = [original] if kind != 'extra' else [row(sdk.r, 300), original]
+            source = (sdk.inbox / 'health.json').read_bytes()
+            token = sdk.state / 'synthetic-token'; token.write_bytes(b'unchanged token')
+            active = False
+            def server(method, path, pool):
+                if method == 'DELETE':
+                    day, pk = path.split('/')[-3], int(path.rsplit('/', 1)[-1])
+                    self.assertEqual((day, pk), (original['calendarDate'], 100))
+                    sdk.rows = [r for r in sdk.rows if (h.canonical_remote_id(r.get('samplePk')), r['calendarDate']) != (pk, day)]
+                    return 200, {'ok': True}
+                if method == 'POST':
+                    values = sdk.fit_values[-1][1]
+                    at = transport.fit_weight_timestamp(sdk.fit_files[-1]).astimezone(AT.tzinfo)
+                    sdk.rows.append(row(h.Measurement(at, values['weight'], values['percent_fat'],
+                                                     'PICOOC', values['bmi']), 201))
+                    return 200, {'detailedImportResult': {'successes': [{}], 'failures': []}}
+                self.assertEqual(method, 'GET')
+                obj = copy.deepcopy(sdk.read_payload(path))
+                if active or (phase == 'day' and '/dayview/' in path):
+                    items = (obj['dateWeightList'] if '/dayview/' in path else
+                             [r for s in obj['dailyWeightSummaries'] for r in s['allWeightMetrics']])
+                    for item in items:
+                        if item.get('samplePk') != before_id:
+                            continue
+                        if change in ('alias', 'unknown_alias'): item['samplePk'] = after_id
+                        elif change == 'weight': item['weight'] += 1000
+                        elif change == 'fat': item['bodyFat'] = 25
+                        elif change == 'bmi': item['bmi'] = 24
+                        elif change == 'date': item['calendarDate'] = '2020-02-21'
+                        elif change == 'new_id': item['samplePk'] = 101
+                        elif change == 'metadata': item['sourceType'] = 'MANUAL'
+                    if change == 'ambiguous':
+                        items.append(dict(original, samplePk=after_id, calendarDate='2020-02-21'))
+                    if change in ('date', 'ambiguous') and '/range/' in path:
+                        days = sorted({r['calendarDate'] for r in items})
+                        obj['dailyWeightSummaries'] = [
+                            {'summaryDate': day, 'numOfWeightEntries': len(day_rows), 'allWeightMetrics': day_rows}
+                            for day in days for day_rows in [[r for r in items if r['calendarDate'] == day]]]
+                return 200, obj
+            sdk.handler = server
+            with patch.object(h, 'api_client', return_value=sdk.api), contextlib.redirect_stdout(io.StringIO()):
+                saved = h.compare_exports(argparse.Namespace(inbox=None, since='2020-02-20',
+                                                            until='2020-02-21'), sdk.cfg)
+            path = next((sdk.state / 'plans').glob('compare-*.json'))
+            saved_bytes = path.read_bytes()
+            if phase == 'initial': active = True
+            prompts = []
+            def confirm(text):
+                nonlocal active
+                prompts.append(text)
+                if phase == 'confirmation': active = True
+                return ('REPLACE ALL' if kind == 'bulk' else 'REPLACE ' + sdk.r.key
+                        if kind == 'repair' else 'DELETE ' + str(after_id if phase == 'initial' else before_id))
+            args = argparse.Namespace(plan=str(path), complete_export=True, record_id=sdk.r.key,
+                                      remote_id=str(before_id))
+            output = io.StringIO()
+            with (patch.object(h, 'api_client', return_value=sdk.api), patch('builtins.input', side_effect=confirm),
+                  contextlib.redirect_stdout(output)):
+                def invoke():
+                    if kind == 'bulk': bulk.execute(args, sdk.cfg, sdk.api)
+                    else: h.reviewed_operation(args, sdk.cfg, delete_extra=kind == 'extra')
+                if change == 'alias': invoke()
+                else:
+                    with self.assertRaises(h.SafeError): invoke()
+            mutations = [r['method'] for r in sdk.sent if r['method'] != 'GET']
+            journals = list((sdk.state / 'operations').glob('*.json'))
+            if change == 'alias':
+                self.assertEqual(mutations, ['POST'] if kind == 'bulk' else ['DELETE', 'POST'] if kind == 'repair' else ['DELETE'])
+                job = h.read_operation(journals[0])
+                self.assertEqual(job['phase'], 'deleted_verified' if kind == 'extra' else 'verified')
+                if kind == 'bulk':
+                    self.assertIn('保留匹配 1 条；删除旧记录 0 条；重建/新增 1 条', output.getvalue())
+                    self.assertEqual(sdk.rows[0], original)
+                    self.assertEqual(job['verification']['matched'], 2)
+                    self.assertEqual([h.get_status(sdk.db, r) for r in records], ['verified', 'verified'])
+                else:
+                    self.assertEqual(job['original']['samplePk'], after_id)
+                    self.assertEqual(json.loads((Path(job['backup']) / 'remote.json').read_text())['dateWeightList'][0 if kind == 'repair' else 1]['samplePk'], after_id)
+                self.assertEqual(saved['remote_snapshot']['dateWeightList'][-1]['samplePk'], before_id)
+            else:
+                self.assertEqual(mutations, [])
+                self.assertFalse(journals)
+                self.assertEqual(len(prompts), phase == 'confirmation')
+                self.assertEqual(sdk.rows, [original] if kind != 'extra' else [row(sdk.r, 300), original])
+                self.assertIsNone(h.state_row(sdk.db, sdk.r))
+            self.assertEqual(path.read_bytes(), saved_bytes)
+            self.assertEqual((sdk.inbox / 'health.json').read_bytes(), source)
+            self.assertEqual(token.read_bytes(), b'unchanged token')
+        finally:
+            sdk.doCleanups()
+
+    def test_native_full_replacement_keeps_canonical_matches_across_range_and_daily_ids(self):
+        for phase in ('initial', 'confirmation', 'day'):
+            for before, after in ((100, '100'), (100, '00100'), ('00100', 100)):
+                with self.subTest(phase=phase, before=before, after=after):
+                    self.assert_native_review_id_change('bulk', phase, before_id=before, after_id=after)
+
+    def test_native_single_review_accepts_only_equivalent_record_ids(self):
+        for kind in ('repair', 'extra'):
+            for phase in ('initial', 'confirmation'):
+                with self.subTest(kind=kind, phase=phase):
+                    self.assert_native_review_id_change(kind, phase)
+        # Canonical selection must not pick one of the same-ID records on different days.
+        for phase in ('initial', 'confirmation'):
+            with self.subTest(kind='extra', phase=phase, change='ambiguous'):
+                self.assert_native_review_id_change('extra', phase, change='ambiguous')
+
+    def test_native_review_still_rejects_changed_remote_fields(self):
+        for kind in ('bulk', 'repair', 'extra'):
+            for change in ('weight', 'fat', 'bmi', 'date', 'new_id', 'metadata'):
+                with self.subTest(kind=kind, change=change):
+                    self.assert_native_review_id_change(kind, 'confirmation', change=change)
+        for old, new in ((100.0, '00100'), (True, '001')):
+            with self.subTest(unknown_id=old):
+                self.assert_native_review_id_change('repair', 'initial', before_id=old,
+                                                   after_id=new, change='unknown_alias')
+        for old, new in ((100, 100.0), (1, True)):
+            with self.subTest(unknown_id=new, phase='confirmation'):
+                self.assert_native_review_id_change('repair', 'confirmation', before_id=old,
+                                                   after_id=new, change='unknown_alias')
+
     def test_native_timestamp_collision_preserves_uncertain_replacement_evidence(self):
         import test_sdk_transport as transport
         if not transport.PINNED_SDK:

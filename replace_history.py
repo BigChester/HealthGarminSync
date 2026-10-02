@@ -12,7 +12,7 @@ import health_garmin as h
 
 def signature(rows):
     # Garmin may recompute weightDelta when another day's measurement changes.
-    return sorted(json.dumps({k: v for k, v in row.items() if k != 'weightDelta'},
+    return sorted(json.dumps({k: v for k, v in h.canonical_remote_row(row).items() if k != 'weightDelta'},
                              sort_keys=True, allow_nan=False) for row in rows)
 
 
@@ -222,9 +222,9 @@ def execute(args, cfg, api=None):
                 matched_rows.add(candidates[0])
                 row = index.rows[candidates[0]]
                 if h.canonical_remote_id(row.get('samplePk')) is not None:
-                    keep.add((str(row['samplePk']), row['calendarDate']))
+                    keep.add((h.canonical_remote_id(row['samplePk']), row['calendarDate']))
             targets_by_day[r.at.date()].append(r)
-        deletes = sum((str(row['samplePk']), row['calendarDate']) not in keep
+        deletes = sum((h.canonical_remote_id(row['samplePk']), row['calendarDate']) not in keep
                       for rows in original_days.values() for row in rows)
         uploads = len(records) - len(matched_rows)
         print(f'完整替换：目标 {len(records)} 条；保留匹配 {len(matched_rows)} 条；删除旧记录 {deletes} 条；重建/新增 {uploads} 条。', flush=True)
@@ -275,7 +275,7 @@ def execute(args, cfg, api=None):
                     raise h.SafeError('待处理日期 Garmin 数据已变化，暂停。')
                 for row in current:
                     pk = str(row['samplePk'])
-                    if (pk, row['calendarDate']) in keep:
+                    if (h.canonical_remote_id(pk), row['calendarDate']) in keep:
                         continue
                     event('delete_intent', pk, day.isoformat())
                     api.delete_weigh_in(pk, day.isoformat())
