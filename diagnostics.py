@@ -174,18 +174,30 @@ def collect():
             children = list(h.STATE.iterdir())
             state_available = True
             invalid_file = None
+            recoverable_plans = unchecked_plans = False
             runtime_names = ('run.lock', 'agent-log.lock', 'sync.log', 'sync.sqlite3', 'last_attempt.json.tmp',
-                             'last_agent_attempt.json.tmp', 'last_run.json.tmp')
+                             'last_agent_attempt.json.tmp', 'last_run.json.tmp', 'plans/sync-latest.json.tmp',
+                             'last_compare.json.tmp', 'last_sync_comparison.json.tmp')
+            replace_targets = ('plans/sync-latest.json', 'last_compare.json', 'last_sync_comparison.json')
             directory_obstacles = ('sync.log.1', 'sync.log.2', 'sync.log.3',
                                    'sync.sqlite3-journal', 'sync.sqlite3-wal')
             log_names = ['agent.out.log', 'agent.err.log']
             readwrite_logs = {base + suffix for base in log_names for suffix in ('', '.1', '.2', '.3')}
             log_names.extend(child.name for child in children
                              if re.fullmatch(r'agent\.(?:out|err)\.log\.[0-9]+', child.name))
-            for name in (*runtime_names, *log_names, *directory_obstacles):
+            for name in ('plans', *runtime_names, *replace_targets, *log_names, *directory_obstacles):
                 path = h.STATE / name
                 try:
-                    mode = path.lstat().st_mode
+                    metadata = path.lstat()
+                    mode = metadata.st_mode
+                    if name == 'plans' or name in replace_targets:
+                        invalid = not stat.S_ISDIR(mode) if name == 'plans' else stat.S_ISDIR(mode) or stat.S_ISLNK(mode)
+                        if invalid:
+                            invalid_file = name
+                            break
+                        if name == 'plans':
+                            recoverable_plans = metadata.st_uid == os.geteuid() and not os.access(path, os.X_OK)
+                        continue
                     if name in directory_obstacles:
                         if stat.S_ISDIR(mode):
                             invalid_file = name
@@ -199,12 +211,21 @@ def collect():
                         break
                 except FileNotFoundError:
                     continue
+                except PermissionError:
+                    if name.startswith('plans/') and recoverable_plans:
+                        unchecked_plans = True
+                        continue
+                    invalid_file = name
+                    break
                 except OSError:
                     invalid_file = name
                     break
             if invalid_file:
                 add('state', 'error', '本地运行文件无效或当前进程缺少所需权限。',
                     f'检查 state/{invalid_file} 的文件类型和权限。')
+            elif unchecked_plans:
+                add('state', 'warn', '当前进程无法检查 plans 内的运行文件。',
+                    '下次运行会恢复 state/plans 权限；之后重新运行 ./hg doctor。')
             else:
                 add('state', 'info', '当前进程可访问 state。')
     except OSError:

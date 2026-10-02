@@ -398,6 +398,109 @@ finally:
                     finally:
                         path.unlink() if kind == 'fifo' else path.rmdir()
 
+    def test_automatic_comparison_write_obstacles_keep_completed_evidence_visible(self):
+        outside = self.root / 'outside-comparison'
+        outside.write_text(SECRET)
+        cases = [('plans', kind) for kind in ('regular', 'fifo', 'symlink')]
+        cases += [(name, 'fifo') for name in ('plans/sync-latest.json.tmp',
+                                             'last_compare.json.tmp', 'last_sync_comparison.json.tmp')]
+        cases += [(name, 'directory') for name in ('plans/sync-latest.json',
+                                                  'last_compare.json', 'last_sync_comparison.json')]
+        cases += [('last_compare.json', 'symlink'), ('plans/sync-latest.json.tmp', 'symlink'),
+                  ('last_sync_comparison.json.tmp', 'readonly')]
+        for name, kind in cases:
+            with self.subTest(name=name, kind=kind):
+                path = self.state / name
+                path.parent.mkdir(exist_ok=True)
+                if kind == 'directory':
+                    path.mkdir()
+                elif kind == 'fifo':
+                    os.mkfifo(path, 0o600)
+                elif kind == 'symlink':
+                    path.symlink_to(outside)
+                else:
+                    path.write_text(SECRET)
+                    if kind == 'readonly':
+                        path.chmod(0o400)
+                try:
+                    code, _, checks = self.report()
+                    text_code, output = self.invoke('doctor')
+                    self.assertEqual((code, text_code), (2, 2))
+                    self.assertEqual(checks['state']['status'], 'error')
+                    self.assertIn('state/' + name, checks['state']['hint'])
+                    self.assertIn('state/' + name, output)
+                    self.assertEqual(checks['last_run']['status'], 'info')
+                    self.assertEqual(checks['last_agent_attempt']['status'], 'info')
+                    self.assertEqual(outside.read_text(), SECRET)
+                finally:
+                    path.rmdir() if kind == 'directory' else path.unlink()
+                if name.startswith('plans/'):
+                    path.parent.rmdir()
+
+    def test_automatic_comparison_metadata_preserves_atomically_replaceable_files(self):
+        self.assertEqual(self.report()[0], 0)
+        plans = self.state / 'plans'
+        plans.mkdir()
+        targets = ('plans/sync-latest.json', 'last_compare.json', 'last_sync_comparison.json')
+        protected = {self.state / name for name in (*targets, *(name + '.tmp' for name in targets))}
+        for name in targets:
+            final = self.state / name
+            os.mkfifo(final, 0o600)
+            final.with_name(final.name + '.tmp').write_text(SECRET)
+        # Manual historical plans are not required by the automatic writer.
+        (plans / 'compare-unrelated.json').mkdir()
+        original_open = h.open_regular_file
+
+        def metadata_only(path, mode, *args, **kwargs):
+            if Path(path) in protected:
+                raise AssertionError('comparison file content read')
+            return original_open(path, mode, *args, **kwargs)
+
+        with patch.object(h, 'open_regular_file', metadata_only):
+            self.assertEqual(self.report()[0], 0)
+            self.assertEqual(self.invoke('doctor')[0], 0)
+            for name in targets:
+                final = self.state / name
+                final.unlink()
+                final.write_text(SECRET)
+                final.chmod(0o400)
+            self.assertEqual(self.report()[0], 0)
+            self.assertEqual(self.invoke('doctor')[0], 0)
+            plans.chmod(0o500)
+            try:
+                self.assertEqual(self.report()[0], 0)
+            finally:
+                plans.chmod(0o700)
+            before = self.snapshot()
+            plans.chmod(0o400)
+            try:
+                with (patch.object(h, 'write_json', side_effect=AssertionError('doctor wrote JSON')),
+                      patch.object(h, 'private_dir', side_effect=AssertionError('doctor changed directory')),
+                      patch.object(h.sqlite3, 'connect', side_effect=AssertionError('doctor opened SQLite')),
+                      patch.object(Path, 'chmod', side_effect=AssertionError('doctor changed permissions'))):
+                    for json_output in (True, False):
+                        output = io.StringIO()
+                        with contextlib.redirect_stdout(output):
+                            self.assertEqual(d.doctor(json_output=json_output), 0)
+                        self.assertIn('下次运行会恢复 state/plans 权限', output.getvalue())
+                        self.assertNotIn(SECRET, output.getvalue())
+                    report = d.collect()
+                checks = {check['id']: check for check in report['checks']}
+                self.assertEqual(checks['state']['status'], 'warn')
+                self.assertEqual(checks['last_run']['status'], 'info')
+                self.assertEqual(checks['last_agent_attempt']['status'], 'info')
+                self.assertEqual(stat.S_IMODE(plans.stat().st_mode), 0o400)
+            finally:
+                plans.chmod(0o700)
+            self.assertEqual(self.snapshot(), before)
+        source, token = self.export.read_bytes(), (self.tokens / 'oauth.json').read_bytes()
+        plans.chmod(0o400)
+        h.write_json(plans / 'sync-latest.json', {'control': True})
+        self.assertEqual(stat.S_IMODE(plans.stat().st_mode), 0o700)
+        self.assertEqual(json.loads((plans / 'sync-latest.json').read_text()), {'control': True})
+        self.assertEqual(self.report()[0], 0)
+        self.assertEqual((self.export.read_bytes(), (self.tokens / 'oauth.json').read_bytes()), (source, token))
+
     def test_database_metadata_diagnoses_real_cli_type_permission_and_sidecar_directory_failures(self):
         script = '''import contextlib, io, json, os, pathlib, socket, sys
 from unittest.mock import patch
