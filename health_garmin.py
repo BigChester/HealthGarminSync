@@ -1189,7 +1189,7 @@ def resume_operation(args: argparse.Namespace) -> None:
         write_json(path, journal)
         print("远端已匹配，无需继续上传。")
         return
-    if any(str(row.get("samplePk")) == original_pk for row in RemoteIndex(obj).rows):
+    if not original_id_absent(RemoteIndex(obj).rows, original_pk):
         raise SafeError("原 Garmin 记录仍存在，停止；不会重复删除。")
     if classify_remote(r, obj) != "absent":
         raise SafeError("远端存在冲突，需重新核对；不恢复上传。")
@@ -1199,7 +1199,7 @@ def resume_operation(args: argparse.Namespace) -> None:
         return
     obj = remote_for(api, r)
     if classify_remote(r, obj) != "matched":
-        if any(str(row.get("samplePk")) == original_pk for row in RemoteIndex(obj).rows) or classify_remote(r, obj) != "absent":
+        if not original_id_absent(RemoteIndex(obj).rows, original_pk) or classify_remote(r, obj) != "absent":
             raise SafeError("确认期间远端记录发生变化，不恢复上传。")
     journal["phase"] = "uploading"
     journal["resumed_at"] = now().isoformat()

@@ -1100,6 +1100,61 @@ class ReconciliationTests(unittest.TestCase):
         self.assertFalse(api.posts)
         self.assertFalse(api.deletes)
 
+    def test_resume_requires_identifiable_rows_before_and_after_confirmation(self):
+        original = dict(row(self.r), bodyFat=None)
+        extra = h.Measurement(self.r.at + timedelta(hours=2), 73, None, 'PICOOC')
+
+        class UnknownAfterDelete(API):
+            def delete_weigh_in(api, pk, day):
+                super().delete_weigh_in(pk, day)
+                api.rows[0]['samplePk'] = None
+
+        api = UnknownAfterDelete([original, row(extra, 300)])
+        plan = self.plan(api.rows, save=True)
+        source = (self.inbox / 'health.json').read_bytes()
+        token = self.state / 'tokens' / 'synthetic'
+        h.private_dir(token.parent)
+        token.write_bytes(b'synthetic token')
+        with self.assertRaises(h.SafeError):
+            self.reviewed(api, plan)
+        journal = next((self.state / 'operations').glob('*.json'))
+        before = journal.read_bytes()
+        local_before = dict(h.state_row(self.db, self.r))
+        self.assertEqual(json.loads(before)['phase'], 'uncertain')
+        self.assertEqual(h.get_status(self.db, self.r), 'repair_uncertain')
+        self.assertEqual(len(api.deletes), 1)
+        self.assertFalse(api.posts)
+        args = argparse.Namespace(operation=str(journal))
+        with patch.object(h, 'api_client', return_value=api), contextlib.redirect_stdout(io.StringIO()):
+            with patch('builtins.input', side_effect=AssertionError('unknown identity must stop before confirmation')):
+                with self.assertRaises(h.SafeError):
+                    h.resume_operation(args)
+            self.assertEqual(journal.read_bytes(), before)
+            self.assertEqual(dict(h.state_row(self.db, self.r)), local_before)
+            self.assertFalse(api.posts)
+            api.rows = [row(extra, 300)]
+
+            def confirm(_):
+                api.rows[0].pop('samplePk')
+                return 'RESUME ' + self.r.key
+
+            with patch('builtins.input', side_effect=confirm) as prompt:
+                with self.assertRaises(h.SafeError):
+                    h.resume_operation(args)
+                prompt.assert_called_once()
+            self.assertEqual(journal.read_bytes(), before)
+            self.assertEqual(dict(h.state_row(self.db, self.r)), local_before)
+            self.assertFalse(api.posts)
+            api.rows = [row(extra, 300)]
+            with patch('builtins.input', return_value='RESUME ' + self.r.key):
+                h.resume_operation(args)
+        self.assertEqual(json.loads(journal.read_text())['phase'], 'verified')
+        self.assertEqual(h.get_status(self.db, self.r), 'verified')
+        self.assertEqual(len(api.deletes), 1)
+        self.assertEqual(len(api.posts), 1)
+        self.assertEqual((self.inbox / 'health.json').read_bytes(), source)
+        self.assertEqual(token.read_bytes(), b'synthetic token')
+
     def test_disabled_run_remains_offline(self):
         self.cfg['enabled'] = False
         with patch.object(h, 'api_client', side_effect=AssertionError('unexpected network')), contextlib.redirect_stdout(io.StringIO()):
