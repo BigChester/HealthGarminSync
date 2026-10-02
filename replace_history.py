@@ -161,7 +161,7 @@ def verify(path, api=None):
                    and not plan['extra_remote'])
         if matched:
             for r in targets:
-                h.set_status(db, r, 'verified', 'Full-history replacement independently verified')
+                h.save_verified_snapshot(db, r, 'Full-history replacement independently verified')
             job['phase'] = 'verified'
         job['last_checked_at'] = h.now().isoformat()
         job['last_check_passed'] = matched
@@ -291,7 +291,7 @@ def execute(args, cfg, api=None):
                         raise h.SafeError('新增前出现未解决的远端冲突，暂停。')
                     event('upload_intent', r.key)
                     h.set_status(db, r, 'pending', 'Explicit complete-history replacement; old records removed')
-                    if h.process_record(target_api, db, r, reviewed=True) != 'verified':
+                    if h.process_record(target_api, db, r, reviewed=True, local_record=r) != 'verified':
                         raise h.SafeError('新增请求尚未读回匹配，暂停，不自动重传。')
                     event('upload_verified', r.key)
                 print(f'日期完成 {n}/{len(days)}：{day}', flush=True)

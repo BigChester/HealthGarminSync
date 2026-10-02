@@ -288,12 +288,123 @@ class BulkReplacementTests(unittest.TestCase):
         self.assertFalse(api.posts)
         self.assertFalse(api.deletes)
 
+    def test_old_full_verification_preserves_current_measurement_and_ignore(self):
+        original = h.Measurement(self.r.at, 70, 23.5, 'PICOOC', 22, 53.55)
+        variants = (
+            ('lbm', h.Measurement(original.at, 70, 23.5, 'PICOOC', 22, 54)),
+            ('weight', h.Measurement(original.at, 71, 23.5, 'PICOOC', 22, 54)),
+            ('fat', h.Measurement(original.at, 70, 24, 'PICOOC', 22, 54)),
+            ('bmi', h.Measurement(original.at, 70, 23.5, 'PICOOC', 23, 54)),
+            ('ignored', original),
+        )
+        for mode, current in variants:
+            with self.subTest(mode=mode), patch.object(h, 'STATE', self.state / mode):
+                h.private_dir(h.STATE)
+                self.write_export([original])
+                token = h.STATE / 'tokens' / 'synthetic'
+                h.private_dir(token.parent)
+                token.write_bytes(b'synthetic private token')
+                backend = API([row(original)])
+                api = self.native_deletion_api(backend, fail_at=None)
+                with contextlib.closing(h.database()) as db:
+                    obj = h.fetch_remote_snapshot(api, original.at.date(), original.at.date())
+                    plan = h.save_comparison(h.comparison_plan(db, [original], obj,
+                        original.at.date(), original.at.date()), self.cfg)
+                    self.invoke(api, plan)
+                    journal = next((h.STATE / 'operations').glob('full-*.json'))
+                    job = h.read_operation(journal)
+                    self.assertEqual(job['phase'], 'verified')
+                    backup = Path(job['backup'])
+                    evidence = {p.name: p.read_bytes() for p in backup.glob('*.json')}
+                    self.write_export([current])
+                    with (patch.object(h, 'api_client', return_value=api),
+                          contextlib.redirect_stdout(io.StringIO())):
+                        h.run_sync(self.cfg)
+                        if mode == 'ignored':
+                            with patch('builtins.input', return_value='IGNORE'):
+                                h.resolve_record(argparse.Namespace(record_id=current.key,
+                                    present=False, absent=False, ignore=True))
+                    stored = dict(h.state_row(db, current))
+                    self.assertEqual(json.loads(stored['payload']), current.payload())
+                    self.assertEqual(stored['status'], 'ignored' if mode == 'ignored' else
+                                     'verified' if mode == 'lbm' else 'verified_conflict')
+                    source = (self.inbox / 'health.json').read_bytes()
+                    for _ in range(2):
+                        with contextlib.redirect_stdout(io.StringIO()):
+                            self.assertTrue(bulk.verify(journal, api))
+                        checked = dict(h.state_row(db, current))
+                        if mode == 'lbm':
+                            self.assertEqual({key: checked[key] for key in ('core', 'payload', 'status')},
+                                             {key: stored[key] for key in ('core', 'payload', 'status')})
+                        else:
+                            self.assertEqual(checked, stored)
+                        with patch.object(h, 'api_client', return_value=api), contextlib.redirect_stdout(io.StringIO()):
+                            h.run_sync(self.cfg)
+                        refreshed = dict(h.state_row(db, current))
+                        self.assertEqual(refreshed['status'], stored['status'])
+                        self.assertEqual(refreshed['core'], stored['core'])
+                        self.assertEqual(refreshed['payload'], stored['payload'])
+                        stored = refreshed
+                    self.assertEqual(h.read_operation(journal)['targets'], [original.payload()])
+                    self.assertEqual(h.read_operation(journal)['phase'], 'verified')
+                    self.assertEqual({p.name: p.read_bytes() for p in backup.glob('*.json')}, evidence)
+                    self.assertEqual((self.inbox / 'health.json').read_bytes(), source)
+                    self.assertEqual(token.read_bytes(), b'synthetic private token')
+                    self.assertFalse(backend.posts)
+                    self.assertFalse(backend.deletes)
+
     def test_complete_export_required(self):
         api = API([row(self.r)]); path = self.plan(api.rows, save=True)
         with self.assertRaises(h.SafeError):
             self.invoke(api, path, complete=False)
         self.assertFalse(api.posts)
         self.assertFalse(api.deletes)
+
+    def test_full_upload_readback_preserves_local_evidence_updated_during_submission(self):
+        original = h.Measurement(self.r.at, 70, 23.5, 'PICOOC', 22, 53.55)
+        for weight in (70, 72):
+            with self.subTest(new_weight=weight), patch.object(h, 'STATE', self.state / str(weight)):
+                h.private_dir(h.STATE)
+                self.write_export([original])
+                current = h.Measurement(original.at, weight, 23.5, 'PICOOC', 22, 54)
+                token = h.STATE / 'tokens' / 'synthetic'
+                h.private_dir(token.parent)
+                token.write_bytes(b'synthetic private token')
+                backend = API([row(h.Measurement(original.at, 71, 23.5, 'PICOOC', 22))])
+                post = backend.add_body_composition
+                revised_bytes = []
+                def update_during_post(**kwargs):
+                    response = post(**kwargs)
+                    self.write_export([current])
+                    revised_bytes.append((self.inbox / 'health.json').read_bytes())
+                    with patch.object(h, 'api_client', return_value=api):
+                        h.run_sync(self.cfg)
+                    return response
+                backend.add_body_composition = update_during_post
+                api = self.native_deletion_api(backend, fail_at=None)
+                with contextlib.closing(h.database()) as db:
+                    obj = h.fetch_remote_snapshot(api, original.at.date(), original.at.date())
+                    plan = h.save_comparison(h.comparison_plan(db, [original], obj,
+                        original.at.date(), original.at.date()), self.cfg)
+                    self.invoke(api, plan)
+                    stored = h.state_row(db, current)
+                    self.assertEqual((stored['core'], stored['status']),
+                                     (current.core, 'verified' if weight == 70 else 'repair_uncertain'))
+                    self.assertEqual(json.loads(stored['payload']), current.payload())
+                    journal = next((h.STATE / 'operations').glob('full-*.json'))
+                    job = h.read_operation(journal)
+                    self.assertEqual(job['phase'], 'verified')
+                    self.assertEqual(job['targets'], [original.payload()])
+                    self.assertEqual((self.inbox / 'health.json').read_bytes(),
+                                     revised_bytes[0])
+                    self.assertEqual(h.load_measurements(self.cfg)[1], [current])
+                    self.assertEqual(h.load_measurements(dict(self.cfg,
+                        inbox=str(Path(job['backup']) / 'exports')))[1], [original])
+                    self.assertEqual(token.read_bytes(), b'synthetic private token')
+                    self.assertEqual(backend.deletes, [('100', original.at.date().isoformat())])
+                    self.assertEqual(len(backend.posts), 1)
+                    self.assertNotIn('lbm', backend.posts[0])
+                    self.assertNotIn('muscle_mass', backend.posts[0])
 
     def test_remote_change_rejects_entire_batch_before_writes(self):
         api = API([row(self.r)]); path = self.plan(api.rows, save=True)

@@ -492,6 +492,235 @@ class ReconciliationTests(unittest.TestCase):
                 self.assertEqual((self.inbox / 'health.json').read_bytes(), source)
                 self.assertEqual(token.read_bytes(), b'unchanged local token')
 
+    def completed_optional_repair(self):
+        self.r = h.Measurement(AT, 70, None, 'PICOOC', lbm=53.55)
+        self.write_export([self.r])
+        records = h.load_measurements(self.cfg)[1]
+        self.assertEqual(records, [self.r])
+        backend = API([row(h.Measurement(AT, 71, 23.5, 'PICOOC'))])
+        api = self.native_deletion_api(backend, fail_at=None)
+        plan = self.deletion_plan(api)
+        self.reviewed(api, plan)
+        journal = next((h.STATE / 'operations').glob('*.json'))
+        self.assertEqual(h.read_operation(journal)['phase'], 'verified')
+        self.assertEqual((len(backend.posts), len(backend.deletes)), (1, 1))
+        return api, backend, journal
+
+    def test_old_matched_operations_preserve_current_export_revisions_and_ignore_choice(self):
+        token = self.state / 'synthetic-token'
+        token.write_bytes(b'unchanged local token')
+        for case in ('fat', 'bmi', 'weight', 'ignored', 'source'):
+            with self.subTest(case=case):
+                self.db.execute('DELETE FROM uploads'); self.db.commit()
+                for journal in (self.state / 'operations').glob('*.json'):
+                    journal.unlink()
+                (self.state / 'last_sync_comparison.json').unlink(missing_ok=True)
+                self.cfg['allowed_sources'] = ['PICOOC', 'OTHER']
+                api, backend, journal = self.completed_optional_repair()
+                historical = h.read_operation(journal)
+                backup = Path(historical['backup'])
+                evidence = {p.name: p.read_bytes() for p in backup.glob('*.json')}
+                current = h.Measurement(AT, 72 if case == 'weight' else 70,
+                                        23.5 if case == 'fat' else None,
+                                        'OTHER' if case == 'source' else 'PICOOC',
+                                        22 if case == 'bmi' else None, 54)
+                if case == 'fat':
+                    self.assertEqual(current.core, h.Measurement(**{**historical['replacement'],
+                        'at': h.aware(historical['replacement']['at'])}).core)
+                self.write_export([current])
+                source = (self.inbox / 'health.json').read_bytes()
+                self.assertEqual(h.load_measurements(self.cfg)[1], [current])
+                self.sync(api)
+                if case == 'ignored':
+                    with patch('builtins.input', return_value='IGNORE'), contextlib.redirect_stdout(io.StringIO()):
+                        h.resolve_record(argparse.Namespace(record_id=current.key, present=False, absent=False, ignore=True))
+                latest = dict(h.state_row(self.db, current))
+                status = 'ignored' if case == 'ignored' else 'verified_conflict' if case in ('bmi', 'weight') else 'verified'
+                self.assertEqual((latest['core'], latest['status']), (current.core, status))
+                self.assertEqual(json.loads(latest['payload']), current.payload())
+                args = argparse.Namespace(operation=str(journal))
+                with (patch.object(h, 'api_client', return_value=api),
+                      patch('builtins.input', side_effect=AssertionError('Matched old operation is read-only')),
+                      contextlib.redirect_stdout(io.StringIO())):
+                    self.assertTrue(h.verify_operation(args))
+                    self.assertEqual(dict(h.state_row(self.db, current)), latest)
+                    h.resume_operation(args)
+                self.assertEqual(dict(h.state_row(self.db, current)), latest)
+                self.assertEqual(h.read_operation(journal)['phase'], 'verified')
+                self.assertTrue(h.read_operation(journal)['last_check_passed'])
+                self.assertEqual(h.read_operation(journal)['measurement'], historical['measurement'])
+                self.sync(api)
+                refreshed = h.state_row(self.db, current)
+                self.assertEqual((refreshed['core'], refreshed['status']), (current.core, status))
+                self.assertEqual(json.loads(refreshed['payload']), current.payload())
+                self.assertEqual((len(backend.posts), len(backend.deletes)), (1, 1))
+                self.assertEqual({p.name: p.read_bytes() for p in backup.glob('*.json')}, evidence)
+                self.assertEqual((self.inbox / 'health.json').read_bytes(), source)
+                self.assertEqual(token.read_bytes(), b'unchanged local token')
+
+    def test_resume_rechecks_local_revision_before_confirmation_and_each_upload_read(self):
+        token = self.state / 'synthetic-token'
+        token.write_bytes(b'unchanged local token')
+        for timing in ('initial', 'ignored', 'confirmation', 'pre_post', 'pre_post_matched',
+                       'pre_post_lbm', 'confirmation_matched'):
+            with self.subTest(timing=timing):
+                self.db.execute('DELETE FROM uploads'); self.db.commit()
+                for journal in (self.state / 'operations').glob('*.json'):
+                    journal.unlink()
+                (self.state / 'last_sync_comparison.json').unlink(missing_ok=True)
+                api, backend, journal = self.completed_optional_repair()
+                historical, old_journal = h.read_operation(journal), journal.read_bytes()
+                backup = Path(historical['backup'])
+                evidence = {p.name: p.read_bytes() for p in backup.glob('*.json')}
+                backend.rows = []  # The previously completed target has subsequently gone missing.
+                source = (self.inbox / 'health.json').read_bytes()
+                current, latest = self.r, None
+                reads = 0
+                native_get = backend.get_body_composition
+                def revise(*, visible=False, old_matched=False, lbm_only=False):
+                    nonlocal current, latest, source
+                    current = h.Measurement(AT, 70 if timing == 'confirmation_matched' or lbm_only else 72,
+                                            23.5 if timing == 'confirmation_matched' else None, 'PICOOC', lbm=54)
+                    self.write_export([current])
+                    source = (self.inbox / 'health.json').read_bytes()
+                    self.assertEqual(h.load_measurements(self.cfg)[1], [current])
+                    if visible:
+                        backend.rows = [row(current, 301)]
+                    elif old_matched:
+                        payload = historical['replacement']
+                        backend.rows = [row(h.Measurement(**{**payload, 'at': h.aware(payload['at'])}), 303)]
+                    self.sync(api)
+                    latest = dict(h.state_row(self.db, current))
+                    self.assertEqual(latest['core'], current.core)
+                    self.assertEqual(latest['status'], 'verified' if visible or lbm_only else
+                                     'repair_uncertain' if old_matched else 'remote_missing')
+                def get(start, end):
+                    nonlocal reads
+                    reads += 1
+                    if reads == 3 and timing in ('pre_post', 'pre_post_matched', 'pre_post_lbm'):
+                        revise(visible=timing == 'pre_post', old_matched=timing != 'pre_post',
+                               lbm_only=timing == 'pre_post_lbm')
+                    return native_get(start, end)
+                backend.get_body_composition = get
+                if timing == 'initial':
+                    revise()
+                elif timing == 'ignored':
+                    with patch('builtins.input', return_value='IGNORE'), contextlib.redirect_stdout(io.StringIO()):
+                        h.resolve_record(argparse.Namespace(record_id=self.r.key, present=False, absent=False, ignore=True))
+                    latest = dict(h.state_row(self.db, self.r))
+                def confirm(_):
+                    self.assertNotIn(timing, ('initial', 'ignored'))
+                    if timing in ('confirmation', 'confirmation_matched'):
+                        revise(visible=timing == 'confirmation_matched')
+                    return 'RESUME ' + self.r.key
+                with (patch.object(h, 'api_client', return_value=api),
+                      patch('builtins.input', side_effect=confirm) as prompt,
+                      contextlib.redirect_stdout(io.StringIO())):
+                    if timing in ('confirmation_matched', 'pre_post_matched', 'pre_post_lbm'):
+                        h.resume_operation(argparse.Namespace(operation=str(journal)))
+                    else:
+                        with self.assertRaisesRegex(h.SafeError, '本地测量已修订或忽略'):
+                            h.resume_operation(argparse.Namespace(operation=str(journal)))
+                self.assertEqual(prompt.call_count, 0 if timing in ('initial', 'ignored') else 1)
+                if timing == 'pre_post_lbm':
+                    self.assertEqual(json.loads(h.state_row(self.db, current)['payload']), current.payload())
+                else:
+                    self.assertEqual(dict(h.state_row(self.db, current)), latest)
+                if timing == 'pre_post':
+                    self.assertEqual(h.read_operation(journal)['phase'], 'uncertain')
+                elif timing in ('confirmation_matched', 'pre_post_matched', 'pre_post_lbm'):
+                    self.assertEqual(h.read_operation(journal)['phase'], 'verified')
+                else:
+                    self.assertEqual(journal.read_bytes(), old_journal)
+                self.assertEqual(h.read_operation(journal)['measurement'], historical['measurement'])
+                self.assertEqual((len(backend.posts), len(backend.deletes)), (1, 1))
+                self.sync(api)
+                self.assertEqual((len(backend.posts), len(backend.deletes)), (1, 1))
+                refreshed = h.state_row(self.db, current)
+                self.assertEqual(refreshed['core'], current.core)
+                self.assertEqual(json.loads(refreshed['payload']), current.payload())
+                self.assertEqual(refreshed['status'], 'uncertain' if timing == 'pre_post_matched' else latest['status'])
+                self.assertEqual({p.name: p.read_bytes() for p in backup.glob('*.json')}, evidence)
+                self.assertEqual((self.inbox / 'health.json').read_bytes(), source)
+                self.assertEqual(token.read_bytes(), b'unchanged local token')
+
+    def test_reviewed_persistence_protects_updates_during_post_and_vetoes_stale_inflight(self):
+        token = self.state / 'synthetic-token'
+        token.write_bytes(b'unchanged local token')
+        for mode in ('matched_core', 'matched_lbm', 'timeout', 'stale_absence'):
+            with self.subTest(mode=mode):
+                self.db.execute('DELETE FROM uploads'); self.db.commit()
+                for journal in (self.state / 'operations').glob('*.json'):
+                    journal.unlink()
+                (self.state / 'last_sync_comparison.json').unlink(missing_ok=True)
+                self.r = h.Measurement(AT, 70, None, 'PICOOC', lbm=53.55)
+                self.write_export([self.r])
+                backend = API([row(h.Measurement(AT, 71, 23.5, 'PICOOC'))])
+                api = self.native_deletion_api(backend, fail_at=None)
+                plan = self.deletion_plan(api)
+                native_post, native_get = backend.add_body_composition, backend.get_body_composition
+                current, latest, source, changed = self.r, None, None, False
+                def revise():
+                    nonlocal current, latest, source, changed
+                    changed = True
+                    current = h.Measurement(AT, 70 if mode == 'matched_lbm' else 72, None, 'PICOOC', lbm=54)
+                    self.write_export([current])
+                    source = (self.inbox / 'health.json').read_bytes()
+                    self.assertEqual(h.load_measurements(self.cfg)[1], [current])
+                    if mode == 'stale_absence':
+                        backend.rows = [row(current, 301)]
+                    self.sync(api)
+                    latest = dict(h.state_row(self.db, current))
+                    self.assertEqual(latest['core'], current.core)
+                    self.assertEqual(json.loads(latest['payload']), current.payload())
+                def post(**kwargs):
+                    result = native_post(**kwargs)
+                    revise()
+                    if mode == 'timeout':
+                        raise TimeoutError('synthetic accepted upload response lost')
+                    return result
+                def get(start, end):
+                    snapshot = native_get(start, end)
+                    paths = list((self.state / 'operations').glob('*.json'))
+                    if (mode == 'stale_absence' and not changed and paths
+                            and h.read_operation(paths[0])['phase'] == 'uploading'):
+                        # This complete read precedes a newer export/sync; veto at the durable intent gate.
+                        revise()
+                    return snapshot
+                backend.add_body_composition = post
+                backend.get_body_composition = get
+                # Refresh the sealed adapter bindings; only the remote API boundary is replaced.
+                api.api.add_body_composition.side_effect = post
+                with contextlib.redirect_stdout(io.StringIO()):
+                    if mode in ('timeout', 'stale_absence'):
+                        with self.assertRaises(h.SafeError): self.reviewed(api, plan)
+                    else:
+                        self.reviewed(api, plan)
+                self.assertTrue(changed)
+                journal = next((self.state / 'operations').glob('*.json'))
+                job = h.read_operation(journal)
+                self.assertEqual(job['measurement'], self.r.payload())
+                self.assertEqual(job['phase'], 'uncertain' if mode in ('timeout', 'stale_absence') else 'verified')
+                stored = dict(h.state_row(self.db, current))
+                if mode == 'matched_lbm':
+                    self.assertEqual(json.loads(stored['payload']), current.payload())
+                    self.assertEqual(stored['status'], 'verified')
+                else:
+                    self.assertEqual(stored, latest)
+                self.assertEqual((len(backend.posts), len(backend.deletes)), (0 if mode == 'stale_absence' else 1, 1))
+                for submitted in backend.posts:
+                    self.assertEqual(set(submitted), {'timestamp', 'weight', 'percent_fat', 'bmi'})
+                    self.assertEqual(submitted['percent_fat'], 23.5)
+                before = (len(backend.posts), len(backend.deletes))
+                self.sync(api)
+                self.assertEqual((len(backend.posts), len(backend.deletes)), before)
+                self.assertEqual(h.state_row(self.db, current)['core'], current.core)
+                self.assertEqual(json.loads(h.state_row(self.db, current)['payload']), current.payload())
+                backup = Path(job['backup'])
+                self.assertEqual(json.loads((backup / 'plan.json').read_text())['entries'][0]['measurement'], self.r.payload())
+                self.assertEqual((self.inbox / 'health.json').read_bytes(), source)
+                self.assertEqual(token.read_bytes(), b'unchanged local token')
+
     def test_bmi_enrichment_repairs_existing_record_and_verifies_all_fields(self):
         original = self.r
         h.set_status(self.db, original, 'verified')
