@@ -595,6 +595,70 @@ class BulkReplacementTests(unittest.TestCase):
         self.assertEqual((self.inbox / 'health.json').read_bytes(), source)
         self.assertEqual(token.read_bytes(), b'synthetic private token')
 
+    def test_issued_delete_guard_uses_durable_dates_for_cross_day_ids(self):
+        other = h.Measurement(self.r.at + timedelta(days=1), 71, 24, 'PICOOC')
+        records = [self.r, other]
+        self.write_export(records)
+        for mode in ('same_day', 'other_day', 'legacy_ambiguous', 'invalid_day'):
+            with self.subTest(mode=mode), patch.object(h, 'STATE', self.state / mode):
+                h.private_dir(h.STATE)
+                token = h.STATE / 'tokens' / 'synthetic'
+                h.private_dir(token.parent)
+                token.write_bytes(b'synthetic private token')
+                source = (self.inbox / 'health.json').read_bytes()
+                extras = [row(h.Measurement(r.at + timedelta(hours=1), 75, None, 'PICOOC'), 100)
+                          for r in records]
+                backend = API(extras)
+                api = self.native_deletion_api(backend, fail_at=1)
+                with contextlib.closing(h.database()) as db:
+                    obj = h.fetch_remote_snapshot(api, self.r.at.date(), other.at.date())
+                    plan = h.save_comparison(h.comparison_plan(db, records, obj,
+                        self.r.at.date(), other.at.date()), self.cfg)
+                    with self.assertRaises(h.SafeError):
+                        self.invoke(api, plan)
+                    journal = next((h.STATE / 'operations').glob('full-*.json'))
+                    job = h.read_operation(journal)
+                    self.assertEqual(job['events'][0]['calendarDate'], self.r.at.date().isoformat())
+                    if mode == 'legacy_ambiguous':
+                        job['events'][0].pop('calendarDate')
+                        h.write_json(journal, job)
+                    elif mode == 'invalid_day':
+                        job['events'][0]['calendarDate'] = '2020-02-30'
+                        h.write_json(journal, job)
+                    journal_bytes = journal.read_bytes()
+                    backup = Path(job['backup'])
+                    evidence = {p.name: p.read_bytes() for p in backup.glob('*.json')}
+                    chosen = self.r if mode == 'same_day' else other
+                    selected = next(item for item in backend.rows if item['calendarDate'] == chosen.at.date().isoformat())
+                    selected['samplePk'] = '00100'
+                    obj = h.fetch_remote_snapshot(api, chosen.at.date(), chosen.at.date())
+                    plan = h.save_comparison(h.comparison_plan(db, [chosen], obj,
+                        chosen.at.date(), chosen.at.date()), self.cfg)
+                    read = h.read_regular_text
+                    def existing_evidence(path, **kwargs):
+                        if mode in ('same_day', 'other_day') and path.name == 'remote-before.json':
+                            raise AssertionError('Dated intent identifies the deletion without backup inference')
+                        return read(path, **kwargs)
+                    with (patch.object(h, 'api_client', return_value=api),
+                          patch.object(h, 'read_regular_text', side_effect=existing_evidence),
+                          patch('builtins.input', return_value='DELETE 00100') as prompt,
+                          contextlib.redirect_stdout(io.StringIO())):
+                        args = argparse.Namespace(plan=str(plan), remote_id='00100', complete_export=True)
+                        if mode == 'other_day':
+                            h.reviewed_operation(args, self.cfg, True)
+                            self.assertEqual(prompt.call_count, 1)
+                        else:
+                            with self.assertRaises(h.SafeError):
+                                h.reviewed_operation(args, self.cfg, True)
+                            self.assertEqual(prompt.call_count, 0)
+                    self.assertEqual(backend.deletes, [('100', self.r.at.date().isoformat())] +
+                                     ([('100', other.at.date().isoformat())] if mode == 'other_day' else []))
+                    self.assertFalse(backend.posts)
+                    self.assertEqual(journal.read_bytes(), journal_bytes)
+                    self.assertEqual({p.name: p.read_bytes() for p in backup.glob('*.json')}, evidence)
+                    self.assertEqual((self.inbox / 'health.json').read_bytes(), source)
+                    self.assertEqual(token.read_bytes(), b'synthetic private token')
+
     def test_partial_close_normalizes_only_known_ids_and_preserves_other_evidence(self):
         for case in ('integer', 'string', 'leading_zero', 'anonymous_upload', 'weight', 'date',
                      'unknown_id', 'invalid_id', 'body_fat', 'extra'):

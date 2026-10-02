@@ -996,20 +996,29 @@ def unfinished_operation_deletes(history: dict[str, Any], remote_row: dict[str, 
         original = history.get("original") or {}
         return (canonical_remote_id(original.get("samplePk")) == pk
                 and original.get("calendarDate") == remote_row["calendarDate"])
-    sent = {canonical_remote_id(event.get("id")) for event in history.get("events", [])
-            if event.get("kind") == "delete_intent"}
-    if pk not in sent:
+    issued = [event for event in history.get("events", [])
+              if event.get("kind") == "delete_intent" and canonical_remote_id(event.get("id")) == pk]
+    if not issued:
         return False  # Unrelated batches do not require their backup to be readable.
     try:
-        before = json.loads(read_regular_text(Path(history["backup"]) / "remote-before.json"))
-        originals = [row for row in RemoteIndex(before).rows
-                     if canonical_remote_id(row.get("samplePk")) == pk]
-        if len(originals) != 1:
-            raise SafeError("删除意图无法关联唯一原记录。")
-        calendar = date.fromisoformat(originals[0]["calendarDate"]).isoformat()
+        calendars = set()
+        for event in issued:
+            if "calendarDate" not in event:
+                continue
+            calendar = event["calendarDate"]
+            if not isinstance(calendar, str) or date.fromisoformat(calendar).isoformat() != calendar:
+                raise ValueError("invalid deletion date")
+            calendars.add(calendar)
+        if any("calendarDate" not in event for event in issued):
+            before = json.loads(read_regular_text(Path(history["backup"]) / "remote-before.json"))
+            originals = [row for row in RemoteIndex(before).rows
+                         if canonical_remote_id(row.get("samplePk")) == pk]
+            if len(originals) != 1:
+                raise SafeError("删除意图无法关联唯一原记录。")
+            calendars.add(date.fromisoformat(originals[0]["calendarDate"]).isoformat())
     except (OSError, UnicodeError, json.JSONDecodeError, KeyError, TypeError, ValueError, SafeError) as exc:
         raise SafeError("未完成批次的删除日期无法可靠核对，请先核对操作记录；不重复删除。") from exc
-    return calendar == remote_row["calendarDate"]
+    return remote_row["calendarDate"] in calendars
 
 
 def reviewed_operation(args: argparse.Namespace, cfg: dict[str, Any], delete_extra: bool = False) -> None:
