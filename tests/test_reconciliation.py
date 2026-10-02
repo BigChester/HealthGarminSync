@@ -62,6 +62,108 @@ class API:
 
 
 class ReconciliationTests(unittest.TestCase):
+    def test_native_timestamp_collision_preserves_uncertain_replacement_evidence(self):
+        import test_sdk_transport as transport
+        if not transport.PINNED_SDK:
+            self.skipTest('Requires the installed, pinned Garmin SDK')
+        sdk = transport.SDKTransportTests('runTest')
+        try:
+            sdk.setUp()
+            sdk.cfg['allowed_sources'] = ['PICOOC', 'OTHER']
+            records = [h.Measurement(AT, 70, None, 'PICOOC'),
+                       h.Measurement(AT + timedelta(days=2), 74, None, 'OTHER')]
+            self.write_export.__func__(sdk, records)
+            sdk.rows = [row(h.Measurement(r.at, r.weight + 1, 23.5 + n, r.source, 22 + n), 100 + n)
+                        for n, r in enumerate(records)]
+            plan = h.save_comparison(h.comparison_plan(sdk.db, records,
+                {'dateWeightList': copy.deepcopy(sdk.rows)}, records[0].at.date(), records[1].at.date()), sdk.cfg)
+            def server(method, path, pool):
+                if method == 'DELETE':
+                    pk = int(path.rsplit('/', 1)[-1])
+                    sdk.rows = [item for item in sdk.rows if item['samplePk'] != pk]
+                    if pk == 100:
+                        raise sdk.urllib3.exceptions.ReadTimeoutError(pool, path, 'synthetic accepted DELETE')
+                    return 200, {'ok': True}
+                if method == 'POST':
+                    values = sdk.fit_values[-1][1]
+                    at = transport.fit_weight_timestamp(sdk.fit_files[-1]).astimezone(AT.tzinfo)
+                    sdk.rows.append(row(h.Measurement(at, values['weight'], values['percent_fat'],
+                                                     'OTHER', values['bmi']), 200))
+                    return 200, {'detailedImportResult': {'successes': [{}], 'failures': []}}
+                self.assertEqual(method, 'GET')
+                return 200, sdk.read_payload(path)
+            sdk.handler = server
+            token = sdk.state / 'synthetic-token'; token.write_bytes(b'unchanged token')
+            source = (sdk.inbox / 'health.json').read_bytes()
+            with (patch.object(h, 'now', return_value=AT + timedelta(days=10)),
+                  patch.object(h, 'api_client', return_value=sdk.api), contextlib.redirect_stdout(io.StringIO())):
+                def invoke(record):
+                    with patch('builtins.input', return_value='REPLACE ' + record.key):
+                        h.reviewed_operation(argparse.Namespace(plan=str(plan), record_id=record.key,
+                            remote_id=None, complete_export=True), sdk.cfg)
+                with self.assertRaises(h.SafeError):
+                    invoke(records[0])
+                journal = next((sdk.state / 'operations').glob('*.json'))
+                evidence = h.read_operation(journal)
+                self.assertEqual(evidence['phase'], 'uncertain')
+                self.assertEqual((evidence['replacement']['fat'], evidence['replacement']['bmi']), (23.5, 22))
+                saved_journal = journal.read_bytes()
+                backup = Path(evidence['backup'])
+                saved_backup = {p.relative_to(backup): p.read_bytes() for p in backup.rglob('*') if p.is_file()}
+                saved_rows = [dict(h.state_row(sdk.db, r)) if h.state_row(sdk.db, r) else None for r in records]
+                with self.assertRaisesRegex(h.SafeError, '已存在'):
+                    invoke(records[1])
+            self.assertEqual(sum(r['method'] == 'DELETE' for r in sdk.sent), 1)
+            self.assertEqual(sum(r['method'] == 'POST' for r in sdk.sent), 0)
+            self.assertEqual(journal.read_bytes(), saved_journal)
+            self.assertEqual({p.relative_to(backup): p.read_bytes() for p in backup.rglob('*') if p.is_file()}, saved_backup)
+            self.assertEqual([dict(h.state_row(sdk.db, r)) if h.state_row(sdk.db, r) else None for r in records], saved_rows)
+            self.assertEqual((sdk.inbox / 'health.json').read_bytes(), source)
+            self.assertEqual(token.read_bytes(), b'unchanged token')
+        finally:
+            sdk.doCleanups()
+
+    def test_single_and_full_replacement_reject_occupied_evidence_paths_before_delete(self):
+        import replace_history as bulk
+        for full in (False, True):
+            for occupied in ('backup', 'journal'):
+                with self.subTest(full=full, occupied=occupied), tempfile.TemporaryDirectory() as temp:
+                    state = Path(temp) / 'state'
+                    h.private_dir(state)
+                    with patch.object(h, 'STATE', state), contextlib.closing(h.database()) as db:
+                        api = API([dict(row(self.r), weight=71000)])
+                        plan = h.save_comparison(h.comparison_plan(db, [self.r],
+                            {'dateWeightList': api.rows}, AT.date(), AT.date()), self.cfg)
+                        fixed_time = AT + timedelta(days=10)
+                        stamp = fixed_time.strftime('%Y%m%dT%H%M%S%fZ')
+                        name = ('full-' if full else '') + stamp
+                        backup = state / 'backups' / name
+                        journal = state / 'operations' / (name + '.json')
+                        if occupied == 'backup':
+                            h.private_dir(backup)
+                            old_path = backup / 'remote.json'
+                            old_path.write_bytes(b'previous recovery evidence')
+                        else:
+                            old_path = journal
+                            h.write_json(journal, {'key': 'previous-operation', 'phase': 'verified'})
+                        old_bytes = old_path.read_bytes()
+                        source = (self.inbox / 'health.json').read_bytes()
+                        with (patch.object(h, 'now', return_value=fixed_time), patch.object(h, 'api_client', return_value=api),
+                              patch('builtins.input', return_value='REPLACE ALL' if full else 'REPLACE ' + self.r.key),
+                              contextlib.redirect_stdout(io.StringIO())):
+                            with self.assertRaisesRegex(h.SafeError, '已存在'):
+                                args = argparse.Namespace(plan=str(plan), complete_export=True,
+                                                          record_id=self.r.key, remote_id=None)
+                                if full:
+                                    bulk.execute(args, self.cfg, api)
+                                else:
+                                    h.reviewed_operation(args, self.cfg)
+                        self.assertEqual(old_path.read_bytes(), old_bytes)
+                        self.assertEqual(api.deletes, [])
+                        self.assertEqual(api.posts, [])
+                        self.assertIsNone(h.state_row(db, self.r))
+                        self.assertEqual((self.inbox / 'health.json').read_bytes(), source)
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
@@ -215,10 +317,10 @@ class ReconciliationTests(unittest.TestCase):
         plan = h.save_comparison(self.plan(backend.rows, [self.r, other]),
                                  dict(self.cfg, inbox=str(source_inbox)))
         native_write = h.write_json
-        def save_old_plan(path, data):
+        def save_old_plan(path, data, **kwargs):
             if legacy and path.name == 'plan.json' and path.parent.parent.name == 'backups':
                 data = {key: value for key, value in data.items() if key != 'config'}
-            native_write(path, data)
+            native_write(path, data, **kwargs)
         with patch.object(h, 'write_json', side_effect=save_old_plan):
             with self.assertRaises(h.SafeError):
                 self.reviewed(api, plan)
@@ -831,10 +933,10 @@ class ReconciliationTests(unittest.TestCase):
                 api = self.native_deletion_api(backend, fail_at=1)
                 plan = self.deletion_plan(api)
                 native_write = h.write_json
-                def legacy_write(path, value):
+                def legacy_write(path, value, **kwargs):
                     if kind == 'legacy_replacement' and path.parent.name == 'operations':
                         value = {key: item for key, item in value.items() if key != 'measurement'}
-                    native_write(path, value)
+                    native_write(path, value, **kwargs)
                 with patch.object(h, 'write_json', side_effect=legacy_write), self.assertRaises(h.SafeError):
                     if kind == 'full':
                         with patch('builtins.input', return_value='REPLACE ALL'), contextlib.redirect_stdout(io.StringIO()):

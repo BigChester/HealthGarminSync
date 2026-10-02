@@ -72,6 +72,15 @@ def private_dir(path: Path) -> None:
     path.chmod(0o700)
 
 
+def create_backup_dir(path: Path) -> None:
+    private_dir(path.parent)
+    try:
+        path.mkdir(mode=0o700)
+    except FileExistsError as exc:
+        raise SafeError("备份路径已存在，未执行修改；请保留原有恢复证据后重新操作。") from exc
+    path.chmod(0o700)
+
+
 def open_regular_file(path, mode, *, encoding=None, errors=None, reject_symlink=True):
     """Open a regular file without blocking or truncating an unchecked path."""
     flags = {"r": os.O_RDONLY, "rb": os.O_RDONLY, "w": os.O_WRONLY | os.O_CREAT,
@@ -122,7 +131,7 @@ class PrivateRotatingFileHandler(RotatingFileHandler):
         return open_regular_append(self.baseFilename, encoding=self.encoding, errors=self.errors)
 
 
-def write_json(path: Path, data: Any) -> None:
+def write_json(path: Path, data: Any, *, exclusive: bool = False) -> None:
     private_dir(path.parent)
     tmp = path.with_name(path.name + ".tmp")
     if tmp.is_symlink() or path.is_symlink():
@@ -143,7 +152,15 @@ def write_json(path: Path, data: Any) -> None:
     else:
         f.close()
     tmp.chmod(0o600)
-    tmp.replace(path)
+    if exclusive:
+        try:
+            os.link(tmp, path)
+        except FileExistsError as exc:
+            raise SafeError("操作记录已存在，未执行修改；请保留原有恢复证据后重新操作。") from exc
+        finally:
+            tmp.unlink()
+    else:
+        tmp.replace(path)
 
 
 def config() -> dict[str, Any]:
@@ -1237,7 +1254,7 @@ def reviewed_operation(args: argparse.Namespace, cfg: dict[str, Any], delete_ext
         fresh = latest
         stamp = now().strftime("%Y%m%dT%H%M%S%fZ")
         backup = STATE / "backups" / stamp
-        private_dir(backup)
+        create_backup_dir(backup)
         write_json(backup / "remote.json", obj)
         write_json(backup / "plan.json", {**fresh, "config": source_cfg})
         write_json(backup / "config.json", cfg)
@@ -1250,7 +1267,7 @@ def reviewed_operation(args: argparse.Namespace, cfg: dict[str, Any], delete_ext
                    "replacement": replacement.payload() if measurement else None,
                    "backup": str(backup)}
         journal_path = operation_dir / (stamp + ".json")
-        write_json(journal_path, journal)  # Durable before DELETE, including the original record.
+        write_json(journal_path, journal, exclusive=True)  # Durable before DELETE, including the original record.
         if measurement:
             set_status(db, local, "repair_uncertain", "Reviewed replacement started; do not resend or delete again")
         try:

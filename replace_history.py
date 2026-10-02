@@ -238,7 +238,7 @@ def execute(args, cfg, api=None):
             raise h.SafeError('确认期间 Garmin 数据已变化，未执行替换。')
         stamp = h.now().strftime('%Y%m%dT%H%M%S%fZ')
         backup = h.STATE / 'backups' / ('full-' + stamp)
-        h.private_dir(backup)
+        h.create_backup_dir(backup)
         h.write_json(backup / 'remote-before.json', latest)
         h.write_json(backup / 'plan.json', saved)
         h.write_json(backup / 'config.json', cfg)
@@ -258,7 +258,7 @@ def execute(args, cfg, api=None):
         job = {'type': 'full_replacement', 'key': 'full-' + stamp, 'phase': 'replacing',
                'start': start.isoformat(), 'end': end.isoformat(), 'targets': payloads,
                'record_ids': [r.key for r in records], 'backup': str(backup), 'events': []}
-        h.write_json(journal_path, job)
+        h.write_json(journal_path, job, exclusive=True)
         def event(kind, identity, calendar=None):
             entry = {'at': h.now().isoformat(), 'kind': kind, 'id': identity}
             if calendar is not None:
