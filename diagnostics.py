@@ -172,16 +172,17 @@ def collect():
             invalid_file = None
             runtime_names = ('run.lock', 'agent-log.lock', 'sync.log', 'sync.sqlite3', 'last_attempt.json.tmp',
                              'last_agent_attempt.json.tmp', 'last_run.json.tmp')
-            sync_backups = ('sync.log.1', 'sync.log.2', 'sync.log.3')
+            directory_obstacles = ('sync.log.1', 'sync.log.2', 'sync.log.3',
+                                   'sync.sqlite3-journal', 'sync.sqlite3-wal')
             log_names = ['agent.out.log', 'agent.err.log']
             readwrite_logs = {base + suffix for base in log_names for suffix in ('', '.1', '.2', '.3')}
             log_names.extend(child.name for child in children
                              if re.fullmatch(r'agent\.(?:out|err)\.log\.[0-9]+', child.name))
-            for name in (*runtime_names, *log_names, *sync_backups):
+            for name in (*runtime_names, *log_names, *directory_obstacles):
                 path = h.STATE / name
                 try:
                     mode = path.lstat().st_mode
-                    if name in sync_backups:
+                    if name in directory_obstacles:
                         if stat.S_ISDIR(mode):
                             invalid_file = name
                             break

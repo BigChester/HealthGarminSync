@@ -98,7 +98,8 @@ class DoctorTests(unittest.TestCase):
         for path in [self.root, *self.root.rglob('*')]:
             mode = path.stat(follow_symlinks=False).st_mode
             result[str(path.relative_to(self.root))] = (
-                stat.S_IMODE(mode), path.read_bytes() if stat.S_ISREG(mode) and path.suffix != '.sqlite3' else None)
+                stat.S_IMODE(mode), path.read_bytes() if stat.S_ISREG(mode)
+                and path.suffix != '.sqlite3' and not path.name.startswith('sync.sqlite3-') else None)
         return result
 
     def invoke(self, *arguments):
@@ -116,7 +117,7 @@ class DoctorTests(unittest.TestCase):
         def read_without_tokens(path, *args, **kwargs):
             if self.tokens in path.parents:
                 raise AssertionError('token content read')
-            if path.suffix == '.sqlite3':
+            if path.suffix == '.sqlite3' or path.name.startswith('sync.sqlite3-'):
                 raise AssertionError('database content read')
             if path.parent == self.state and re.fullmatch(r'agent\.(?:out|err)\.log(?:\.[0-9]+)?', path.name):
                 raise AssertionError('background log content read')
@@ -126,7 +127,7 @@ class DoctorTests(unittest.TestCase):
             path = Path(path)
             if mode not in ('r', 'rb') or path == self.tokens or self.tokens in path.parents:
                 raise AssertionError('unsafe local file access')
-            if path.suffix == '.sqlite3':
+            if path.suffix == '.sqlite3' or path.name.startswith('sync.sqlite3-'):
                 raise AssertionError('database content read')
             if path.parent == self.state and re.fullmatch(r'agent\.(?:out|err)\.log(?:\.[0-9]+)?', path.name):
                 raise AssertionError('background log content read')
@@ -397,7 +398,7 @@ finally:
                     finally:
                         path.unlink() if kind == 'fifo' else path.rmdir()
 
-    def test_database_metadata_diagnoses_real_cli_type_and_permission_failures(self):
+    def test_database_metadata_diagnoses_real_cli_type_permission_and_sidecar_directory_failures(self):
         script = '''import contextlib, io, json, os, pathlib, socket, sys
 from unittest.mock import patch
 sys.path[:0] = [sys.argv[1], str(pathlib.Path(sys.argv[1]) / 'tests')]
@@ -411,6 +412,7 @@ try:
     database = fixture.state / 'sync.sqlite3'
     if kind != 'missing':
         connection = h.database()
+        fixture.assertEqual(connection.execute('PRAGMA journal_mode').fetchone()[0], 'delete')
         connection.close()
     if kind in ('symlink', 'directory', 'fifo'):
         outside = fixture.root / 'outside.sqlite3'
@@ -423,9 +425,12 @@ try:
             os.mkfifo(database, 0o600)
     elif kind in ('readonly', 'writeonly'):
         database.chmod(0o400 if kind == 'readonly' else 0o200)
+    elif kind.startswith(('journal-', 'wal-')):
+        sidecar = fixture.state / ('sync.sqlite3-journal' if kind.startswith('journal-') else 'sync.sqlite3-wal')
+        sidecar.mkdir() if kind.endswith('-directory') else sidecar.touch()
     native_open, native_connect = pathlib.Path.open, h.sqlite3.connect
     def file_open(path, *args, **kwargs):
-        if path.suffix == '.sqlite3':
+        if path.suffix == '.sqlite3' or path.name.startswith('sync.sqlite3-'):
             raise AssertionError('database content read as file')
         return native_open(path, *args, **kwargs)
     def connect(path, *args, **kwargs):
@@ -453,7 +458,7 @@ try:
         calls['api'] += 1
         return API()
     source, token = fixture.export.read_bytes(), (fixture.tokens / 'oauth.json').read_bytes()
-    expected = 0 if kind in ('missing', 'normal') else 2
+    expected = 0 if kind in ('missing', 'normal', 'journal-regular', 'wal-regular') else 2
     with patch.object(pathlib.Path, 'open', file_open), patch.object(h.sqlite3, 'connect', connect):
         code, _, checks = fixture.report()
         fixture.assertEqual(code, expected)
@@ -463,7 +468,9 @@ try:
         text_code, text = fixture.invoke('doctor')
         fixture.assertEqual(text_code, expected)
         if expected:
-            fixture.assertIn('state/sync.sqlite3', text)
+            expected_name = sidecar.name if kind.endswith('-directory') else 'sync.sqlite3'
+            fixture.assertIn('state/' + expected_name, checks['state']['hint'])
+            fixture.assertIn('state/' + expected_name, text)
         h.api_client = client
         sys.argv = ['hg', 'run']
         output, errors = io.StringIO(), io.StringIO()
@@ -471,7 +478,7 @@ try:
             fixture.assertEqual(h.main(), expected)
         fixture.assertNotIn(SECRET, errors.getvalue())
         fixture.assertEqual(fixture.report()[0], expected)
-    expected_calls = 1 if kind in ('missing', 'normal', 'readonly') else 0
+    expected_calls = 1 if kind in ('missing', 'normal', 'readonly', 'journal-regular', 'wal-regular') else 0
     fixture.assertEqual(calls, {'api': expected_calls, 'get': expected_calls, 'post': 0, 'delete': 0})
     attempt = json.loads((fixture.state / 'last_attempt.json').read_text())
     fixture.assertEqual(attempt['outcome'], 'completed' if expected == 0 else 'failed')
@@ -480,7 +487,8 @@ try:
 finally:
     fixture.doCleanups()
 '''
-        for kind in ('missing', 'normal', 'symlink', 'directory', 'fifo', 'readonly', 'writeonly'):
+        for kind in ('missing', 'normal', 'symlink', 'directory', 'fifo', 'readonly', 'writeonly',
+                     'journal-directory', 'wal-directory', 'journal-regular', 'wal-regular'):
             with self.subTest(kind=kind), tempfile.TemporaryDirectory() as isolated:
                 child = subprocess.Popen([sys.executable, '-B', '-c', script,
                     str(Path(__file__).resolve().parents[1]), kind], cwd=isolated,
