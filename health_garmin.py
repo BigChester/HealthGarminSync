@@ -916,9 +916,10 @@ def missing_source_alias(r: Measurement, context: list[tuple[str, datetime, str]
     return None
 
 
-def fetch_remote_snapshot(api: Any, start: date, end: date) -> dict[str, Any]:
-    """Fetch all chunks before any write; pad dates for UTC/local midnight boundaries."""
-    cursor, final = start - timedelta(days=1), end + timedelta(days=1)
+def fetch_remote_snapshot(api: Any, start: date, end: date, *, targets=()) -> dict[str, Any]:
+    """Fetch all chunks before writes, covering job dates and target UTC dates."""
+    days = [start, end, *(r.at.astimezone(UTC).date() for r in targets)]
+    cursor, final = min(days) - timedelta(days=1), max(days) + timedelta(days=1)
     rows, seen = [], {}
     while cursor <= final:
         stop = min(cursor + timedelta(days=30), final)
@@ -1041,7 +1042,7 @@ def compare_exports(args: argparse.Namespace, cfg: dict[str, Any]) -> dict[str, 
     if not records:
         raise SafeError("选定范围没有可用 Apple 测量，不能据此生成清理清单。")
     api = api_client()
-    obj = fetch_remote_snapshot(api, start, end)
+    obj = fetch_remote_snapshot(api, start, end, targets=records)
     with contextlib.closing(database()) as db, db:
         plan = comparison_plan(db, records, obj, start, end)
     print_comparison(plan)
@@ -1161,7 +1162,7 @@ def reviewed_operation(args: argparse.Namespace, cfg: dict[str, Any], delete_ext
     if not records or waiting:
         raise SafeError("Apple 导出为空或存在歧义，请重新对账。")
     api = api_client()
-    obj = fetch_remote_snapshot(api, start, end)
+    obj = fetch_remote_snapshot(api, start, end, targets=records)
     with contextlib.closing(database()) as db, db:
         fresh = comparison_plan(db, records, obj, start, end)
         if delete_extra:
@@ -1237,7 +1238,7 @@ def reviewed_operation(args: argparse.Namespace, cfg: dict[str, Any], delete_ext
         latest_records = [r for r in latest_records if start <= r.at.date() <= end]
         if not latest_records or latest_waiting:
             raise SafeError("确认期间 Apple 数据已变化，请重新对账。")
-        obj = fetch_remote_snapshot(api, start, end)
+        obj = fetch_remote_snapshot(api, start, end, targets=latest_records)
         latest = comparison_plan(db, latest_records, obj, start, end)
         if delete_extra:
             candidates = [r for r in latest["extra_remote"] if str(r.get("samplePk")) == pk]
@@ -1272,7 +1273,7 @@ def reviewed_operation(args: argparse.Namespace, cfg: dict[str, Any], delete_ext
             set_status(db, local, "repair_uncertain", "Reviewed replacement started; do not resend or delete again")
         try:
             api.delete_weigh_in(pk, calendar)
-            remaining = fetch_remote_snapshot(api, start, end)
+            remaining = fetch_remote_snapshot(api, start, end, targets=latest_records)
             if not original_id_absent(remaining["dateWeightList"], pk, calendar=calendar):
                 raise SafeError("删除请求后原记录仍可见，暂停后续操作。")
             journal["phase"] = "deleted_verified" if delete_extra else "deleted"
@@ -1389,7 +1390,7 @@ def verify_operation(args: argparse.Namespace) -> bool:
     r = Measurement(**{**payload, "at": aware(payload["at"])}) if payload else None
     original_pk = str(journal["original"]["samplePk"]) if r is None else None
     try:
-        obj = fetch_remote_snapshot(api_client(), day, day)
+        obj = fetch_remote_snapshot(api_client(), day, day, targets=[r] if r else ())
         if r is not None:
             classification = classify_remote(r, obj)
             matched = classification == "matched"
@@ -1557,7 +1558,7 @@ def load_local_comparison(cfg: dict[str, Any], records: list[Measurement], api: 
     if not records:
         return {"entries": [], "counts": {}, "extra_remote": []}
     start, end = min(r.at.date() for r in records), max(r.at.date() for r in records)
-    obj = fetch_remote_snapshot(api, start, end)
+    obj = fetch_remote_snapshot(api, start, end, targets=records)
     plan = comparison_plan(db, source_records if source_records is not None else records,
                            obj, start, end, selected_ids={r.key for r in records})
     save_comparison(plan, cfg, automatic=True)

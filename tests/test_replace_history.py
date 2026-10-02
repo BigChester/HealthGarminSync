@@ -47,7 +47,7 @@ class BulkReplacementTests(unittest.TestCase):
         return h.GarminMeasurementAPI(raw)
 
     def assert_native_cross_calendar_batch(self, first_at, *, second=False, unrelated=False,
-                                          check_changes=False, anonymous=None):
+                                          check_changes=False, anonymous=None, account_hours=8, automatic=False):
         import test_sdk_transport as transport
         if not transport.PINNED_SDK:
             self.skipTest('Requires the installed, pinned Garmin SDK')
@@ -55,7 +55,7 @@ class BulkReplacementTests(unittest.TestCase):
         try:
             sdk.setUp()
             sdk.enterContext(patch('subprocess.run', side_effect=transport.forbidden))
-            account = timezone(timedelta(hours=8))
+            account = timezone(timedelta(hours=account_hours))
             first = h.Measurement(datetime.fromisoformat(first_at), 70, 23.5, 'PICOOC', 22, 53.55)
             records = [first]
             if second:
@@ -65,6 +65,10 @@ class BulkReplacementTests(unittest.TestCase):
             elif anonymous == 'two':
                 records.append(h.Measurement(first.at + timedelta(hours=1), 72, 24, 'PICOOC', 23, 54))
             self.write_export.__func__(sdk, records)
+            source_path = sdk.inbox / 'health.json'
+            exported = json.loads(source_path.read_text())
+            exported['exported_at'] = '2020-02-22T09:00:00+08:00'
+            source_path.write_text(json.dumps(exported))
             self.assertEqual(h.load_measurements(sdk.cfg)[1], records)
             rows = [row(h.Measurement(r.at.astimezone(account), r.weight, r.fat, r.source, r.bmi), 100 + n)
                     for n, r in enumerate(records)]
@@ -85,11 +89,18 @@ class BulkReplacementTests(unittest.TestCase):
             source = (sdk.inbox / 'health.json').read_bytes()
             token = sdk.state / 'synthetic-token'; token.write_bytes(b'unchanged token')
             start, end = min(r.at.date() for r in records), max(r.at.date() for r in records)
-            obj = h.fetch_remote_snapshot(sdk.api, start, end)
-            plan = h.comparison_plan(sdk.db, records, obj, start, end)
+            if automatic:
+                with patch.object(h, 'api_client', return_value=sdk.api), contextlib.redirect_stdout(io.StringIO()):
+                    h.run_sync(sdk.cfg)
+                automatic_plan = json.loads((sdk.state / 'plans' / 'sync-latest.json').read_text())
+                self.assertEqual(automatic_plan['counts'], {'matched': len(records)})
+            with patch.object(h, 'api_client', return_value=sdk.api), contextlib.redirect_stdout(io.StringIO()):
+                plan = h.compare_exports(argparse.Namespace(inbox=None, since=start.isoformat(),
+                                                            until=end.isoformat()), sdk.cfg)
+            obj = plan['remote_snapshot']
             self.assertEqual(plan['counts'], {'matched': len(records)})
             self.assertFalse(plan['extra_remote'])
-            path = h.save_comparison(plan, sdk.cfg)
+            path = next((sdk.state / 'plans').glob('compare-*.json'))
             output = io.StringIO()
             with patch('builtins.input', return_value='REPLACE ALL'), contextlib.redirect_stdout(output):
                 bulk.execute(argparse.Namespace(plan=str(path), complete_export=True), sdk.cfg, sdk.api)
@@ -147,6 +158,85 @@ class BulkReplacementTests(unittest.TestCase):
         for mode in ('missing', 'two'):
             with self.subTest(anonymous=mode):
                 self.assert_native_cross_calendar_batch('2020-02-19T08:30:00-08:00', anonymous=mode)
+
+    def test_native_compare_and_full_verification_cover_two_day_timezone_difference(self):
+        for at, account_hours in (('2020-02-19T23:30:00-12:00', 14),
+                                  ('2020-02-21T00:30:00+14:00', -12)):
+            with self.subTest(source_at=at, account_offset=account_hours):
+                self.assert_native_cross_calendar_batch(at, account_hours=account_hours, unrelated=True, automatic=True)
+
+    def test_legacy_partial_batch_checks_confirmed_upload_on_new_utc_padding_day(self):
+        import test_sdk_transport as transport
+        if not transport.PINNED_SDK:
+            self.skipTest('Requires the installed, pinned Garmin SDK')
+        for unrelated in (False, True):
+            with self.subTest(unbacked_row=unrelated):
+                sdk = transport.SDKTransportTests('runTest')
+                try:
+                    sdk.setUp()
+                    sdk.enterContext(patch('subprocess.run', side_effect=transport.forbidden))
+                    first = h.Measurement(datetime.fromisoformat('2020-02-19T23:30:00-12:00'),
+                                          70, 23.5, 'PICOOC', 22, 53.55)
+                    second = h.Measurement(first.at + timedelta(minutes=10), 72, 24, 'PICOOC', 23, 54)
+                    self.write_export.__func__(sdk, [first, second])
+                    source_path = sdk.inbox / 'health.json'
+                    export = json.loads(source_path.read_text()); export['exported_at'] = '2020-02-22T09:00:00+08:00'
+                    source_path.write_text(json.dumps(export))
+                    source = source_path.read_bytes()
+                    token = sdk.state / 'synthetic-token'; token.write_bytes(b'unchanged token')
+                    paused, readbacks = True, 0
+                    def server(method, path, pool):
+                        nonlocal readbacks
+                        if method == 'POST':
+                            self.assertEqual(sum(r['method'] == 'POST' for r in sdk.sent), 1)
+                            wire = transport.fit_weight_timestamp(sdk.fit_files[-1])
+                            sdk.rows = [row(h.Measurement(wire.astimezone(timezone(timedelta(hours=14))),
+                                                          first.weight, first.fat, first.source, first.bmi), 201)]
+                            return 200, {'detailedImportResult': {'successes': [{}], 'failures': []}}
+                        self.assertEqual(method, 'GET')
+                        if sdk.rows and paused:
+                            readbacks += 1
+                            if readbacks > 1:
+                                raise sdk.urllib3.exceptions.ReadTimeoutError(pool, path, 'synthetic next-target interruption')
+                        return 200, sdk.read_payload(path)
+                    sdk.handler = server
+                    # Generate a real paused batch with the previous release's query contract.
+                    native_fetch = h.fetch_remote_snapshot
+                    def legacy_fetch(api, start, end, **kwargs):
+                        return native_fetch(api, start, end)
+                    with (patch.object(h, 'fetch_remote_snapshot', side_effect=legacy_fetch),
+                          patch.object(h, 'api_client', return_value=sdk.api), contextlib.redirect_stdout(io.StringIO())):
+                        h.compare_exports(argparse.Namespace(inbox=None, since=first.at.date().isoformat(),
+                                                            until=first.at.date().isoformat()), sdk.cfg)
+                        plan = next((sdk.state / 'plans').glob('*.json'))
+                        with patch('builtins.input', return_value='REPLACE ALL'), self.assertRaises(h.SafeError):
+                            bulk.execute(argparse.Namespace(plan=str(plan), complete_export=True), sdk.cfg, sdk.api)
+                    journal = next((sdk.state / 'operations').glob('full-*.json'))
+                    job = h.read_operation(journal)
+                    self.assertEqual([e['kind'] for e in job['events']], ['upload_intent', 'upload_verified'])
+                    backup = Path(job['backup']) / 'remote-before.json'
+                    evidence = backup.read_bytes()
+                    self.assertEqual(json.loads(evidence)['dateWeightList'], [])
+                    journal_bytes = journal.read_bytes()
+                    paused = False
+                    if unrelated:
+                        at = first.at.astimezone(timezone(timedelta(hours=14))) + timedelta(hours=4)
+                        sdk.rows.append(row(h.Measurement(at, 75, None, 'PICOOC'), 300))
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        if unrelated:
+                            with self.assertRaisesRegex(h.SafeError, '远端出现意外变化'):
+                                bulk.close_verified_partial(journal, dict(sdk.cfg, enabled=False), sdk.api)
+                            self.assertEqual(journal.read_bytes(), journal_bytes)
+                        else:
+                            bulk.close_verified_partial(journal, dict(sdk.cfg, enabled=False), sdk.api)
+                            self.assertEqual(h.read_operation(journal)['phase'], 'closed_partial')
+                    self.assertEqual(sum(r['method'] == 'POST' for r in sdk.sent), 1)
+                    self.assertFalse(any(r['method'] == 'DELETE' for r in sdk.sent))
+                    self.assertEqual(backup.read_bytes(), evidence)
+                    self.assertEqual(source_path.read_bytes(), source)
+                    self.assertEqual(token.read_bytes(), b'unchanged token')
+                finally:
+                    sdk.doCleanups()
 
     def assert_concurrent_export_backup_rejected(self, intermediate):
         source = self.inbox / 'health.json'

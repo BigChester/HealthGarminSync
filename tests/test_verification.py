@@ -1,7 +1,7 @@
 """Current verification results stay separate from completed operation history."""
 import argparse
 import contextlib
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 import io
 import json
 import logging
@@ -26,6 +26,69 @@ class OperationVerificationTests(unittest.TestCase):
     native_deletion_api = fixtures.ReconciliationTests.native_deletion_api
     deletion_plan = fixtures.ReconciliationTests.deletion_plan
     reviewed = fixtures.ReconciliationTests.reviewed
+
+    def test_native_repair_uses_original_calendar_and_verifies_corrected_target_calendar(self):
+        import test_sdk_transport as transport
+        if not transport.PINNED_SDK:
+            self.skipTest('Requires the installed, pinned Garmin SDK')
+        sdk = transport.SDKTransportTests('runTest')
+        try:
+            sdk.setUp()
+            sdk.enterContext(patch('subprocess.run', side_effect=transport.forbidden))
+            r = h.Measurement(datetime.fromisoformat('2020-02-19T23:30:00-12:00'),
+                              70, 23.5, 'PICOOC', 22, 53.55)
+            self.write_export.__func__(sdk, [r])
+            source_path = sdk.inbox / 'health.json'
+            export = json.loads(source_path.read_text()); export['exported_at'] = '2020-02-22T09:00:00+08:00'
+            source_path.write_text(json.dumps(export))
+            original = row(h.Measurement(r.at.astimezone(timezone(timedelta(hours=14))),
+                                         71, r.fat, r.source, r.bmi), 100)
+            sdk.rows = [original]
+            def server(method, path, pool):
+                if method == 'DELETE':
+                    self.assertEqual(path, '/weight-service/weight/2020-02-21/byversion/100')
+                    sdk.rows = []
+                    return 200, {'ok': True}
+                if method == 'POST':
+                    self.assertEqual(path, '/upload-service/upload')
+                    wire = transport.fit_weight_timestamp(sdk.fit_files[-1])
+                    # The same physical target now appears on the other legal account calendar.
+                    sdk.rows = [row(h.Measurement(wire.astimezone(timezone(timedelta(hours=-12))),
+                                                  r.weight, r.fat, r.source, r.bmi), 201)]
+                    return 200, {'detailedImportResult': {'successes': [{}], 'failures': []}}
+                self.assertEqual(method, 'GET')
+                return 200, sdk.read_payload(path)
+            sdk.handler = server
+            source = source_path.read_bytes()
+            token = sdk.state / 'synthetic-token'; token.write_bytes(b'unchanged token')
+            with patch.object(h, 'api_client', return_value=sdk.api), contextlib.redirect_stdout(io.StringIO()):
+                plan = h.compare_exports(argparse.Namespace(inbox=None, since=r.at.date().isoformat(),
+                                                            until=r.at.date().isoformat()), sdk.cfg)
+                self.assertEqual(plan['counts'], {'replace': 1})
+                path = next((sdk.state / 'plans').glob('*.json'))
+                with patch('builtins.input', return_value='REPLACE ' + r.key):
+                    h.reviewed_operation(argparse.Namespace(plan=str(path), record_id=r.key,
+                                                            remote_id='100', complete_export=True), sdk.cfg)
+                journal = next((sdk.state / 'operations').glob('*.json'))
+                self.assertTrue(h.verify_operation(argparse.Namespace(operation=str(journal))))
+                with patch('builtins.input') as prompt:
+                    h.resume_operation(argparse.Namespace(operation=str(journal)))
+                prompt.assert_not_called()
+            job = h.read_operation(journal)
+            self.assertEqual(job['original']['calendarDate'], '2020-02-21')
+            self.assertEqual(job['measurement'], r.payload())
+            self.assertEqual(job['replacement']['at'], r.at.isoformat())
+            self.assertTrue(job['last_check_passed'])
+            self.assertEqual(sdk.rows[0]['calendarDate'], '2020-02-19')
+            self.assertEqual(sum(request['method'] == 'POST' for request in sdk.sent), 1)
+            self.assertEqual(sum(request['method'] == 'DELETE' for request in sdk.sent), 1)
+            self.assertEqual(h.get_status(sdk.db, r), 'verified')
+            backup = Path(job['backup'])
+            self.assertEqual(json.loads((backup / 'remote.json').read_text())['dateWeightList'], [original])
+            self.assertEqual(source_path.read_bytes(), source)
+            self.assertEqual(token.read_bytes(), b'unchanged token')
+        finally:
+            sdk.doCleanups()
 
     def journal(self, phase='verified', deletion=False, full=False):
         path = self.state / 'operations' / 'verification.json'

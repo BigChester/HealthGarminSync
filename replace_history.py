@@ -93,7 +93,7 @@ def close_verified_partial(path, cfg, api):
     removed_ids = set(removed)
     def identity(row):
         return h.canonical_remote_id(row.get('samplePk')), row.get('calendarDate')
-    obj = h.fetch_remote_snapshot(api, start, end)
+    obj = h.fetch_remote_snapshot(api, start, end, targets=targets)
     index = h.RemoteIndex(obj)
     added = set()
     for r in targets:
@@ -146,7 +146,7 @@ def verify(path, api=None):
     backup = Path(job['backup'])
     try:
         api = api or h.api_client()
-        obj = h.fetch_remote_snapshot(api, start, end)
+        obj = h.fetch_remote_snapshot(api, start, end, targets=targets)
         index = h.RemoteIndex(obj)
         decisions = [index.decide(r) for r in targets]
         owners = {indices[0] for kind, indices, _ in decisions if kind == 'matched'}
@@ -198,7 +198,7 @@ def execute(args, cfg, api=None):
     if payloads != [e['measurement'] for e in saved['entries']]:
         raise h.SafeError('Apple 数据已变化，请重新对账。')
     api = api or h.api_client()
-    obj = h.fetch_remote_snapshot(api, start, end)
+    obj = h.fetch_remote_snapshot(api, start, end, targets=records)
     if signature(obj['dateWeightList']) != signature(saved['remote_snapshot']['dateWeightList']):
         raise h.SafeError('Garmin 数据已变化，请重新对账。')
     index = h.RemoteIndex(obj)
@@ -233,7 +233,7 @@ def execute(args, cfg, api=None):
             return
         if payloads != [r.payload() for r in load_targets(cfg, start, end)]:
             raise h.SafeError('确认期间 Apple 数据已变化，未执行替换。')
-        latest = h.fetch_remote_snapshot(api, start, end)
+        latest = h.fetch_remote_snapshot(api, start, end, targets=records)
         if signature(latest['dateWeightList']) != signature(index.rows):
             raise h.SafeError('确认期间 Garmin 数据已变化，未执行替换。')
         stamp = h.now().strftime('%Y%m%dT%H%M%S%fZ')
