@@ -133,6 +133,80 @@ raise SystemExit(h.main())
             self.assertEqual(path.stat().st_mode & 0o777, 0o600)
         self.assertIn('记录 19 café', log.read_text(encoding='utf-8'))
 
+    def test_generated_sync_backups_report_directory_obstacle_and_real_cli_recovers(self):
+        log = self.state / 'sync.log'
+        with contextlib.closing(h.PrivateRotatingFileHandler(log, maxBytes=1_000_000,
+                                                           backupCount=3, encoding='utf-8')) as handler:
+            for _ in range(5):
+                handler.emit(logging.LogRecord('fixture', logging.INFO, '', 0, 'X' * 999900, (), None))
+        self.assertEqual({path.name for path in self.state.glob('sync.log*')},
+                         {'sync.log', 'sync.log.1', 'sync.log.2', 'sync.log.3'})
+        self.assertEqual(self.report()[0], 0)
+        source, tokens = self.export.read_bytes(), (self.tokens / 'oauth.json').read_bytes()
+        obstacle = self.state / 'sync.log.3'
+        obstacle.unlink()
+        obstacle.mkdir()
+        code, _, checks = self.report()
+        self.assertEqual(code, 2)
+        self.assertIn('state/sync.log.3', checks['state']['hint'])
+        self.assertEqual(checks['last_run']['status'], 'info')
+        self.assertEqual(checks['last_agent_attempt']['status'], 'info')
+        self.assertEqual(self.invoke('doctor')[0], 2)
+        self.install_temporary_script(OFFLINE + '''
+api_client = manage_agent = forbidden
+def run_sync(cfg, record_id=None):
+    assert cfg['enabled']
+    LOG.info('Synthetic next sync iteration ' + 'Y' * 300)
+''')
+        script = "import sys, health_garmin as h; sys.argv = ['hg', 'run']; raise SystemExit(h.main())"
+        self.assertEqual(self.child('-c', script), 2)
+        marker = self.state / 'last_attempt.json'
+        self.assertEqual(json.loads(marker.read_text())['outcome'], 'failed')
+        obstacle.rmdir()
+        self.assertEqual(self.child('-c', script), 0)
+        self.assertEqual(json.loads(marker.read_text())['outcome'], 'completed')
+        self.assertEqual(self.report()[0], 0)
+        self.assertEqual((self.export.read_bytes(), (self.tokens / 'oauth.json').read_bytes()), (source, tokens))
+
+    def test_sync_backup_metadata_preserves_stdlib_safe_compatibility(self):
+        backup = self.state / 'sync.log.3'
+        outside = self.root / 'outside-backup'
+        outside.write_bytes(b'untouched external target')
+        (self.state / 'sync.log.4').mkdir()
+        native_open = h.open_regular_file
+
+        def metadata_only(path, *args, **kwargs):
+            if Path(path).parent == self.state and Path(path).name in ('sync.log.1', 'sync.log.2', 'sync.log.3'):
+                raise AssertionError('backup content read')
+            return native_open(path, *args, **kwargs)
+
+        for kind in ('missing', 'readonly', 'fifo', 'symlink'):
+            with self.subTest(kind=kind):
+                if kind == 'readonly':
+                    backup.write_bytes(b'old log')
+                    backup.chmod(0o400)
+                elif kind == 'fifo':
+                    os.mkfifo(backup, 0o600)
+                elif kind == 'symlink':
+                    backup.symlink_to(outside)
+                try:
+                    with patch.object(h, 'open_regular_file', side_effect=metadata_only):
+                        self.assertEqual(self.report()[0], 0)
+                        self.assertEqual(self.invoke('doctor')[0], 0)
+                finally:
+                    if kind != 'missing':
+                        backup.unlink()
+        for number in (1, 2):
+            path = self.state / f'sync.log.{number}'
+            path.mkdir()
+            try:
+                code, _, checks = self.report()
+                self.assertEqual(code, 2)
+                self.assertIn('state/' + path.name, checks['state']['hint'])
+            finally:
+                path.rmdir()
+        self.assertEqual(outside.read_bytes(), b'untouched external target')
+
     def test_real_agent_invalid_initial_log_records_failure_without_starting_sync(self):
         self.install_temporary_script(OFFLINE + '\nconfig = api_client = run_with_attempt = manage_agent = forbidden\n')
         stamp = h.now().isoformat()
