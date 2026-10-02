@@ -943,8 +943,8 @@ class ReviewedReplacementAPI:
                                              self.target, self.targets)
 
 
-def replacement_preflight(obj: Any, original: dict[str, Any], replacement: Measurement,
-                          records: list[Measurement], saved: dict[str, Any]) -> list[Measurement]:
+def reviewed_source_targets(replacement: Measurement, records: list[Measurement],
+                            saved: dict[str, Any], *, measurement: dict[str, Any] | None = None) -> list[Measurement]:
     reviewed = {entry["id"]: entry["measurement"] for entry in saved["entries"]}
     # Changed or newly exported sources can make an otherwise reviewed neighbour
     # ambiguous; include every current source when checking distinguishability.
@@ -953,8 +953,16 @@ def replacement_preflight(obj: Any, original: dict[str, Any], replacement: Measu
     for (stamp, key), (next_stamp, next_key) in zip(ordered, ordered[1:]):
         if next_stamp - stamp <= 2:
             overlapping.update((key, next_key))
-    targets = [replacement, *(r for r in records if r.key != replacement.key
-                             and r.key not in overlapping and reviewed.get(r.key) == r.payload())]
+    if measurement is not None and (replacement.key in overlapping
+                                   or not any(r.key == replacement.key and r.payload() == measurement for r in records)):
+        raise SafeError("待恢复的 Apple 测量已变化或来源重叠，请重新对账；不恢复上传。")
+    return [replacement, *(r for r in records if r.key != replacement.key
+                          and r.key not in overlapping and reviewed.get(r.key) == r.payload())]
+
+
+def replacement_preflight(obj: Any, original: dict[str, Any], replacement: Measurement,
+                          records: list[Measurement], saved: dict[str, Any]) -> list[Measurement]:
+    targets = reviewed_source_targets(replacement, records, saved)
     remaining = {**obj, "dateWeightList": [row for row in RemoteIndex(obj).rows if row != original]}
     scoped = reviewed_replacement_snapshot(remaining, replacement, targets)
     if classify_remote(replacement, scoped) != "absent":
@@ -1068,7 +1076,7 @@ def reviewed_operation(args: argparse.Namespace, cfg: dict[str, Any], delete_ext
         backup = STATE / "backups" / stamp
         private_dir(backup)
         write_json(backup / "remote.json", obj)
-        write_json(backup / "plan.json", fresh)
+        write_json(backup / "plan.json", {**fresh, "config": source_cfg})
         write_json(backup / "config.json", cfg)
         backup_db = backup / "sync.sqlite3"
         with contextlib.closing(sqlite3.connect(backup_db)) as target, target:
@@ -1170,6 +1178,46 @@ def verify_operation(args: argparse.Namespace) -> bool:
     return matched
 
 
+class ResumedReplacementAPI:
+    """Recheck raw identity and current reviewed sources before every resume read."""
+
+    def __init__(self, api: Any, target: Measurement, journal: dict[str, Any]):
+        self.api, self.target, self.journal = api, target, journal
+        self.context_needed = False
+
+    def __getattr__(self, name):
+        return getattr(self.api, name)
+
+    def get_body_composition(self, start: str, end: str):
+        obj = self.api.get_body_composition(start, end)
+        kind = classify_remote(self.target, obj)
+        if kind == "matched":
+            return obj  # Read-only completion does not require source access.
+        if not original_id_absent(RemoteIndex(obj).rows, str(self.journal["original"]["samplePk"])):
+            raise SafeError("原 Garmin 记录仍存在，停止；不会重复删除。")
+        if kind == "absent" and not self.context_needed:
+            return obj
+        backup = self.journal.get("backup")
+        if not backup:
+            raise SafeError("远端存在冲突，需重新核对；不恢复上传。")
+        self.context_needed = True
+        backup = Path(backup)
+        saved = json.loads(read_regular_text(backup / "plan.json"))
+        cfg = saved.get("config")
+        if cfg is None:
+            cfg = json.loads(read_regular_text(backup / "config.json"))
+        source_cfg = dict(cfg, since=saved["start"])
+        _, records, waiting, _ = load_measurements(source_cfg)
+        if waiting:
+            raise SafeError("Apple 导出存在配对歧义，请重新对账；不恢复上传。")
+        targets = reviewed_source_targets(self.target, records, saved,
+                                          measurement=self.journal["measurement"])
+        scoped = reviewed_replacement_snapshot(obj, self.target, targets)
+        if classify_remote(self.target, scoped) != "absent":
+            raise SafeError("目标附近记录无法唯一匹配未变化的已审阅 Apple 数据，请重新对账；不恢复上传。")
+        return scoped
+
+
 def resume_operation(args: argparse.Namespace) -> None:
     path = Path(args.operation).expanduser()
     journal = read_operation(path)
@@ -1179,7 +1227,7 @@ def resume_operation(args: argparse.Namespace) -> None:
     if not payload:
         raise SafeError("删除操作仅用 verify-operation 核对，不重复删除。")
     r = Measurement(**{**payload, "at": aware(payload["at"])})
-    api = api_client()
+    api = ResumedReplacementAPI(api_client(), r, journal)
     obj = remote_for(api, r)
     original_pk = str(journal["original"]["samplePk"])
     if classify_remote(r, obj) == "matched":
@@ -1206,7 +1254,20 @@ def resume_operation(args: argparse.Namespace) -> None:
     write_json(path, journal)
     with contextlib.closing(database()) as db, db:
         set_status(db, r, "pending", "User confirmed remote absence for reviewed operation resume")
-        result = process_record(api, db, r, reviewed=True)
+        try:
+            result = process_record(api, db, r, reviewed=True)
+        except Exception as exc:
+            journal.update(phase="uncertain", error=safe_exception(exc))
+            for save in (lambda: set_status(db, r, "repair_uncertain", "Resume preflight failed; do not resend"),
+                         lambda: write_json(path, journal)):
+                try:
+                    save()
+                except Exception as secondary:
+                    try:
+                        print("恢复失败证据未保存：", type(secondary).__name__, file=sys.stderr)
+                    except Exception:
+                        pass
+            raise
     journal["phase"] = "verified" if result == "verified" else "uncertain"
     write_json(path, journal)
     print("恢复结果：", result, "；不会自动重发。")

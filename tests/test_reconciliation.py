@@ -8,7 +8,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, patch, seal
 
 import health_garmin as h
 
@@ -113,6 +113,57 @@ class ReconciliationTests(unittest.TestCase):
         confirm = 'DELETE 100' if delete_extra else 'REPLACE ' + self.r.key
         with patch.object(h, 'api_client', return_value=api), patch('builtins.input', return_value=confirm), contextlib.redirect_stdout(io.StringIO()):
             h.reviewed_operation(args, self.cfg, delete_extra)
+
+    def detailed_api(self, backend):
+        raw = Mock(spec_set=['get_weigh_ins', 'get_daily_weigh_ins', 'add_body_composition',
+                             'add_weigh_in', 'delete_weigh_in'])
+        def summaries(start, end):
+            days = {}
+            for item in backend.get_body_composition(start, end)['dateWeightList']:
+                days.setdefault(item['calendarDate'], []).append(item)
+            return {'dailyWeightSummaries': [
+                {'summaryDate': day, 'numOfWeightEntries': len(items), 'allWeightMetrics': items}
+                for day, items in sorted(days.items())]}
+        raw.get_weigh_ins.side_effect = summaries
+        raw.get_daily_weigh_ins.side_effect = lambda day: backend.get_body_composition(day, day)
+        raw.add_body_composition.side_effect = backend.add_body_composition
+        raw.add_weigh_in.side_effect = backend.add_weigh_in
+        raw.delete_weigh_in.side_effect = backend.delete_weigh_in
+        seal(raw)
+        return h.GarminMeasurementAPI(raw)
+
+    def paused_reviewed_neighbor(self, *, alternate=False, legacy=False):
+        other = h.Measurement(AT + timedelta(seconds=30), 71, 24, 'PICOOC')
+        source_inbox = self.inbox
+        if alternate:
+            self.write_export([self.r])
+            source_inbox = self.root / ('alternate-' + h.STATE.name)
+            source_inbox.mkdir()
+        original_inbox = self.inbox
+        try:
+            self.inbox = source_inbox
+            self.write_export([self.r, other])
+        finally:
+            self.inbox = original_inbox
+        backend = API([dict(row(self.r), bodyFat=None), row(other, 101)])
+        backend.delete_timeout = True
+        api = self.detailed_api(backend)
+        plan = h.save_comparison(self.plan(backend.rows, [self.r, other]),
+                                 dict(self.cfg, inbox=str(source_inbox)))
+        native_write = h.write_json
+        def save_old_plan(path, data):
+            if legacy and path.name == 'plan.json' and path.parent.parent.name == 'backups':
+                data = {key: value for key, value in data.items() if key != 'config'}
+            native_write(path, data)
+        with patch.object(h, 'write_json', side_effect=save_old_plan):
+            with self.assertRaises(h.SafeError):
+                self.reviewed(api, plan)
+        journal = next((h.STATE / 'operations').glob('*.json'))
+        self.assertEqual(h.read_operation(journal)['phase'], 'uncertain')
+        self.assertEqual(len(backend.deletes), 1)
+        self.assertFalse(backend.posts)
+        backend.delete_timeout = False
+        return api, backend, journal, other, source_inbox / 'health.json'
 
     def test_classifies_missing_match_repair_replace(self):
         self.assertEqual(self.action([]), 'missing')
@@ -1154,6 +1205,150 @@ class ReconciliationTests(unittest.TestCase):
         self.assertEqual(len(api.posts), 1)
         self.assertEqual((self.inbox / 'health.json').read_bytes(), source)
         self.assertEqual(token.read_bytes(), b'synthetic token')
+
+    def test_reviewed_neighbor_resume_reloads_actual_sources_and_preserves_legacy_plan(self):
+        for name, alternate, legacy in (('normal', False, False), ('alternate', True, False),
+                                        ('legacy', False, True)):
+            with self.subTest(case=name), patch.object(h, 'STATE', self.state / name):
+                h.private_dir(h.STATE)
+                api, backend, journal, other, source = self.paused_reviewed_neighbor(
+                    alternate=alternate, legacy=legacy)
+                source_bytes = source.read_bytes()
+                default_bytes = (self.inbox / 'health.json').read_bytes()
+                token = h.STATE / 'tokens' / 'synthetic'
+                h.private_dir(token.parent)
+                token.write_bytes(b'private synthetic token')
+                backup = Path(h.read_operation(journal)['backup'])
+                saved = json.loads((backup / 'plan.json').read_text())
+                if legacy:
+                    self.assertNotIn('config', saved)
+                else:
+                    self.assertEqual(saved['config']['inbox'], str(source.parent))
+                self.assertEqual(json.loads((backup / 'config.json').read_text())['inbox'], self.cfg['inbox'])
+                args = argparse.Namespace(operation=str(journal))
+                with (patch.object(h, 'api_client', return_value=api), contextlib.redirect_stdout(io.StringIO()),
+                      patch('builtins.input', return_value='RESUME ' + self.r.key),
+                      patch.object(Path, 'home', side_effect=AssertionError('No real home')),
+                      patch('socket.create_connection', side_effect=AssertionError('No network')),
+                      patch('subprocess.run', side_effect=AssertionError('No service'))):
+                    h.resume_operation(args)
+                    native_read = h.read_regular_text
+                    def no_backup_read(path, **kwargs):
+                        if path.parent == backup:
+                            raise AssertionError('Matched needs no backup')
+                        return native_read(path, **kwargs)
+                    with (patch.object(h, 'load_measurements', side_effect=AssertionError('Matched needs no source')),
+                          patch.object(h, 'read_regular_text', side_effect=no_backup_read)):
+                        h.resume_operation(args)
+                        self.assertTrue(h.verify_operation(args))
+                self.assertEqual(len(backend.deletes), 1)
+                self.assertEqual(len(backend.posts), 1)
+                self.assertIn(row(other, 101), backend.rows)
+                self.assertEqual(h.read_operation(journal)['phase'], 'verified')
+                with contextlib.closing(h.database()) as db:
+                    self.assertEqual(h.get_status(db, self.r), 'verified')
+                self.assertEqual(source.read_bytes(), source_bytes)
+                self.assertEqual((self.inbox / 'health.json').read_bytes(), default_bytes)
+                self.assertEqual(token.read_bytes(), b'private synthetic token')
+
+    def test_neighbor_resume_revalidates_initial_confirmation_and_post_preflight(self):
+        changes = ('target', 'target_overlap', 'peer_source', 'peer_overlap', 'peer_remote',
+                   'unknown_id', 'original')
+        scenarios = [(stage, change) for stage in (1, 2, 3) for change in changes]
+        scenarios.append((3, 'peer_disappears_target_changes'))
+        for number, (stage, change) in enumerate(scenarios):
+            with self.subTest(read=stage, change=change), patch.object(h, 'STATE', self.state / str(number)):
+                h.private_dir(h.STATE)
+                api, backend, journal, other, source = self.paused_reviewed_neighbor()
+                journal_before = journal.read_bytes()
+                with contextlib.closing(h.database()) as db:
+                    local_before = dict(h.state_row(db, self.r))
+                token = h.STATE / 'tokens' / 'synthetic'
+                h.private_dir(token.parent)
+                token.write_bytes(b'private synthetic token')
+                reads = 0
+                expected_source = source.read_bytes()
+                native_read = backend.get_body_composition
+                def changing_read(start, end):
+                    nonlocal reads, expected_source
+                    reads += 1
+                    if reads == stage:
+                        if change in ('target', 'peer_disappears_target_changes'):
+                            self.write_export([h.Measurement(AT, 72, 23.5, 'PICOOC'), other])
+                            if change == 'peer_disappears_target_changes':
+                                backend.rows = []
+                        elif change == 'target_overlap':
+                            overlap = h.Measurement(AT + timedelta(milliseconds=500), 72, 25, 'PICOOC')
+                            self.write_export([self.r, other, overlap])
+                        elif change == 'peer_source':
+                            self.write_export([self.r, h.Measurement(other.at, 72, 24, 'PICOOC')])
+                        elif change == 'peer_overlap':
+                            overlap = h.Measurement(other.at + timedelta(milliseconds=500), 72, 25, 'PICOOC')
+                            self.write_export([self.r, other, overlap])
+                        elif change == 'peer_remote':
+                            backend.rows[0]['weight'] = 72000
+                        elif change == 'unknown_id':
+                            backend.rows[0]['samplePk'] = None
+                        elif change == 'original':
+                            backend.rows.append(dict(row(self.r), bodyFat=None))
+                        expected_source = source.read_bytes()
+                    return native_read(start, end)
+                backend.get_body_composition = changing_read
+                args = argparse.Namespace(operation=str(journal))
+                with (patch.object(h, 'api_client', return_value=api), contextlib.redirect_stdout(io.StringIO()),
+                      patch('builtins.input', return_value='RESUME ' + self.r.key) as prompt,
+                      patch.object(Path, 'home', side_effect=AssertionError('No real home')),
+                      patch('socket.create_connection', side_effect=AssertionError('No network')),
+                      patch('subprocess.run', side_effect=AssertionError('No service'))):
+                    with self.assertRaises(h.SafeError):
+                        h.resume_operation(args)
+                self.assertEqual(reads, stage)
+                self.assertEqual(prompt.call_count, 0 if stage == 1 else 1)
+                self.assertEqual(len(backend.deletes), 1)
+                self.assertFalse(backend.posts)
+                self.assertEqual(h.read_operation(journal)['phase'], 'uncertain')
+                with contextlib.closing(h.database()) as db:
+                    self.assertEqual(h.get_status(db, self.r), 'repair_uncertain')
+                    if stage < 3:
+                        self.assertEqual(dict(h.state_row(db, self.r)), local_before)
+                        self.assertEqual(journal.read_bytes(), journal_before)
+                self.assertEqual(source.read_bytes(), expected_source)
+                self.assertEqual(token.read_bytes(), b'private synthetic token')
+
+    def test_resume_preflight_error_survives_failure_journal_save_error(self):
+        api, backend, journal, _, source = self.paused_reviewed_neighbor()
+        source_bytes = source.read_bytes()
+        primary = TimeoutError('private network detail')
+        native_read, native_write = backend.get_body_composition, h.write_json
+        reads = 0
+        def interrupted_read(start, end):
+            nonlocal reads
+            reads += 1
+            if reads == 3:
+                raise primary
+            return native_read(start, end)
+        backend.get_body_composition = interrupted_read
+        def unavailable_journal(path, data):
+            if path == journal and data.get('phase') == 'uncertain':
+                raise OSError('private storage detail')
+            native_write(path, data)
+        errors = io.StringIO()
+        args = argparse.Namespace(operation=str(journal))
+        with (patch.object(h, 'api_client', return_value=api),
+              patch.object(h, 'write_json', side_effect=unavailable_journal),
+              patch('builtins.input', return_value='RESUME ' + self.r.key),
+              contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(errors)):
+            with self.assertRaises(TimeoutError) as failure:
+                h.resume_operation(args)
+        self.assertIs(failure.exception, primary)
+        self.assertEqual(h.get_status(self.db, self.r), 'repair_uncertain')
+        self.assertEqual(h.read_operation(journal)['phase'], 'uploading')
+        self.assertIn(self.r.key, h.active_operations())
+        self.assertEqual(len(backend.deletes), 1)
+        self.assertFalse(backend.posts)
+        self.assertEqual(source.read_bytes(), source_bytes)
+        self.assertIn('OSError', errors.getvalue())
+        self.assertNotIn('private', errors.getvalue())
 
     def test_disabled_run_remains_offline(self):
         self.cfg['enabled'] = False
