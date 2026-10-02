@@ -122,8 +122,61 @@ class ReconciliationTests(unittest.TestCase):
         wrong = row(self.r); wrong['weight'] = 71000
         self.assertEqual(self.action([wrong]), 'replace')
 
+    def test_boolean_remote_numbers_are_conflicts_for_valid_exported_measurement(self):
+        self.r = h.Measurement(AT, 70, 23.5, 'PICOOC', 22)
+        self.write_export([self.r])
+        _, records, waiting, _ = h.load_measurements(self.cfg)
+        self.assertFalse(waiting)
+        self.assertEqual(records, [self.r])
+        for field in ('weight', 'bodyFat', 'bmi'):
+            for value in (True, False):
+                with self.subTest(field=field, value=value):
+                    remote = dict(row(self.r), **{field: value})
+                    entry = self.plan([remote], records)['entries'][0]
+                    self.assertEqual(entry['action'], 'conflict')
+                    self.assertEqual(entry['reason'], '远端数值无法可靠解析')
+
+    def test_legacy_replace_plan_with_boolean_remote_cannot_authorize_mutation(self):
+        self.r = h.Measurement(AT, 70, 23.5, 'PICOOC', 22)
+        self.write_export([self.r])
+        source = (self.inbox / 'health.json').read_bytes()
+        api = API([dict(row(self.r), bodyFat=True)])
+        legacy = self.plan(api.rows)
+        legacy['entries'][0].update(action='replace', reason='同次测量数值不同')
+        legacy['counts'] = {'replace': 1}
+        path = h.save_comparison(legacy, self.cfg)
+        with self.assertRaises(h.SafeError):
+            self.reviewed(api, path)
+        self.assertFalse(api.posts)
+        self.assertFalse(api.deletes)
+        self.assertFalse((self.state / 'operations').exists())
+        self.assertIsNone(h.state_row(self.db, self.r))
+        self.assertEqual((self.inbox / 'health.json').read_bytes(), source)
+
+    def test_boolean_optional_values_cannot_verify_uncertain_but_numeric_strings_can(self):
+        self.r = h.Measurement(AT, 70, 1, 'PICOOC', 1)
+        self.write_export([self.r])
+        _, records, waiting, _ = h.load_measurements(self.cfg)
+        self.assertFalse(waiting)
+        self.assertEqual(records, [self.r])
+        for status in ('uncertain', 'inflight'):
+            with self.subTest(status=status):
+                h.set_status(self.db, self.r, status, 'awaiting visibility')
+                api = API([dict(row(self.r), bodyFat=True, bmi=True)])
+                self.assertEqual(h.process_record(api, self.db, records[0]), 'uncertain')
+                self.assertEqual(h.get_status(self.db, self.r), 'uncertain')
+                self.assertFalse(api.posts)
+                self.assertFalse(api.deletes)
+        api = API([dict(row(self.r), weight='70000', bodyFat='1', bmi='1')])
+        self.assertEqual(h.process_record(api, self.db, records[0]), 'verified')
+        self.assertEqual(h.get_status(self.db, self.r), 'verified')
+        self.assertFalse(api.posts)
+        self.assertFalse(api.deletes)
+
     def test_optional_remote_values_not_erased_when_apple_has_none(self):
         self.assertEqual(self.action([row(self.r)], h.Measurement(AT, 70, None, 'PICOOC')), 'matched')
+        self.assertEqual(self.action([dict(row(self.r), bodyFat=True, bmi=True)],
+                                     h.Measurement(AT, 70, None, 'PICOOC')), 'matched')
 
     def test_missing_bmi_becomes_repair(self):
         self.assertEqual(self.action([row(self.r)], h.Measurement(AT, 70, 23.5, 'PICOOC', 22)), 'repair')

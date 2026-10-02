@@ -698,6 +698,8 @@ class RemoteIndex:
         i = exact[0]
         row = self.rows[i]
         try:
+            if isinstance(row["weight"], bool):
+                raise ValueError()
             weight = float(row["weight"]) / 1000
             if not math.isfinite(weight) or not 0 < weight < 600:
                 raise ValueError()
@@ -710,6 +712,8 @@ class RemoteIndex:
                 if remote is None:
                     missing = True
                 else:
+                    if isinstance(remote, bool):
+                        raise ValueError()
                     value = float(remote)
                     if not math.isfinite(value) or not 0 < value < 100:
                         raise ValueError()
