@@ -400,6 +400,7 @@ def load_exports(cfg: dict[str, Any]) -> tuple[list[Sample], dict[str, str]]:
         raise SafeError("导出目录没有 .json 文件；先在 iPhone 手动运行导出快捷指令。")
     all_samples: list[Sample] = []
     exports: dict[str, str] = {}
+    allowed = {normalized_source(source) for source in cfg["allowed_sources"]}
     for p in files:
         if p.is_symlink():
             raise SafeError("导出目录含符号链接，已停止。")
@@ -418,7 +419,9 @@ def load_exports(cfg: dict[str, Any]) -> tuple[list[Sample], dict[str, str]]:
         except SafeError as exc:
             raise SafeError(f"{p.name}: {exc}") from exc
         all_samples.extend(new)
-        for metric in export_groups(obj):
+        for metric, items in export_groups(obj).items():
+            if items and not any(normalized_source(item["source"]) in allowed for item in items):
+                continue
             if metric not in exports or exported > aware(exports[metric]):
                 exports[metric] = exported.isoformat()
     return deduplicate(all_samples), exports

@@ -217,6 +217,64 @@ class AgentAttemptTests(unittest.TestCase):
         self.assertEqual(json.loads(self.last.read_text())['unknown_request_count'], 0)
         self.assertEqual(self.report()[0], 0)
 
+    def test_unallowed_source_refresh_cannot_keep_ready_measurement_in_settling(self):
+        import socket
+        from test_reconciliation import ReconciliationTests
+        def forbidden(*args, **kwargs):
+            raise AssertionError('No real network or service')
+        current = h.now()
+        original = json.loads(self.export.read_text())
+        original['exported_at'] = (current - timedelta(minutes=10)).isoformat()
+        self.export.write_text(json.dumps(original))
+        source_bytes, token = self.export.read_bytes(), (self.tokens / 'oauth.json').read_bytes()
+        other = self.inbox / 'other.json'
+        backend = API()
+        api = ReconciliationTests.detailed_api(self, backend)
+        with (patch.object(socket.socket, 'connect', forbidden),
+              patch.object(socket, 'create_connection', forbidden), patch.object(h, 'manage_agent', forbidden)):
+            for minute in (0, 30, 60):
+                with self.subTest(minute=minute):
+                    reference = current + timedelta(minutes=minute)
+                    other.write_text(json.dumps({'schema_version': 1, 'metric': 'weight',
+                        'exported_at': reference.isoformat(), 'samples': [
+                            {'at': reference.isoformat(), 'value': '80 kg', 'source': 'OTHER'}]}))
+                    other_bytes = other.read_bytes()
+                    with patch.object(h, 'now', return_value=reference), patch.object(h, 'api_client', return_value=api) as factory:
+                        self.assertEqual(self.run_agent()[0], 0)
+                        self.assertEqual(self.report()[0], 0)
+                    self.assertEqual(factory.call_count, 1 if minute == 0 else 0)
+                    self.assertEqual(len(backend.posts), 1)
+                    self.assertFalse(backend.deletes)
+                    summary = json.loads(self.last.read_text())
+                    self.assertNotIn('deferred', summary)
+                    self.assertEqual(h.aware(summary['exports']['weight']), h.aware(original['exported_at']))
+                    self.assertEqual(list(summary['results'].values()), ['verified'] if minute == 0 else [])
+                    self.assertEqual(summary['local_status_counts'], {'verified': 1})
+                    self.assertEqual(self.value()['outcome'], 'completed')
+                    self.assertEqual(self.export.read_bytes(), source_bytes)
+                    self.assertEqual(other.read_bytes(), other_bytes)
+                    self.assertEqual((self.tokens / 'oauth.json').read_bytes(), token)
+            # An allowed new core export still starts its own normal settling window.
+            reference = current + timedelta(minutes=65)
+            latest = json.loads(source_bytes)
+            latest['exported_at'] = reference.isoformat()
+            at = (h.aware(latest['metrics']['weight'][0]['at']) + timedelta(days=1)).isoformat()
+            allowed = self.cfg['allowed_sources'][0]
+            latest['metrics']['weight'].append({'at': at, 'value': '74 kg', 'source': allowed})
+            latest['metrics']['body_fat'].append({'at': at, 'value': '27%', 'source': allowed})
+            self.export.write_text(json.dumps(latest))
+            source_bytes = self.export.read_bytes()
+            with patch.object(h, 'now', return_value=reference), patch.object(h, 'api_client', return_value=api):
+                self.assertEqual(self.run_agent()[0], 0)
+            summary = json.loads(self.last.read_text())
+            self.assertEqual(summary['deferred'], 'settling')
+            self.assertIn('deferred', summary['results'].values())
+            self.assertEqual(h.aware(summary['exports']['weight']), reference)
+            self.assertEqual(len(backend.posts), 1)
+            self.assertFalse(backend.deletes)
+            self.assertEqual(self.export.read_bytes(), source_bytes)
+            self.assertEqual((self.tokens / 'oauth.json').read_bytes(), token)
+
     def test_sync_log_rollover_failure_finishes_batch_but_reports_failed_evidence(self):
         first = h.load_measurements(self.cfg)[1][0]
         second = h.Measurement(first.at + timedelta(hours=1), 74, 27, first.source)

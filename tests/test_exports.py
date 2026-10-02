@@ -272,6 +272,34 @@ class ExportBundleTests(unittest.TestCase):
             self.assertEqual(exports['weight'], x['exported_at'])
             self.assertEqual(exports['body_fat'], x['exported_at'])
 
+    def test_header_freshness_excludes_only_nonempty_unallowed_metric_groups(self):
+        newer = '2020-02-21T09:00:00+08:00'
+        excluded = dict(sample('ignored invalid unit'), source='OTHER')
+        cases = (
+            ('v1_excluded', old('weight', [excluded]), False, None),
+            ('mixed', {'schema_version': 2, 'metrics': {'weight': [excluded],
+                'body_fat': [sample('23.5%')], 'bmi': [sample(22)]}}, False, newer),
+            ('empty', old('weight', []), True, None),
+            ('allowed_since_filtered', old('weight', [dict(sample('ignored invalid unit'),
+                at='2019-12-31T08:00:00+08:00')]), True, None),
+            ('normalized_allowed', old('weight', [dict(sample('70 kg'), source=' picooc ')]), True, None),
+        )
+        for name, fresh, weight_advances, other_advances in cases:
+            with self.subTest(case=name), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                (root / 'old.json').write_text(json.dumps(bundle()))
+                fresh['exported_at'] = newer
+                (root / 'new.json').write_text(json.dumps(fresh))
+                before = {path.name: path.read_bytes() for path in root.iterdir()}
+                samples, exports = h.load_exports(dict(CFG, inbox=temp))
+                self.assertEqual(exports['weight'], newer if weight_advances else EXPORTED)
+                self.assertEqual(exports['body_fat'], other_advances or EXPORTED)
+                self.assertEqual({s.metric for s in samples}, {'weight', 'body_fat', 'bmi'}
+                                 if name == 'mixed' else {'weight', 'body_fat'})
+                if name == 'mixed':
+                    self.assertEqual(exports['bmi'], newer)
+                self.assertEqual({path.name: path.read_bytes() for path in root.iterdir()}, before)
+
     def test_conflicting_value_in_mixed_files_stops(self):
         with tempfile.TemporaryDirectory() as temp:
             p = Path(temp); x = bundle()
