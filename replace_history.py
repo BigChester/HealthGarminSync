@@ -149,13 +149,14 @@ def verify(path, api=None):
         obj = h.fetch_remote_snapshot(api, start, end)
         index = h.RemoteIndex(obj)
         decisions = [index.decide(r) for r in targets]
-        scoped = [row for row in index.rows if start.isoformat() <= row['calendarDate'] <= end.isoformat()]
+        owners = {indices[0] for kind, indices, _ in decisions if kind == 'matched'}
+        scoped = [row for i, row in enumerate(index.rows)
+                  if i in owners or start.isoformat() <= row['calendarDate'] <= end.isoformat()]
     except Exception:
         h.record_failed_check(path, job)
         raise
     with contextlib.closing(h.database()) as db, db:
         plan = h.comparison_plan(db, targets, obj, start, end)
-        owners = {indices[0] for kind, indices, _ in decisions if kind == 'matched'}
         matched = (all(kind == 'matched' for kind, _, _ in decisions)
                    and len(owners) == len(targets) == len(scoped)
                    and not plan['extra_remote'])
@@ -202,6 +203,7 @@ def execute(args, cfg, api=None):
         raise h.SafeError('Garmin 数据已变化，请重新对账。')
     index = h.RemoteIndex(obj)
     keep, original_days = set(), defaultdict(list)
+    matched_rows = set()
     targets_by_day = defaultdict(list)
     for row in index.rows:
         day = date.fromisoformat(row['calendarDate'])
@@ -217,15 +219,15 @@ def execute(args, cfg, api=None):
             if kind != 'matched' and old and old['status'] in ('uncertain', 'inflight', 'repair_uncertain', 'ignored'):
                 raise h.SafeError('目标测量有未确定或忽略状态，需要先人工核对。')
             if kind == 'matched':
+                matched_rows.add(candidates[0])
                 row = index.rows[candidates[0]]
-                # Retain only records whose Garmin day agrees with the source day.
-                if row['calendarDate'] == r.at.date().isoformat():
+                if h.canonical_remote_id(row.get('samplePk')) is not None:
                     keep.add((str(row['samplePk']), row['calendarDate']))
             targets_by_day[r.at.date()].append(r)
         deletes = sum((str(row['samplePk']), row['calendarDate']) not in keep
                       for rows in original_days.values() for row in rows)
-        uploads = len(records) - len(keep)
-        print(f'完整替换：目标 {len(records)} 条；保留匹配 {len(keep)} 条；删除旧记录 {deletes} 条；重建/新增 {uploads} 条。', flush=True)
+        uploads = len(records) - len(matched_rows)
+        print(f'完整替换：目标 {len(records)} 条；保留匹配 {len(matched_rows)} 条；删除旧记录 {deletes} 条；重建/新增 {uploads} 条。', flush=True)
         if input('确认以完整 Apple 历史为准，输入 REPLACE ALL：').strip() != 'REPLACE ALL':
             print('已取消，未修改 Garmin。')
             return

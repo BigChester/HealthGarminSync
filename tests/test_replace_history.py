@@ -1,7 +1,7 @@
 """Bulk replacement invariants with an offline Garmin substitute."""
 import argparse
 import contextlib
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 import io
 import json
 from pathlib import Path
@@ -45,6 +45,108 @@ class BulkReplacementTests(unittest.TestCase):
         raw.delete_weigh_in.side_effect = backend.delete_weigh_in
         seal(raw)
         return h.GarminMeasurementAPI(raw)
+
+    def assert_native_cross_calendar_batch(self, first_at, *, second=False, unrelated=False,
+                                          check_changes=False, anonymous=None):
+        import test_sdk_transport as transport
+        if not transport.PINNED_SDK:
+            self.skipTest('Requires the installed, pinned Garmin SDK')
+        sdk = transport.SDKTransportTests('runTest')
+        try:
+            sdk.setUp()
+            sdk.enterContext(patch('subprocess.run', side_effect=transport.forbidden))
+            account = timezone(timedelta(hours=8))
+            first = h.Measurement(datetime.fromisoformat(first_at), 70, 23.5, 'PICOOC', 22, 53.55)
+            records = [first]
+            if second:
+                records.append(h.Measurement(first.at.astimezone(account) + timedelta(hours=8),
+                                             72, 24, 'PICOOC', 23, 54))
+                self.assertNotEqual(records[0].at.date(), records[1].at.date())
+            elif anonymous == 'two':
+                records.append(h.Measurement(first.at + timedelta(hours=1), 72, 24, 'PICOOC', 23, 54))
+            self.write_export.__func__(sdk, records)
+            self.assertEqual(h.load_measurements(sdk.cfg)[1], records)
+            rows = [row(h.Measurement(r.at.astimezone(account), r.weight, r.fat, r.source, r.bmi), 100 + n)
+                    for n, r in enumerate(records)]
+            self.assertNotEqual(rows[0]['calendarDate'], first.at.date().isoformat())
+            if anonymous:
+                for item in rows:
+                    item['samplePk'] = None
+                    if anonymous == 'missing':
+                        item.pop('samplePk')
+            if unrelated:
+                rows.append(row(h.Measurement(first.at.astimezone(account) + timedelta(hours=2),
+                                              75, None, 'PICOOC'), 300))
+            sdk.rows = list(rows)
+            def server(method, path, pool):
+                self.assertEqual(method, 'GET', 'Matched targets must not be deleted or uploaded')
+                return 200, sdk.read_payload(path)
+            sdk.handler = server
+            source = (sdk.inbox / 'health.json').read_bytes()
+            token = sdk.state / 'synthetic-token'; token.write_bytes(b'unchanged token')
+            start, end = min(r.at.date() for r in records), max(r.at.date() for r in records)
+            obj = h.fetch_remote_snapshot(sdk.api, start, end)
+            plan = h.comparison_plan(sdk.db, records, obj, start, end)
+            self.assertEqual(plan['counts'], {'matched': len(records)})
+            self.assertFalse(plan['extra_remote'])
+            path = h.save_comparison(plan, sdk.cfg)
+            output = io.StringIO()
+            with patch('builtins.input', return_value='REPLACE ALL'), contextlib.redirect_stdout(output):
+                bulk.execute(argparse.Namespace(plan=str(path), complete_export=True), sdk.cfg, sdk.api)
+                journal = next((sdk.state / 'operations').glob('full-*.json'))
+                self.assertTrue(bulk.verify(journal, sdk.api))
+            job = h.read_operation(journal)
+            self.assertEqual(job['phase'], 'verified')
+            self.assertEqual(job['verification'], {'matched': len(records), 'target_count': len(records),
+                                                  'remote_count': len(records), 'extra': 0})
+            self.assertFalse(job['events'])
+            self.assertIn(f'保留匹配 {len(records)} 条；删除旧记录 0 条；重建/新增 0 条。', output.getvalue())
+            self.assertEqual([h.get_status(sdk.db, r) for r in records], ['verified'] * len(records))
+            self.assertEqual(sdk.rows, rows)
+            backup = Path(job['backup'])
+            self.assertEqual(json.loads((backup / 'remote-before.json').read_text()), obj)
+            self.assertEqual((backup / 'exports' / 'health.json').read_bytes(), source)
+            if check_changes:
+                for change in ('missing', 'changed', 'ambiguous', 'in_scope_extra'):
+                    with self.subTest(remote_change=change):
+                        if change == 'missing':
+                            sdk.rows = rows[1:]
+                        elif change == 'changed':
+                            sdk.rows = [dict(rows[0], weight=71000), *rows[1:]]
+                        elif change == 'ambiguous':
+                            sdk.rows = [*rows, dict(rows[0], samplePk=400)]
+                        else:
+                            extra_at = datetime.combine(start, datetime.min.time(), tzinfo=account) + timedelta(hours=12)
+                            sdk.rows = [*rows, row(h.Measurement(extra_at, 76, None, 'PICOOC'), 500)]
+                        with contextlib.redirect_stdout(io.StringIO()):
+                            self.assertFalse(bulk.verify(journal, sdk.api))
+                        self.assertEqual(h.read_operation(journal)['phase'], 'verified')
+                        self.assertFalse(h.read_operation(journal)['last_check_passed'])
+                        sdk.rows = list(rows)
+                        with contextlib.redirect_stdout(io.StringIO()):
+                            self.assertTrue(bulk.verify(journal, sdk.api))
+            self.assertFalse(any(request['method'] in ('POST', 'DELETE') for request in sdk.sent))
+            self.assertEqual((sdk.inbox / 'health.json').read_bytes(), source)
+            self.assertEqual(token.read_bytes(), b'unchanged token')
+            self.assertEqual(json.loads((backup / 'remote-before.json').read_text()), obj)
+        finally:
+            sdk.doCleanups()
+
+    def test_native_two_day_batch_preserves_matched_target_on_different_garmin_calendar(self):
+        self.assert_native_cross_calendar_batch('2020-02-19T08:30:00-08:00', second=True)
+
+    def test_native_single_day_batch_counts_owned_padding_without_unrelated_rows(self):
+        for at in ('2020-02-19T08:30:00-08:00', '2020-02-20T00:30:00+14:00'):
+            with self.subTest(source_at=at):
+                self.assert_native_cross_calendar_batch(at, unrelated=True)
+
+    def test_native_padding_target_verification_rejects_missing_changed_ambiguous_and_extra_rows(self):
+        self.assert_native_cross_calendar_batch('2020-02-19T08:30:00-08:00', unrelated=True, check_changes=True)
+
+    def test_native_anonymous_padding_matches_remain_readonly_and_count_each_owned_row(self):
+        for mode in ('missing', 'two'):
+            with self.subTest(anonymous=mode):
+                self.assert_native_cross_calendar_batch('2020-02-19T08:30:00-08:00', anonymous=mode)
 
     def assert_concurrent_export_backup_rejected(self, intermediate):
         source = self.inbox / 'health.json'
