@@ -114,7 +114,7 @@ class DatabaseLifecycleTests(unittest.TestCase):
             self.assertFalse(h.save_verified_snapshot(self.db, local, 'stale completion'))
         self.assertEqual(h.aware(self.db.execute('SELECT wire_at FROM request_times WHERE record_id=?',
                                                (local.key,)).fetchone()[0]), wire_at)
-        for status in ('verified', 'pending', 'verified_manual', 'ignored'):
+        for status in ('verified', 'pending', 'verified_manual'):
             with self.subTest(release=status):
                 h.set_status(self.db, latest, status)
                 with contextlib.closing(h.database()) as independent:
@@ -128,6 +128,78 @@ class DatabaseLifecycleTests(unittest.TestCase):
         h.set_status(self.db, latest, 'inflight', request=latest)
         self.assertEqual(h.aware(self.db.execute('SELECT wire_at FROM request_times WHERE record_id=?',
                                                (latest.key,)).fetchone()[0]), h.measurement_wire_time(latest))
+
+    def test_ignoring_unknown_requests_keeps_time_evidence_and_latest_local_values(self):
+        at = self.r.at.replace(microsecond=500001)
+        original = h.Measurement(at, 70, 23.5, 'PICOOC', 22, 53.55)
+        latest = h.Measurement(at, 72, None, 'PICOOC', lbm=54)
+        for legacy in (False, True):
+            for status in ('inflight', 'uncertain', 'repair_uncertain'):
+                with self.subTest(legacy=legacy, status=status):
+                    self.db.execute('DELETE FROM uploads'); self.db.execute('DELETE FROM request_times'); self.db.commit()
+                    if legacy:
+                        self.db.execute('INSERT INTO uploads VALUES(?,?,?,?,?,?)',
+                                        (original.key, original.core, json.dumps(original.payload()), status, 'old', ''))
+                        self.db.commit()
+                    else:
+                        h.set_status(self.db, original, 'inflight', request=original)
+                        h.set_status(self.db, original, status)
+                    args = argparse.Namespace(record_id=original.key, present=False, absent=False, ignore=True)
+                    with patch('builtins.input', return_value='IGNORE'), contextlib.redirect_stdout(io.StringIO()):
+                        h.resolve_record(args)
+                    # Further export revisions must not change the physical request's timestamp.
+                    h.set_status(self.db, latest, 'ignored')
+                    h.set_status(self.db, latest, 'ignored')
+                    with contextlib.closing(h.database()) as independent:
+                        saved = h.state_row(independent, latest)
+                        self.assertEqual(saved['status'], 'ignored')
+                        self.assertEqual(saved['core'], latest.core)
+                        self.assertEqual(json.loads(saved['payload']), latest.payload())
+                        context = h.unknown_request_context(independent)
+                        self.assertEqual(len(context), 1)
+                        self.assertEqual(context[0][:3], (original.key, original.at, h.measurement_wire_time(original)))
+                    api = fixtures.API()
+                    self.assertEqual(h.process_record(api, self.db, latest), 'ignored')
+                    self.assertFalse(api.posts)
+                    for decision in ('ABSENT', 'PRESENT'):
+                        with patch('builtins.input', return_value=decision), contextlib.redirect_stdout(io.StringIO()):
+                            h.resolve_record(argparse.Namespace(record_id=latest.key, present=decision == 'PRESENT',
+                                                                absent=decision == 'ABSENT', ignore=False))
+                        self.assertFalse(h.unknown_request_context(self.db))
+                        self.assertIsNone(self.db.execute('SELECT wire_at FROM request_times WHERE record_id=?',
+                                                         (latest.key,)).fetchone())
+                        if decision == 'ABSENT':
+                            h.set_status(self.db, latest, 'inflight', request=original)
+                            h.set_status(self.db, latest, 'ignored')
+        # Ignoring a task that was never sent, or whose write is resolved, creates no unknown evidence.
+        for status in ('pending', 'verified', 'verified_manual', 'ignored'):
+            with self.subTest(resolved=status):
+                h.set_status(self.db, latest, 'pending')
+                h.set_status(self.db, latest, status)
+                h.set_status(self.db, latest, 'ignored')
+                self.assertFalse(h.unknown_request_context(self.db))
+
+    def test_ignored_request_evidence_and_task_status_roll_back_together(self):
+        for legacy in (False, True):
+            with self.subTest(legacy=legacy):
+                self.db.execute('DELETE FROM uploads'); self.db.execute('DELETE FROM request_times'); self.db.commit()
+                h.set_status(self.db, self.r, 'inflight')
+                if legacy:
+                    self.db.execute('DELETE FROM request_times'); self.db.commit()
+                before = dict(h.state_row(self.db, self.r))
+                self.db.execute("CREATE TRIGGER fail_ignore BEFORE INSERT ON uploads WHEN NEW.status='ignored' "
+                                "BEGIN SELECT RAISE(ABORT,'synthetic failure'); END")
+                self.db.commit()
+                try:
+                    with patch('builtins.input', return_value='IGNORE'), contextlib.redirect_stdout(io.StringIO()):
+                        with self.assertRaises(sqlite3.IntegrityError):
+                            h.resolve_record(argparse.Namespace(record_id=self.r.key, present=False, absent=False, ignore=True))
+                    with contextlib.closing(h.database()) as independent:
+                        self.assertEqual(dict(h.state_row(independent, self.r)), before)
+                        wire = independent.execute('SELECT wire_at FROM request_times WHERE record_id=?', (self.r.key,)).fetchone()
+                        self.assertEqual(wire is None, legacy)
+                finally:
+                    self.db.execute('DROP TRIGGER fail_ignore'); self.db.commit()
 
     def test_request_time_and_upload_status_fail_together_before_post_or_release(self):
         for failure in ('wire_insert', 'upload_insert', 'release_upload'):

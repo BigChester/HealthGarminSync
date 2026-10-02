@@ -476,7 +476,7 @@ def database() -> sqlite3.Connection:
 def set_status(db: sqlite3.Connection, r: Measurement, status: str, detail: str = "", *, request: Measurement | None = None) -> None:
     previous = state_row(db, r)
     if (previous and previous["status"] in ("inflight", "uncertain", "repair_uncertain")
-            and status in ("inflight", "uncertain", "repair_uncertain")):
+            and status in ("inflight", "uncertain", "repair_uncertain", "ignored")):
         # Capture the old-format fallback before a source revision changes it.
         payload = json.loads(previous["payload"])
         original = Measurement(**{**payload, "at": aware(payload["at"])})
@@ -485,7 +485,8 @@ def set_status(db: sqlite3.Connection, r: Measurement, status: str, detail: str 
     elif status == "inflight":
         db.execute("INSERT OR REPLACE INTO request_times VALUES (?,?)",
                    (r.key, measurement_wire_time(request or r).isoformat()))
-    elif status not in ("uncertain", "repair_uncertain"):
+    elif (status not in ("uncertain", "repair_uncertain")
+          and not (status == "ignored" and previous and previous["status"] == "ignored")):
         db.execute("DELETE FROM request_times WHERE record_id=?", (r.key,))
     payload = r.payload()
     if r.lbm is None:
@@ -828,7 +829,8 @@ def unknown_request_context(db: sqlite3.Connection) -> list[tuple[str, datetime,
     context = []
     for row in db.execute("""SELECT uploads.record_id,payload,wire_at FROM uploads
                            LEFT JOIN request_times USING(record_id)
-                           WHERE status IN ('inflight','uncertain','repair_uncertain')"""):
+                           WHERE status IN ('inflight','uncertain','repair_uncertain')
+                              OR (status='ignored' AND wire_at IS NOT NULL)"""):
         payload = json.loads(row["payload"])
         record = Measurement(**{**payload, "at": aware(payload["at"])})
         wire_at = aware(row["wire_at"]) if row["wire_at"] is not None else measurement_wire_time(record)

@@ -493,6 +493,104 @@ class SDKTransportTests(unittest.TestCase):
                 self.assertEqual(token.read_bytes(), b'unchanged local token')
                 self.assert_source_untouched()
 
+    def test_ignored_unknown_request_still_protects_source_alias_until_explicit_absence(self):
+        token = self.state / 'synthetic-token'
+        token.write_bytes(b'unchanged local token')
+        self.cfg['allowed_sources'] = ['PICOOC', 'OTHER']
+        process = h.process_record
+        for mode in ('fit_same_at', 'json_same_at', 'fit_precision_only'):
+            with self.subTest(mode=mode):
+                self.db.execute('DELETE FROM uploads'); self.db.commit()
+                self.sent.clear(); self.rows = []
+                old = h.Measurement(h.aware('2020-02-20T00:00:01.500001+00:00'), 70,
+                                    None if mode == 'json_same_at' else 23.5, 'PICOOC')
+                candidate = h.Measurement(h.aware('2020-02-20T00:00:00+00:00')
+                                          if mode == 'fit_precision_only' else old.at, 71, None, 'OTHER')
+                fixtures.ReconciliationTests.write_export(self, [old])
+                self.source_bytes = (self.inbox / 'health.json').read_bytes()
+                self.assertEqual(h.load_measurements(self.cfg)[1], [old])
+                self.assertEqual(process(self.api, self.db, old, sleep=lambda _: None), 'uncertain')
+                if mode == 'json_same_at':
+                    posted = next(request for request in self.sent if request['method'] == 'POST')
+                    actual_wire = h.aware(json.loads(posted['body'])['gmtTimestamp'] + '+00:00')
+                else:
+                    actual_wire = fit_weight_timestamp(self.fit_files[-1])
+                self.assertLessEqual(abs((actual_wire - candidate.at).total_seconds()), 1)
+                with patch('builtins.input', return_value='IGNORE'), contextlib.redirect_stdout(io.StringIO()):
+                    h.resolve_record(argparse.Namespace(record_id=old.key, present=False, absent=False, ignore=True))
+                ignored = dict(h.state_row(self.db, old))
+                self.assertEqual(ignored['status'], 'ignored')
+                sent = list(self.sent)
+                self.assertEqual(process(self.api, self.db, old), 'ignored')
+                self.assertEqual(self.sent, sent)
+                fixtures.ReconciliationTests.write_export(self, [candidate])
+                self.source_bytes = (self.inbox / 'health.json').read_bytes()
+                self.assertEqual(h.load_measurements(self.cfg)[1], [candidate])
+                output = io.StringIO()
+                with (patch.object(h, 'api_client', return_value=self.api),
+                      patch.object(h, 'process_record', side_effect=lambda *a, **k: process(*a, **k, sleep=lambda _: None)),
+                      contextlib.redirect_stdout(output)):
+                    h.run_sync(self.cfg)
+                self.assertEqual(sum(request['method'] == 'POST' for request in self.sent), 1)
+                self.assertIsNone(h.state_row(self.db, candidate))
+                self.assertEqual(dict(h.state_row(self.db, old)), ignored)
+                self.assertIn(old.key, output.getvalue())
+                context = [entry for entry in h.unknown_request_context(self.db) if entry[0] == old.key]
+                self.assertTrue(context)
+                self.assertEqual(context[0][2], actual_wire)
+                self.assert_source_untouched()
+                with patch('builtins.input', return_value='ABSENT'), contextlib.redirect_stdout(io.StringIO()):
+                    h.resolve_record(argparse.Namespace(record_id=old.key, present=False, absent=True, ignore=False))
+                self.assertEqual(h.state_row(self.db, old)['status'], 'pending')
+                self.assertEqual(process(self.api, self.db, candidate, sleep=lambda _: None), 'uncertain')
+                self.assertEqual(sum(request['method'] == 'POST' for request in self.sent), 2)
+                self.assertFalse(any(request['method'] == 'DELETE' for request in self.sent))
+                self.assertEqual(token.read_bytes(), b'unchanged local token')
+                self.assert_source_untouched()
+
+    def test_ignored_task_and_explicit_present_keep_existing_source_and_readonly_contracts(self):
+        self.cfg['allowed_sources'] = ['PICOOC', 'OTHER']
+        token = self.state / 'synthetic-token'
+        token.write_bytes(b'unchanged local token')
+        for received in (False, True):
+            with self.subTest(explicit_present=received):
+                self.db.execute('DELETE FROM uploads'); self.db.commit()
+                self.sent.clear(); self.rows = []
+                old = h.Measurement(h.aware('2020-02-20T00:00:01.500001+00:00'), 70, 23.5, 'PICOOC')
+                if received:
+                    self.assertEqual(h.process_record(self.api, self.db, old, sleep=lambda _: None), 'uncertain')
+                    actual_wire = fit_weight_timestamp(self.fit_files[-1])
+                else:
+                    h.set_status(self.db, old, 'pending')
+                with patch('builtins.input', return_value='IGNORE'), contextlib.redirect_stdout(io.StringIO()):
+                    h.resolve_record(argparse.Namespace(record_id=old.key, present=False, absent=False, ignore=True))
+                ignored = dict(h.state_row(self.db, old))
+                sent = list(self.sent)
+                self.assertEqual(h.process_record(self.api, self.db, old), 'ignored')
+                self.assertEqual(self.sent, sent)
+                self.assertEqual(dict(h.state_row(self.db, old)), ignored)
+                if received:
+                    with patch('builtins.input', return_value='PRESENT'), contextlib.redirect_stdout(io.StringIO()):
+                        h.resolve_record(argparse.Namespace(record_id=old.key, present=True, absent=False, ignore=False))
+                    self.rows = [fixtures.row(h.Measurement(actual_wire, 70, 23.5, 'REMOTE'), 200)]
+                previous = dict(h.state_row(self.db, old))
+                candidate = h.Measurement(old.at, 70, 23.5, 'OTHER')
+                fixtures.ReconciliationTests.write_export(self, [candidate])
+                self.source_bytes = (self.inbox / 'health.json').read_bytes()
+                self.assertEqual(h.load_measurements(self.cfg)[1], [candidate])
+                with patch.object(h, 'api_client', return_value=self.api), contextlib.redirect_stdout(io.StringIO()):
+                    if received:
+                        h.run_sync(self.cfg)
+                    else:
+                        self.assertEqual(h.process_record(self.api, self.db, candidate, sleep=lambda _: None), 'uncertain')
+                self.assertEqual(sum(request['method'] == 'POST' for request in self.sent), 1)
+                self.assertEqual(dict(h.state_row(self.db, old)), previous)
+                self.assertEqual(previous['status'], 'verified_manual' if received else 'ignored')
+                self.assertEqual(h.state_row(self.db, candidate)['status'], 'verified' if received else 'uncertain')
+                self.assertFalse(any(request['method'] == 'DELETE' for request in self.sent))
+                self.assertEqual(token.read_bytes(), b'unchanged local token')
+                self.assert_source_untouched()
+
     def test_deleted_but_timed_out_review_keeps_journal_and_verify_never_redeletes(self):
         original = fixtures.row(self.r)
         original['bodyFat'] = None
