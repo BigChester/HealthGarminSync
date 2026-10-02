@@ -226,7 +226,7 @@ def collect():
                         if (not isinstance(job.get('last_checked_at'), str)
                                 or type(job.get('last_check_passed')) is not bool):
                             raise ValueError('invalid journal verification')
-                        h.aware(job['last_checked_at'])
+                        evidence_time(job['last_checked_at'], reference_time)
                         failed_checks += not job['last_check_passed']
                     pending += job['phase'] not in TERMINAL_PHASES
                     total += 1
@@ -234,6 +234,9 @@ def collect():
                 f'未完成操作 {pending} 项；最近一次核对未通过 {failed_checks} 项。',
                 '运行 ./hg verify-operation 核对对应操作记录。' if pending or failed_checks else None,
                 {'total': total, 'unfinished': pending, 'failed_checks': failed_checks})
+        except FutureEvidenceError:
+            add('operations', 'error', '操作记录最近核对时间晚于当前 Mac 时间超过十分钟。',
+                '核对 Mac 时间和 state/operations 中的最近核对证据。')
         except (OSError, UnicodeError, ValueError, TypeError, h.SafeError):
             add('operations', 'error', '操作记录无法读取或结构无效。', '检查 state/operations 中的本地证据。')
         try:

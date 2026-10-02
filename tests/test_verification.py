@@ -1,6 +1,7 @@
 """Current verification results stay separate from completed operation history."""
 import argparse
 import contextlib
+from datetime import timedelta
 import io
 import json
 import logging
@@ -261,6 +262,36 @@ class OperationDiagnosticTests(unittest.TestCase):
         self.assert_diagnosis(path, 'deleted_verified', failed=False)
         self.assertFalse(api.posts)
         self.assertFalse(api.deletes)
+
+    def test_generated_operation_checks_share_future_tolerance_after_clock_rollback(self):
+        reference = h.now()
+        source, token = self.export.read_bytes(), (self.tokens / 'oauth.json').read_bytes()
+        for kind in ('deletion', 'repair', 'full'):
+            for offset, expected in ((timedelta(seconds=600), 0),
+                                     (timedelta(seconds=600, microseconds=1), 2),
+                                     (timedelta(days=30), 2)):
+                with self.subTest(kind=kind, rollback=offset):
+                    path = self.journal(phase='uncertain', deletion=kind == 'deletion', full=kind == 'full')
+                    api = API([] if kind == 'deletion' else [row(self.r, 201)])
+                    with patch.object(h, 'now', return_value=reference + offset):
+                        self.assertIs(self.check_single(path, api)[0], True)
+                    before = path.read_bytes()
+                    with patch.object(h, 'now', return_value=reference):
+                        code, _, checks = self.report()
+                        text_code, output = self.invoke('doctor')
+                    self.assertEqual((code, text_code), (expected, expected))
+                    self.assertEqual(checks['operations']['status'], 'error' if expected else 'ok')
+                    if expected:
+                        self.assertIn('Mac 时间', checks['operations']['hint'])
+                        self.assertIn('state/operations', checks['operations']['hint'])
+                        self.assertIn('Mac 时间', output)
+                        self.assertNotIn(path.name, output)
+                        self.assertNotIn(json.loads(before)['last_checked_at'], output)
+                    self.assertEqual(path.read_bytes(), before)
+                    self.assertFalse(api.posts)
+                    self.assertFalse(api.deletes)
+        self.assertEqual(self.export.read_bytes(), source)
+        self.assertEqual((self.tokens / 'oauth.json').read_bytes(), token)
 
     def test_deletion_identity_uncertainty_survives_cli_and_doctor_until_known_absence(self):
         path = self.journal(phase='uncertain', deletion=True)
