@@ -2,6 +2,18 @@
 
 本文命令在项目目录运行。`记录ID`、日期和清单文件名都需替换为实际值；写入命令先展示目标，按提示输入确认词。日常启用、安装与单条试传见 [README](../README.md)。
 
+## Garmin 血压与 Apple 健康
+
+`0.1.0` 的同步方向是 Apple 健康 → Garmin，处理体重、体脂率和 BMI。Garmin 血压及其脉搏属于独立接口，不会经过这条称重链路。
+
+先在 iPhone「健康 → 共享 → App → Connect」检查收缩压、舒张压和心率写入权限，保持 Garmin Connect 在前台完成同步，再核对授权后的一次新测量。新测量与历史回填分别检查。
+
+Garmin 官方公布的 Apple 健康共享清单未列血压；其论坛有 Index BPM 用户确认开启收缩压、舒张压后可以同步新测量。因此，需根据本机授权项、测量来源和实际新测量判断支持情况。手动录入血压所带的 `pulse` 也不能直接视为 Garmin 全天心率流。
+
+Garmin 中国区客户端可通过 `get_blood_pressure` 查询血压明细。读取时使用 `measurementSummaries[].measurements[]`，保留收缩压、舒张压、可选脉搏与原始时间；日最高、最低值不代表单次测量。`measurementTimestampGMT` 表示 UTC，不能按 Mac 本地时区解释。
+
+来源见 [Garmin → Apple 健康](SOURCES.md#garmin--apple-%E5%81%A5%E5%BA%B7)。
+
 ## 状态与未确定请求
 
 pending 待比对；verified / verified_manual 为已读回 / 人工确认；conflict / verified_conflict 为差异或歧义；remote_missing 曾验证后缺失；repair_uncertain 有未完成修复；uncertain / inflight 为结果未知 / 已持久准备提交；ignored 保留人工跳过决定。
