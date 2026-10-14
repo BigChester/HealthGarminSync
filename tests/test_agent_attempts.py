@@ -855,6 +855,7 @@ class AgentAttemptTests(unittest.TestCase):
     def install_temporary_script(self, override):
         source = Path(r.__file__).resolve().parent
         shutil.copyfile(source / 'agent_runner.py', self.entry)
+        shutil.copyfile(source / 'source_archive.py', self.base / 'source_archive.py')
         health = (source / 'health_garmin.py').read_text()
         (self.base / 'health_garmin.py').write_text(health + '\n' + override)
 

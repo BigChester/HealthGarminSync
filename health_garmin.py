@@ -2,7 +2,7 @@
 """Local Apple Health export -> Garmin CN bridge. JSON schema v1/v2. No HTTP server.
 
 The only network library is imported by explicit Garmin commands. Offline preview
-never authenticates. Source files are never modified. Run with Python >= 3.12.
+never authenticates. Verified exports can be archived locally. Run with Python >= 3.12.
 """
 from __future__ import annotations
 
@@ -181,6 +181,8 @@ def validate_config(cfg: Any) -> dict[str, Any]:
         raise SafeError("本工具仅配置为 Garmin 中国区；is_cn 必须为 true。")
     if type(cfg.get("enabled")) is not bool:
         raise SafeError("config.json 的 enabled 必须为布尔值 true 或 false，不能是文本或数字。")
+    if "archive_after_sync" in cfg and type(cfg["archive_after_sync"]) is not bool:
+        raise SafeError("config.json 的 archive_after_sync 必须为布尔值 true 或 false。")
     for key in ("inbox", "since"):
         if not isinstance(cfg.get(key), str) or not cfg[key].strip():
             raise SafeError(f"config.json 的 {key} 必须为非空文本。")
@@ -391,40 +393,42 @@ def deduplicate(samples: list[Sample]) -> list[Sample]:
     return sorted(unique.values(), key=lambda s: (s.at, s.metric))
 
 
-def load_exports(cfg: dict[str, Any]) -> tuple[list[Sample], dict[str, str]]:
+def load_exports(cfg: dict[str, Any], *, source_snapshot=None,
+                 include_archive: bool = True) -> tuple[list[Sample], dict[str, str]]:
+    import source_archive
     inbox = Path(cfg["inbox"]).expanduser()
     if not inbox.is_dir():
         raise SafeError("找不到导出目录，请确认 iCloud 下载状态和 config.json 中的真实路径。")
-    files = sorted(inbox.glob("*.json"))
-    if not files:
+    canonical = source_archive.canonical_inbox(cfg)
+    snapshots = [source_archive.capture(path, canonical) for path in source_archive.live_paths(inbox)]
+    if include_archive:
+        snapshots.extend(source_archive.read_archive(cfg))
+    if not snapshots:
         raise SafeError("导出目录没有 .json 文件；先在 iPhone 手动运行导出快捷指令。")
     all_samples: list[Sample] = []
     exports: dict[str, str] = {}
     allowed = {normalized_source(source) for source in cfg["allowed_sources"]}
-    for p in files:
-        if p.is_symlink():
-            raise SafeError("导出目录含符号链接，已停止。")
-        before = p.stat()
-        if before.st_size == 0 or before.st_size > 4 * 1024 * 1024:
-            raise SafeError(f"{p.name} 为空或超过 4 MB，请检查 iCloud 文件下载。")
+    for snapshot in snapshots:
         try:
-            obj = json.loads(read_regular_text(p, encoding="utf-8-sig"))
+            obj = json.loads(snapshot.raw.decode("utf-8-sig"))
         except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-            raise SafeError(f"{p.name} 不是完整 UTF-8 JSON，或尚未下载完毕。") from exc
-        after = p.stat()
-        if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
-            raise SafeError("文件正在更新，本次暂停；下一轮会重新读取。")
+            raise SafeError(f"{snapshot.name} 不是完整 UTF-8 JSON，或尚未下载完毕。") from exc
         try:
             new, exported = decode_export(obj, cfg)
         except SafeError as exc:
-            raise SafeError(f"{p.name}: {exc}") from exc
+            raise SafeError(f"{snapshot.name}: {exc}") from exc
+        snapshot.samples = new
+        snapshot.exported_at = exported.isoformat()
         all_samples.extend(new)
         for metric, items in export_groups(obj).items():
             if items and not any(normalized_source(item["source"]) in allowed for item in items):
                 continue
             if metric not in exports or exported > aware(exports[metric]):
                 exports[metric] = exported.isoformat()
-    return deduplicate(all_samples), exports
+    samples = deduplicate(all_samples)
+    if source_snapshot is not None:
+        source_snapshot.extend(snapshots)
+    return samples, exports
 
 
 def pair_samples(samples: list[Sample], window: int = 0,
@@ -1670,8 +1674,8 @@ def process_record(api: Any, db: sqlite3.Connection, r: Measurement, sleep=time.
     return "uncertain"
 
 
-def load_measurements(cfg: dict[str, Any]):
-    samples, exports = load_exports(cfg)
+def load_measurements(cfg: dict[str, Any], *, source_snapshot=None, include_archive=True):
+    samples, exports = load_exports(cfg, source_snapshot=source_snapshot, include_archive=include_archive)
     records, waiting = pair_samples(samples, int(cfg["pair_window_seconds"]), allow_weight_only=True)
     return samples, records, waiting, exports
 
@@ -1785,7 +1789,8 @@ def run_sync(cfg: dict[str, Any], record_id: str | None = None) -> None:
         print("自动写入未启用；本次只预览。启用前先完成单条试传。")
         show_preview(cfg)
         return
-    samples, records, waiting, exports = load_measurements(cfg)
+    source_snapshot = []
+    samples, records, waiting, exports = load_measurements(cfg, source_snapshot=source_snapshot)
     source_records = records
     if record_id:
         records = [r for r in records if r.key == record_id]
@@ -1855,6 +1860,11 @@ def run_sync(cfg: dict[str, Any], record_id: str | None = None) -> None:
         if settling:
             summary["deferred"] = "settling"
             print("手机刚导出，新增测量留待下一轮处理。")
+        elif cfg.get("archive_after_sync", False):
+            import source_archive
+            summary["source_archive"] = source_archive.archive_completed(
+                cfg, source_snapshot, samples, source_records, db)
+            print("原始 JSON 本地归档：", summary["source_archive"])
     write_json(STATE / "last_run.json", summary)
 
 
@@ -1883,7 +1893,7 @@ def init_config(args: argparse.Namespace) -> None:
     cfg = {"is_cn": True, "inbox": str(inbox), "allowed_sources": [source],
            "since": since, "weight_bare_unit": "kg", "fat_bare_unit": "percent",
            "pair_window_seconds": 0, "settle_seconds": 120,
-           "max_records_per_run": 10, "enabled": False}
+           "max_records_per_run": 10, "enabled": False, "archive_after_sync": True}
     write_json(CONFIG, cfg)
     print("已初始化，默认只同步选定起始日之后的数据，自动写入关闭。")
     print(json.dumps(cfg, ensure_ascii=False, indent=2))
@@ -1893,6 +1903,9 @@ def update_settings(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
     changes = {"fat_bare_unit": args.fat_unit, "weight_bare_unit": args.weight_unit,
                "pair_window_seconds": args.pair_window, "since": args.since,
                "inbox": args.inbox}
+    archive_setting = getattr(args, "archive_after_sync", None)
+    if archive_setting is not None:
+        changes["archive_after_sync"] = archive_setting == "on"
     if args.source is not None:
         changes["allowed_sources"] = [args.source]
     if cfg.get("enabled") and any(v is not None for v in changes.values()):
@@ -2089,6 +2102,9 @@ def main() -> int:
     p.add_argument("--weight-unit", choices=("kg", "lb", "g"))
     p.add_argument("--pair-window", type=int); p.add_argument("--since")
     p.add_argument("--source"); p.add_argument("--inbox")
+    p.add_argument("--archive-after-sync", choices=("on", "off"))
+    p = subs.add_parser("restore-exports", help="将当前 inbox 的本地原始 JSON 归档精确恢复到新目录")
+    p.add_argument("--to", required=True)
     p = subs.add_parser("resolve"); p.add_argument("record_id")
     group = p.add_mutually_exclusive_group(required=True)
     group.add_argument("--present", action="store_true")
@@ -2210,6 +2226,9 @@ def main() -> int:
                     print("仅查询，响应保存到：", p)
                     print(json.dumps(obj, ensure_ascii=False, indent=2))
                 elif args.command == "resolve": resolve_record(args)
+                elif args.command == "restore-exports":
+                    from source_archive import restore_exports
+                    restore_exports(cfg, args.to)
                 finish_logging()
             except (Exception, KeyboardInterrupt) as exc:
                 primary_result = report_error(exc, log=owned_handler is not None)

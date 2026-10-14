@@ -4,7 +4,6 @@ import contextlib
 from datetime import date
 import json
 from pathlib import Path
-import shutil
 import sqlite3
 
 import health_garmin as h
@@ -16,8 +15,10 @@ def signature(rows):
                              sort_keys=True, allow_nan=False) for row in rows)
 
 
-def load_targets(cfg, start, end):
-    _, records, waiting, _ = h.load_measurements(dict(cfg, since=start.isoformat()))
+def load_targets(cfg, start, end, *, source_snapshot=None, include_archive=True):
+    _, records, waiting, _ = h.load_measurements(dict(cfg, since=start.isoformat()),
+                                               source_snapshot=source_snapshot,
+                                               include_archive=include_archive)
     records = [r for r in records if start <= r.at.date() <= end]
     if waiting or not records:
         raise h.SafeError('完整历史导出为空或存在配对歧义，未执行替换。')
@@ -231,7 +232,8 @@ def execute(args, cfg, api=None):
         if input('确认以完整 Apple 历史为准，输入 REPLACE ALL：').strip() != 'REPLACE ALL':
             print('已取消，未修改 Garmin。')
             return
-        if payloads != [r.payload() for r in load_targets(cfg, start, end)]:
+        source_snapshot = []
+        if payloads != [r.payload() for r in load_targets(cfg, start, end, source_snapshot=source_snapshot)]:
             raise h.SafeError('确认期间 Apple 数据已变化，未执行替换。')
         latest = h.fetch_remote_snapshot(api, start, end, targets=records)
         if signature(latest['dateWeightList']) != signature(index.rows):
@@ -246,12 +248,9 @@ def execute(args, cfg, api=None):
         with contextlib.closing(sqlite3.connect(backup / 'sync.sqlite3')) as target, target:
             db.backup(target)
         (backup / 'sync.sqlite3').chmod(0o600)
-        for source in Path(cfg['inbox']).glob('*.json'):
-            destination = backup / 'exports' / source.name
-            h.private_dir(destination.parent)
-            shutil.copyfile(source, destination)
-            destination.chmod(0o600)
-        backed_up = load_targets(dict(cfg, inbox=str(backup / 'exports')), start, end)
+        from source_archive import export_snapshots
+        export_snapshots(source_snapshot, backup / 'exports')
+        backed_up = load_targets(dict(cfg, inbox=str(backup / 'exports')), start, end, include_archive=False)
         if payloads != [r.payload() for r in backed_up]:
             raise h.SafeError('Apple 导出备份与已确认的测量不一致，未执行替换；请重新对账。')
         journal_path = h.STATE / 'operations' / ('full-' + stamp + '.json')

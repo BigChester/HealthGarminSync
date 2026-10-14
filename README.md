@@ -33,7 +33,7 @@ bash setup.sh
 
 已有 Python 3.12+ 可跳过 `brew install`。`setup.sh` 创建 `.venv/`，安装固定 `garminconnect==0.3.16` 和 `curl_cffi`，运行离线测试并保存 `requirements.lock.txt`。找不到 Homebrew 时按其官方说明安装或恢复 shell 环境；依赖升级需手动验证。
 
-主要文件：`hg` 为命令入口，`health_garmin.py` 为主程序，`agent_runner.py` 为后台日志入口，`replace_history.py` 处理完整历史替换，`tests/` 为离线测试，`samples/health.example.json` 为禁止上传的演示数据。
+主要文件：`hg` 为命令入口，`health_garmin.py` 为主程序，`source_archive.py` 处理原始导出归档与恢复，`agent_runner.py` 为后台日志入口，`replace_history.py` 处理完整历史替换，`tests/` 为离线测试，`samples/health.example.json` 为禁止上传的演示数据。
 
 运行生成的 `config.json`、`state/`、`.venv/` 和依赖锁文件不随包交付。`state/tokens/`、备份及导出含凭据或健康数据，应留在本机并保持私密。
 
@@ -58,6 +58,7 @@ bash setup.sh
 | pair_window_seconds | 0 | 仅配对相同测量时刻 |
 | settle_seconds | 120 | 自动处理等待批次合并两分钟；0 关闭等待 |
 | max_records_per_run | 10 | 单次处理数量上限 |
+| archive_after_sync | true（新初始化） | 同步成功后将已核验文件归档至本地数据库并清理云端副本 |
 
 已有配置用 `settings` 修改；启用后须先 `./hg disable`，修改完重新预览。例如更新导出目录：
 
@@ -236,6 +237,31 @@ Mac 需开机、登录该用户、联网且文件已下载；睡眠、注销或�
 
 iPhone 自动化按 [SHORTCUTS.md](SHORTCUTS.md) 第 5 节设置：退出 PICOOC 后运行总快捷指令，另设每日固定时间，并保留手动入口。首次授权需在手机完成，读取 Health 可能要求解锁。
 
+## 8. 同步后归档原始导出
+
+开启归档后，成功完成 `run` 或 `upload-one` 会把符合条件的原始 JSON 完整存入 Mac 本地 `state/source_archive.sqlite3`，永久保留原始字节、文件名、目录、导出时间和 SHA-256，再清理 iCloud inbox 中对应文件。原始体重、体脂、BMI 和瘦体重都保留；瘦体重仍不上传 Garmin。
+
+新初始化配置默认开启；升级已有配置时，在关闭自动写入的状态下设置：
+
+```bash
+./hg settings --archive-after-sync on
+# 需要暂停云端清理时：./hg settings --archive-after-sync off
+```
+
+只有文件中纳入同步范围的样本都能唯一对应到已核验、数值一致的测量，才允许清理。待上传、缺字段、冲突、孤立指标和歧义样本的文件继续留在 inbox；存在未确定请求或未完成操作时暂停清理。仅预览、同步失败或等待手机导出合并的轮次不清理。归档提交并读回校验后，程序再检查源文件；文件变化或清理失败时保留数据，后续可重试。
+
+`preview`、`compare` 和 `run` 会合并当前目录对应的本地归档与新导出，inbox 清空后仍可核对历史，也能识别重复导出。独立 `--inbox` 只读取该目录对应的数据。关闭清理开关不影响读取已有归档。
+
+`doctor` 检查当前云端导出和归档数据库文件的可访问性，不打开归档数据库；用 `preview` 校验归档内容与配对结果。
+
+需要恢复原始 JSON 时，导出到一个尚不存在的目录：
+
+```bash
+./hg restore-exports --to "$HOME/Documents/HealthGarmin-restored"
+```
+
+恢复保留原始字节；同名不同内容的文件使用摘要后缀区分，不覆盖已有目录。完整历史替换的备份也包含归档中的原始导出。请随 `state/` 备份本地归档数据库；云端清理后，原始历史由本地数据库保留。
+
 ## 日常维护与排错
 
 ```bash
@@ -292,7 +318,7 @@ macOS 权限：先手动 `./hg preview` 接受目录授权。后台 Python 可�
 
 在系统设置 → 隐私与安全性 → 文件与文件夹检查对应进程。确被 TCC 拒绝且无更窄授权时，可为实际 Python 授予完全磁盘访问权限；该权限也覆盖其运行的其他脚本。授权后重新卸载、安装并验证 LaunchAgent；Homebrew 更新解释器路径后需重新检查。
 
-手机默认导出近 7 天；更早未导出的记录需扩大窗口导出一次。Mac 会继续读取 inbox 的旧文件，不自动删除云端副本。备份 SQLite 和 state 时保持私密，登录故障只需重新 login。日常同步只对账和新增，修复/删除/替换按上述确认流程执行，不回写 Apple 健康。
+手机默认导出近 7 天；更早未导出的记录需扩大窗口导出一次。Mac 会合并 inbox 与本地归档；启用归档后，已核验且完整存入数据库的导出会从云端清理。备份 SQLite 和 state 时保持私密，登录故障只需重新 login。日常同步只对账和新增，修复/删除/替换按上述确认流程执行，不回写 Apple 健康。
 
 实现依据见 [docs/SOURCES.md](docs/SOURCES.md)。固定库的 FIT 时间编码使用进程本地时区；程序提交时临时切本进程到 UTC，结束后恢复，以保留原始测量时间。
 

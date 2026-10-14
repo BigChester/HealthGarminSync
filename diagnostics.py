@@ -169,9 +169,14 @@ def collect():
             inbox = Path(cfg['inbox']).expanduser()
             files = [path for path in inbox.iterdir() if path.suffix == '.json']
             if not files:
-                add('inbox', 'warn', '当前进程可读取 inbox，但没有 JSON 导出。', '在 iPhone 手动导出一次。')
+                archive = h.STATE / 'source_archive.sqlite3'
+                if archive.exists() and not archive.is_symlink() and archive.is_file():
+                    add('inbox', 'info', 'inbox 为空；检测到本地原始导出归档。',
+                        '运行 ./hg preview 检查当前目录对应的归档；doctor 不打开 SQLite。')
+                else:
+                    add('inbox', 'warn', '当前进程可读取 inbox，但没有 JSON 导出。', '在 iPhone 手动导出一次。')
             else:
-                samples, records, waiting, exports = h.load_measurements(cfg)
+                samples, records, waiting, exports = h.load_measurements(cfg, include_archive=False)
                 data = {'files': len(files), 'samples': len(samples),
                         'measurements': len(records), 'waiting_pairs': len(waiting)}
                 if waiting:
@@ -321,6 +326,12 @@ def collect():
             unknown_count = last.get('unknown_request_count', 0)
             if type(unknown_count) is not int or unknown_count < 0:
                 raise ValueError('invalid unknown request count')
+            archive_counts = last.get('source_archive')
+            if 'source_archive' in last:
+                if (not isinstance(archive_counts, dict)
+                        or set(archive_counts) != {'archived', 'removed', 'changed', 'failed', 'missing'}
+                        or any(type(count) is not int or count < 0 for count in archive_counts.values())):
+                    raise ValueError('invalid source archive counts')
             statuses = set(counts) | {key for key, count in local_counts.items() if count > 0}
             stale = cfg is not None and cfg['enabled'] and (reference_time - ran_at).total_seconds() > STALE_SECONDS
             if unknown_count or UNCERTAIN_RESULTS.intersection(statuses):
@@ -355,6 +366,13 @@ def collect():
                     hint = (hint + ' ' if hint else '') + '本地状态为最近同步时的快照；运行 ./hg status 核对当前状态。'
             add('last_run', status, message, hint,
                 data=data)
+            if archive_counts is not None:
+                failed_cleanup = archive_counts['failed'] > 0
+                add('source_archive', 'warn' if failed_cleanup else 'info',
+                    '原始 JSON 已归档，但部分 inbox 文件未能清理。' if failed_cleanup
+                    else '最近同步的原始 JSON 归档计数可读取。',
+                    '检查 inbox 与归档隔离目录权限；下次 ./hg run 会继续安全清理。' if failed_cleanup else None,
+                    data=archive_counts)
             if source_summary is not None and source_summary[0] > ran_at:
                 latest_export, source_count = source_summary
                 freshness = {'latest_export_at': latest_export.isoformat(),

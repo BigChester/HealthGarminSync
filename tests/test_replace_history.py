@@ -270,19 +270,24 @@ class BulkReplacementTests(unittest.TestCase):
             finally:
                 restored.set()
         worker = threading.Thread(target=exporter, daemon=True)
-        native_copy = bulk.shutil.copyfile
-        def concurrent_copy(src, dst):
-            self.assertEqual(src, source)
+        import source_archive
+        native_export = source_archive.export_snapshots
+        def concurrent_copy(snapshots, dst):
             begin.set()
             self.assertTrue(ready.wait(2))
             try:
-                return native_copy(src, dst)
+                result = native_export(snapshots, dst)
+                # Inject a torn/corrupt backup write. Production exports the
+                # immutable snapshot rather than copying a concurrently edited
+                # iCloud path, and must still reject unusable stored evidence.
+                (dst / source.name).write_bytes(source.read_bytes())
+                return result
             finally:
                 copied.set()
                 self.assertTrue(restored.wait(2))
         worker.start()
         try:
-            with (patch.object(bulk.shutil, 'copyfile', side_effect=concurrent_copy),
+            with (patch.object(source_archive, 'export_snapshots', side_effect=concurrent_copy),
                   patch.object(h, 'api_client', side_effect=AssertionError('No login')),
                   patch.object(Path, 'home', side_effect=AssertionError('No real home')),
                   patch('socket.socket', side_effect=AssertionError('No network')),
