@@ -10,7 +10,43 @@
 
 Garmin 官方公布的 Apple 健康共享清单未列血压；其论坛有 Index BPM 用户确认开启收缩压、舒张压后可以同步新测量。因此，需根据本机授权项、测量来源和实际新测量判断支持情况。手动录入血压所带的 `pulse` 也不能直接视为 Garmin 全天心率流。
 
+本机已确认 Connect 没有收缩压、舒张压写入开关，当前原生路径无法获得血压写入授权；使用下述导入端完成补同步。
+
 Garmin 中国区客户端可通过 `get_blood_pressure` 查询血压明细。读取时使用 `measurementSummaries[].measurements[]`，保留收缩压、舒张压、可选脉搏与原始时间；日最高、最低值不代表单次测量。`measurementTimestampGMT` 表示 UTC，不能按 Mac 本地时区解释。
+
+### 安装 iPhone 导入端
+
+Mac CLI 负责读取与发布，写入健康由 `ios/GarminHealthBridge/App/GarminHealthBridge.xcodeproj` 中的 App 完成。使用 Xcode 16+ 打开工程，选择自己的签名 Team 和连接的 iPhone，运行 `GarminHealthBridge`；最低 iOS 17。App 使用系统文件选择器访问 iCloud，不保存 Garmin 凭据。
+
+在 Mac 项目目录读取指定历史范围：
+
+```bash
+./health-garmin-sync export-health \
+  --since 2026-09-01 --until 2026-10-15 \
+  --outbox "/Users/chester/Library/Mobile Documents/iCloud~is~workflow~my~workflows/Documents/Health/garmin-to-health"
+```
+
+日期替换为实际需要的范围，交接目录须独立于称重 inbox。此命令只读 Garmin；iPhone 尚未导入时，重复执行保留当前批次。
+
+在 iPhone App 中选择同一 `Health/garmin-to-health` **目录**，核对测量后点击「授权并同步到健康」。允许读取已有收缩压、舒张压和心率供查重，并允许写入。App 将血压组合成一条关联测量，把脉搏保存为同一时刻的心率；健康数据来源显示为本导入 App。
+
+全部写入并读回匹配后，App 发布回执。下一次 Mac 导出消费回执并发布下一批。单批最多 100 条；云端只有当前 `pending.json` 与 `receipt.json`，已确认文件移至同卷本地私密目录校验后清理。完整 SDK 响应、本地队列和确认版本永久保存在 `state/garmin_health.sqlite3`。
+
+### 定时导出与 iPhone 自动化
+
+```bash
+./health-garmin-sync settings --health-outbox "/Users/chester/Library/Mobile Documents/iCloud~is~workflow~my~workflows/Documents/Health/garmin-to-health"
+./health-garmin-sync enable-health  # 输入 ENABLE HEALTH
+./health-garmin-sync run
+./health-garmin-sync install-agent
+./health-garmin-sync status
+```
+
+血压导出可独立于称重启用，无需先试传体重。首次扫描配置起点至中国区今天，之后覆盖未扫描的日期并重读近七天。Mac 每 30 分钟检查回执和新数据；iPhone 需解锁、健康授权有效且云文件已下载。App 可选择「打开 App 时自动同步」，或在快捷指令自动化中调用「同步 Garmin 血压」动作；该动作会打开 App。
+
+`disable-health` 只停血压定时导出；`disable` 停止两向自动处理；`export-health` 是显式执行，不受自动开关影响。更改交接目录前先停自动处理。相同来源键的修订使用更高版本更新本 App 写入的数据，缺省脉搏不推算；删除 Garmin 记录不联动删除健康，来源键变化的修改按新测量处理。其他 App 的记录保留，冲突留待核对。
+
+最近导出摘要为 `state/last_health_export.json`。Mac 收到的回执代表 iPhone 导入端报告成功，设备验收在健康 App 中核对时间、血压及脉搏。
 
 来源见 [Garmin → Apple 健康](SOURCES.md#garmin--apple-%E5%81%A5%E5%BA%B7)。
 

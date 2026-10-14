@@ -1,10 +1,12 @@
 # 验证记录
 
-## Garmin → Apple 健康：血压调查
+## Garmin → Apple 健康：血压与脉搏
 
-2026-10-15，Python 3.15.0：577 项离线测试通过，无跳过；其中 27 项新增测试覆盖血压明细、UTC 跨日、脉搏缺省、多测量标志、重复冲突及异常响应。格式、静态检查和独立实现审查通过。
+2026-10-15，Python 3.15.0：640 项离线测试通过。Swift 37 项测试及 Python → Swift → Python 批次、回执、恢复测试通过，覆盖血压关联、同次脉搏、重复导入、修订、权限拒绝、部分写入、回执核验、永久归档与云端清理。格式、静态检查和独立实现审查通过。
 
-中国区账户近 30 天的只读查询返回 10 条手动血压测量，均含脉搏；解析模块对该响应验证通过。Mac 的 `HKHealthStore.isHealthDataAvailable()` 返回 false。手机 Connect 的血压授权项尚待核对；本切片只完成调查与解析，尚未写入 Apple 健康。
+中国区账户近 30 天的只读查询返回 10 条手动血压测量，均含脉搏；真实按日查询确认 UTC 跨日记录按本地日期返回。用户确认手机 Connect 没有收缩压、舒张压写入开关，当前原生路径无法授权写入血压。Mac 的 `HKHealthStore.isHealthDataAvailable()` 返回 false，写入端由 iPhone 应用提供。
+
+本地使用 Apple SDK 编译检查 SwiftUI、AppIntents 和 HealthKit 类型；HealthKit 样本构造测试通过。iOS 构建与模拟器启动由 CI 验证，结果待补充。本轮未向真实 Apple 健康写入数据；iPhone 签名安装、健康授权与实际导入仍需设备验收。复核命令见 [CONTRIBUTING](../CONTRIBUTING.md)。
 
 ## 本次架构与工具调整
 

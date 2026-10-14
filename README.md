@@ -1,6 +1,8 @@
-# HealthGarminSync：PICOOC → Apple 健康 → Garmin 中国区
+# HealthGarminSync：Apple 健康与 Garmin 中国区
 
 iPhone 快捷指令把 Apple 健康中的 PICOOC 测量导出到 iCloud Drive，Mac CLI 每 30 分钟检查并同步到 Garmin 中国区。默认仅新增明确缺失的测量，修复和历史替换需手动确认。
+
+可选的反向链路读取 Garmin 血压与测量脉搏，经 iCloud 批次交给 iPhone App 保存到 Apple 健康。血压成对保存，脉搏映射为测量时的心率；原始 API 响应永久保存在 Mac 本地数据库。原生 Connect 授权检查、App 安装、历史回填与定时导出见 [血压同步](docs/OPERATIONS.md#garmin-%E8%A1%80%E5%8E%8B%E4%B8%8E-apple-%E5%81%A5%E5%BA%B7)。
 
 当前版本为 **0.1.0**；运行 `./health-garmin-sync --version` 查看版本。
 
@@ -77,7 +79,7 @@ bash scripts/setup.sh
 
 LaunchAgent 每 30 分钟启动一次 CLI。Mac 需开机、登录该用户、联网且 iCloud 文件已下载。首次复核起始日后的全部测量，以后复核近 30 天及更早待处理、未确定、缺失或修订记录；单次默认最多处理 10 条，等待导出合并两分钟。无待复核数据时不登录 Garmin，历史瘦体重补录仅更新本地。
 
-自动处理保留冲突和多余记录，后到字段留待人工修复；关闭写入时 `run` 仅离线预览。iPhone 自动化和超过七天的补采见 [快捷指令说明](docs/SHORTCUTS.md#%E8%87%AA%E5%8A%A8%E5%8C%96%E4%B8%8E%E8%A1%A5%E9%87%87)。后台权限和运行限制见 [维护说明](docs/OPERATIONS.md#%E8%AF%8A%E6%96%AD%E4%B8%8E%E5%90%8E%E5%8F%B0%E8%BF%90%E8%A1%8C)。
+自动处理保留冲突和多余记录，后到字段留待人工修复；两向自动开关均关闭时 `run` 仅离线预览。iPhone 自动化和超过七天的补采见 [快捷指令说明](docs/SHORTCUTS.md#%E8%87%AA%E5%8A%A8%E5%8C%96%E4%B8%8E%E8%A1%A5%E9%87%87)。后台权限和运行限制见 [维护说明](docs/OPERATIONS.md#%E8%AF%8A%E6%96%AD%E4%B8%8E%E5%90%8E%E5%8F%B0%E8%BF%90%E8%A1%8C)。
 
 ## 日常命令与数据保留
 
@@ -99,7 +101,7 @@ LaunchAgent 每 30 分钟启动一次 CLI。Mac 需开机、登录该用户、�
 ./health-garmin-sync restore-exports --to "$HOME/Documents/HealthGarmin-restored"
 ```
 
-请私密备份完整 `state/`（含归档、令牌和恢复证据）及配置。`config.json`、`state/`、`.venv/` 和本机锁文件不进入 Git。程序不回写 Apple 健康；手机修改或删除历史数据后，用 [对账、删除及完整历史替换](docs/OPERATIONS.md) 核对处理。
+请私密备份完整 `state/`（含归档、令牌和恢复证据）及配置。`config.json`、`state/`、`.venv/` 和本机锁文件不进入 Git。称重链路不回写 Apple 健康；反向血压由 iPhone 导入端写入。手机修改或删除称重历史后，用 [对账、删除及完整历史替换](docs/OPERATIONS.md) 核对处理。
 
 ## 进一步阅读
 
