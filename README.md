@@ -2,6 +2,8 @@
 
 iPhone 快捷指令把 Apple 健康中的 PICOOC 测量导出到 iCloud Drive，Mac CLI 每 30 分钟检查并同步到 Garmin 中国区。默认仅新增明确缺失的测量，修复和历史替换需手动确认。
 
+当前版本为 **0.1.0**；运行 `./health-garmin-sync --version` 查看版本。
+
 ## 安装与手机准备
 
 1. 在 Apple 健康中确认 PICOOC 已写入真实测量，并核对准确来源名称。

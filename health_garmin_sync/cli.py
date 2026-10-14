@@ -14,6 +14,7 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
+from . import __version__
 from . import domain as hg_domain
 from . import exports as hg_exports
 from . import file_io as hg_file_io
@@ -165,6 +166,7 @@ def show_status(cfg: dict[str, Any]) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(prog="health-garmin-sync", description=__doc__)
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     subs = parser.add_subparsers(dest="command", required=True)
     p = subs.add_parser("init")
     p.add_argument("--inbox")

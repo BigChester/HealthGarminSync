@@ -70,12 +70,14 @@ assert 'garminconnect' not in sys.modules
         )
         self.assertEqual(result.returncode, 0, result.stderr)
 
-    def test_all_modules_import_without_sdk_network_or_runtime_writes(self):
+    def test_all_modules_import_and_version_without_sdk_network_or_runtime_writes(self):
         script = """
 import builtins
 import importlib
 import pkgutil
+import runpy
 import socket
+import sys
 
 def forbidden(*args, **kwargs):
     raise AssertionError('network or SDK import during package inspection')
@@ -91,6 +93,13 @@ import health_garmin_sync
 for module in pkgutil.iter_modules(health_garmin_sync.__path__):
     if module.name != '__main__':
         importlib.import_module('health_garmin_sync.' + module.name)
+sys.argv = ['health-garmin-sync', '--version']
+try:
+    runpy.run_module('health_garmin_sync', run_name='__main__')
+except SystemExit as exc:
+    assert exc.code == 0, exc.code
+else:
+    raise AssertionError('--version did not exit')
 """
         with tempfile.TemporaryDirectory() as temp:
             project = Path(temp)
@@ -104,6 +113,7 @@ for module in pkgutil.iter_modules(health_garmin_sync.__path__):
                 timeout=5,
             )
             self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, "health-garmin-sync 0.1.0\n")
             self.assertEqual(set(project.rglob("*")), before)
 
     def test_canonical_help_entry_works_in_an_isolated_project(self):
