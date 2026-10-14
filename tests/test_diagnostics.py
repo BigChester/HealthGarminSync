@@ -1291,6 +1291,117 @@ finally:
         self.assertEqual(result, 0)
         self.assertEqual(checks['last_run']['status'], 'warn')
 
+    def test_historical_replacement_reports_newer_source_without_claiming_remote_absence(self):
+        self.cfg['enabled'] = False
+        self.save_config()
+        summary = {'kind': 'full_replacement', 'phase': 'verified',
+                   'finished_at': '2020-02-19T00:00:00+00:00',
+                   'source_measurements': 0, 'remote_measurements': 0,
+                   'matched': 0, 'extra': 0, 'backup': SECRET, 'payload': SECRET}
+        self.last.write_text(json.dumps(summary))
+        code, _, checks = self.report()
+        self.assertEqual(code, 0)
+        self.assertEqual(checks['last_run']['status'], 'info')
+        self.assertIn('历史完整替换', checks['last_run']['message'])
+        fresh = checks['source_freshness']
+        self.assertEqual(fresh['status'], 'warn')
+        self.assertEqual(fresh['data']['source_measurements'], 1)
+        self.assertEqual(fresh['data']['historically_verified_measurements'], 0)
+        self.assertEqual(fresh['data']['measurement_count_difference'], 1)
+        self.assertIn('不表示 Garmin 缺失', fresh['hint'])
+        summary['finished_at'] = '2020-02-21T00:00:00+00:00'
+        self.last.write_text(json.dumps(summary))
+        _, _, checks = self.report()
+        self.assertNotIn('source_freshness', checks)
+
+    def test_historical_replacement_rejects_invalid_counts_phase_and_time(self):
+        summary = {'kind': 'full_replacement', 'phase': 'verified',
+                   'finished_at': h.now().isoformat(), 'source_measurements': 1,
+                   'remote_measurements': 1, 'matched': 1, 'extra': 0}
+        cases = [('source_measurements', True), ('matched', -1), ('matched', 0),
+                 ('remote_measurements', 2), ('extra', SECRET), ('phase', 'uncertain'),
+                 ('finished_at', SECRET),
+                 ('finished_at', (h.now() + timedelta(hours=1)).isoformat())]
+        for key, value in cases:
+            with self.subTest(key=key, value=value):
+                self.last.write_text(json.dumps({**summary, key: value}))
+                code, _, checks = self.report()
+                self.assertEqual(code, 2)
+                self.assertEqual(checks['last_run']['status'], 'error')
+                self.assertNotIn('data', checks['last_run'])
+                self.assertNotIn('source_freshness', checks)
+        self.last.write_text(json.dumps({**summary, 'extra': 1, 'remote_measurements': 2}))
+        code, _, checks = self.report()
+        self.assertEqual(code, 2)
+        self.assertEqual(checks['last_run']['status'], 'error')
+        self.assertNotIn('data', checks['last_run'])
+        self.assertNotIn('source_freshness', checks)
+
+    def test_newer_export_also_warns_for_modern_summary_without_inventing_pending_count(self):
+        self.last.write_text(json.dumps({'run_at': '2020-02-19T00:00:00+00:00',
+                                         'results': {SECRET: 'verified'}}))
+        _, _, checks = self.report()
+        fresh = checks['source_freshness']
+        self.assertEqual(fresh['status'], 'warn')
+        self.assertEqual(fresh['data']['source_measurements'], 1)
+        self.assertNotIn('measurement_count_difference', fresh['data'])
+        self.assertNotIn('pending', fresh['data'])
+        code, output = self.invoke('doctor')
+        self.assertEqual(code, 0)
+        self.assertIn('不表示 Garmin 缺失', output)
+
+    def test_historical_closed_operations_allow_timestamp_without_modern_result(self):
+        operations = self.state / 'operations'
+        operations.mkdir()
+        path = operations / 'job.json'
+        for phase in ('verified', 'closed_partial'):
+            with self.subTest(phase=phase):
+                path.write_text(json.dumps({'type': 'full_replacement', 'phase': phase,
+                    'key': SECRET, 'last_checked_at': h.now().isoformat(),
+                    'verification': {'matched': 1, 'target_count': 1, 'remote_count': 1, 'extra': 0}}))
+                code, _, checks = self.report()
+                self.assertEqual(code, 0)
+                self.assertEqual(checks['operations']['status'], 'ok')
+                self.assertEqual(checks['operations']['data']['unfinished'], 0)
+                self.assertEqual(checks['historical_operations']['data'], {'count': 1})
+        for phase, stamp in [('uncertain', h.now().isoformat()),
+                             ('verified', SECRET),
+                             ('verified', (h.now() + timedelta(hours=1)).isoformat())]:
+            with self.subTest(phase=phase, stamp=stamp):
+                path.write_text(json.dumps({'type': 'full_replacement', 'phase': phase,
+                                           'key': SECRET, 'last_checked_at': stamp}))
+                code, _, checks = self.report()
+                self.assertEqual(code, 2)
+                self.assertEqual(checks['operations']['status'], 'error')
+
+    def test_historical_verification_counts_override_closed_phase_after_failed_readback(self):
+        operations = self.state / 'operations'
+        operations.mkdir()
+        path = operations / 'job.json'
+        counts = {'matched': 2, 'target_count': 2, 'remote_count': 2, 'extra': 0}
+        for phase in ('verified', 'closed_partial'):
+            for changes in ({'matched': 1}, {'remote_count': 1}, {'remote_count': 3}, {'extra': 1}):
+                with self.subTest(phase=phase, changes=changes):
+                    path.write_text(json.dumps({'type': 'full_replacement', 'phase': phase,
+                        'key': SECRET, 'last_checked_at': h.now().isoformat(),
+                        'verification': {**counts, **changes}}))
+                    code, _, checks = self.report()
+                    self.assertEqual(code, 2)
+                    self.assertEqual(checks['operations']['status'], 'error')
+                    self.assertEqual(checks['operations']['data'],
+                                     {'total': 1, 'unfinished': 0, 'failed_checks': 1})
+        invalid = [None, SECRET, {}, {**counts, 'matched': True},
+                   {**counts, 'extra': -1}, {**counts, 'matched': SECRET},
+                   {**counts, 'payload': SECRET}]
+        for verification in invalid:
+            with self.subTest(verification=verification):
+                path.write_text(json.dumps({'type': 'full_replacement', 'phase': 'verified',
+                    'key': SECRET, 'last_checked_at': h.now().isoformat(), 'verification': verification}))
+                code, _, checks = self.report()
+                self.assertEqual(code, 2)
+                self.assertEqual(checks['operations']['status'], 'error')
+                self.assertNotIn('data', checks['operations'])
+
     def test_malformed_plist_and_runtime_paths_are_errors_without_value_dump(self):
         self.plist.write_text('<plist><dict>' + SECRET)
         result, _, checks = self.report()

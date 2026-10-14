@@ -50,6 +50,30 @@ def evidence_time(text, reference_time):
     return stamp
 
 
+def historical_replacement_summary(value):
+    """Recognize the completed replacement summary written by older installations."""
+    if not isinstance(value, dict) or value.get('kind') != 'full_replacement':
+        return None
+    fields = ('source_measurements', 'remote_measurements', 'matched', 'extra')
+    if (value.get('phase') != 'verified' or not isinstance(value.get('finished_at'), str)
+            or any(type(value.get(key)) is not int or value[key] < 0 for key in fields)
+            or value['matched'] != value['source_measurements']
+            or value['extra'] != 0
+            or value['remote_measurements'] != value['matched'] + value['extra']):
+        raise ValueError('invalid historical replacement summary')
+    return {key: value[key] for key in fields}
+
+
+def historical_verification_passed(value):
+    """Old verification kept its phase even after a failed read-back."""
+    fields = {'matched', 'target_count', 'remote_count', 'extra'}
+    if (not isinstance(value, dict) or set(value) != fields
+            or any(type(value[key]) is not int or value[key] < 0 for key in fields)):
+        raise ValueError('invalid historical verification')
+    return (value['matched'] == value['target_count'] == value['remote_count']
+            and value['extra'] == 0)
+
+
 def attempt_summary(value, *, allowed_stages=('config', 'sync'),
                     allowed_outcomes=('running', 'completed', 'preview', 'failed', 'interrupted'),
                     allow_http=True, reference_time=None):
@@ -126,6 +150,7 @@ def collect():
             add('dependency', 'error', 'garminconnect 版本与固定依赖不符。', '运行 bash setup.sh。')
 
     cfg = None
+    source_summary = None
     try:
         cfg = h.validate_config(_json(h.CONFIG, reject_symlink=False))
     except FileNotFoundError:
@@ -146,7 +171,7 @@ def collect():
             if not files:
                 add('inbox', 'warn', '当前进程可读取 inbox，但没有 JSON 导出。', '在 iPhone 手动导出一次。')
             else:
-                samples, records, waiting, _ = h.load_measurements(cfg)
+                samples, records, waiting, exports = h.load_measurements(cfg)
                 data = {'files': len(files), 'samples': len(samples),
                         'measurements': len(records), 'waiting_pairs': len(waiting)}
                 if waiting:
@@ -156,6 +181,8 @@ def collect():
                         '运行 ./hg preview 核对来源和起始日期。', data)
                 else:
                     add('inbox', 'ok', '当前进程可读取导出，解析和配对通过。', data=data)
+                    if exports:
+                        source_summary = (max(h.aware(stamp) for stamp in exports.values()), len(records))
         except (OSError, ValueError, RuntimeError, h.SafeError):
             add('inbox', 'error', '当前进程无法读取或校验 inbox 导出。',
                 '检查目录与下载状态，运行 ./hg preview 查看具体原因。')
@@ -234,7 +261,7 @@ def collect():
     if state_available:
         try:
             operations = h.STATE / 'operations'
-            pending, total, failed_checks = 0, 0, 0
+            pending, total, failed_checks, historical_checks = 0, 0, 0, 0
             if operations.is_symlink():
                 raise ValueError('symlink')
             if operations.exists():
@@ -249,17 +276,27 @@ def collect():
                     if not isinstance(ids, list) or any(not isinstance(key, str) for key in ids):
                         raise ValueError('invalid journal')
                     if 'last_checked_at' in job or 'last_check_passed' in job:
+                        historical = (job.get('type') == 'full_replacement'
+                                      and job['phase'] in ('verified', 'closed_partial')
+                                      and 'last_check_passed' not in job)
                         if (not isinstance(job.get('last_checked_at'), str)
-                                or type(job.get('last_check_passed')) is not bool):
+                                or not historical and type(job.get('last_check_passed')) is not bool):
                             raise ValueError('invalid journal verification')
                         evidence_time(job['last_checked_at'], reference_time)
-                        failed_checks += not job['last_check_passed']
+                        if historical:
+                            historical_checks += 1
+                            failed_checks += not historical_verification_passed(job.get('verification'))
+                        else:
+                            failed_checks += not job['last_check_passed']
                     pending += job['phase'] not in TERMINAL_PHASES
                     total += 1
             add('operations', 'error' if failed_checks else 'warn' if pending else 'ok',
                 f'未完成操作 {pending} 项；最近一次核对未通过 {failed_checks} 项。',
                 '运行 ./hg verify-operation 核对对应操作记录。' if pending or failed_checks else None,
                 {'total': total, 'unfinished': pending, 'failed_checks': failed_checks})
+            if historical_checks:
+                add('historical_operations', 'info', '历史已关闭替换操作使用旧版计数核对结果；不代表当前数据已核验。',
+                    data={'count': historical_checks})
         except FutureEvidenceError:
             add('operations', 'error', '操作记录最近核对时间晚于当前 Mac 时间超过十分钟。',
                 '核对 Mac 时间和 state/operations 中的最近核对证据。')
@@ -267,6 +304,9 @@ def collect():
             add('operations', 'error', '操作记录无法读取或结构无效。', '检查 state/operations 中的本地证据。')
         try:
             last = _json(h.STATE / 'last_run.json')
+            history = historical_replacement_summary(last)
+            if history is not None:
+                last = {'run_at': last['finished_at'], 'results': {}}
             if (not isinstance(last, dict) or not isinstance(last.get('run_at'), str)
                     or not isinstance(last.get('results'), dict)
                     or any(not isinstance(result, str) or result not in RESULTS for result in last['results'].values())):
@@ -304,6 +344,9 @@ def collect():
                     status = 'warn'
                 hint = (hint + ' ' if hint else '') + '最近运行摘要距今超过两小时；请核对任务与设备状态。'
             data = {'run_at': ran_at.isoformat(), 'results': counts}
+            if history is not None:
+                message = '历史完整替换已核验；不代表当前导出已核验。'
+                data['historical_replacement'] = history
             if 'unknown_request_count' in last:
                 data['unknown_request_count'] = unknown_count
             if 'local_status_counts' in last:
@@ -312,6 +355,15 @@ def collect():
                     hint = (hint + ' ' if hint else '') + '本地状态为最近同步时的快照；运行 ./hg status 核对当前状态。'
             add('last_run', status, message, hint,
                 data=data)
+            if source_summary is not None and source_summary[0] > ran_at:
+                latest_export, source_count = source_summary
+                freshness = {'latest_export_at': latest_export.isoformat(),
+                             'last_run_at': ran_at.isoformat(), 'source_measurements': source_count}
+                if history is not None:
+                    freshness['historically_verified_measurements'] = history['matched']
+                    freshness['measurement_count_difference'] = source_count - history['source_measurements']
+                add('source_freshness', 'warn', '当前源导出比最近完成的运行证据更新；最新数据尚未由该证据核验。',
+                    '导出时间与测量数量差不表示 Garmin 缺失；需要时运行 ./hg compare 只读核对。', freshness)
         except FileNotFoundError:
             add('last_run', 'warn', '尚无最近运行摘要。')
         except FutureEvidenceError:
