@@ -53,9 +53,11 @@ def manage_agent(install: bool, cfg: dict[str, Any] | None = None) -> None:
         raise hg_domain.SafeError("LaunchAgent 仅能在 macOS 安装。")
     path = Path.home() / "Library/LaunchAgents" / f"{hg_runtime.LABEL}.plist"
     domain = f"gui/{os.getuid()}"
-    if install and (cfg is None or not cfg.get("enabled")):
+    if install and (
+        cfg is None or not (cfg.get("enabled") or cfg.get("health_export_enabled", False))
+    ):
         raise hg_domain.SafeError(
-            "先完成试传并运行 ./health-garmin-sync enable，然后安装定时任务。"
+            "先完成试传并运行 ./health-garmin-sync enable，或运行 enable-health，再安装定时任务。"
         )
     # Only this tool's known service label is affected; no system-wide changes.
     if not install:

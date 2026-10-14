@@ -52,6 +52,17 @@ def validate_config(cfg: Any) -> dict[str, Any]:
         )
     if "archive_after_sync" in cfg and type(cfg["archive_after_sync"]) is not bool:
         raise hg_domain.SafeError("config.json 的 archive_after_sync 必须为布尔值 true 或 false。")
+    if "health_export_enabled" in cfg and type(cfg["health_export_enabled"]) is not bool:
+        raise hg_domain.SafeError("config.json 的 health_export_enabled 必须为布尔值。")
+    health_outbox = cfg.get("health_outbox")
+    if health_outbox is not None and (
+        not isinstance(health_outbox, str)
+        or not health_outbox.strip()
+        or not Path(health_outbox).is_absolute()
+    ):
+        raise hg_domain.SafeError("config.json 的 health_outbox 必须为绝对目录路径或 null。")
+    if cfg.get("health_export_enabled", False) and health_outbox is None:
+        raise hg_domain.SafeError("启用血压导出前须设置独立的 health_outbox 目录。")
     for key in ("inbox", "since"):
         if not isinstance(cfg.get(key), str) or not cfg[key].strip():
             raise hg_domain.SafeError(f"config.json 的 {key} 必须为非空文本。")

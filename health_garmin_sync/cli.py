@@ -1,4 +1,4 @@
-"""Local Apple Health export -> Garmin CN bridge. JSON schema v1/v2. No HTTP server."""
+"""Local Apple Health and Garmin CN sync, with an optional iPhone blood-pressure bridge."""
 
 from __future__ import annotations
 
@@ -72,6 +72,8 @@ def init_config(args: argparse.Namespace) -> None:
         "max_records_per_run": 10,
         "enabled": False,
         "archive_after_sync": True,
+        "health_outbox": None,
+        "health_export_enabled": False,
     }
     hg_file_io.write_json(hg_runtime.CONFIG, cfg)
     print("已初始化，默认只同步选定起始日之后的数据，自动写入关闭。")
@@ -89,9 +91,14 @@ def update_settings(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
     archive_setting = getattr(args, "archive_after_sync", None)
     if archive_setting is not None:
         changes["archive_after_sync"] = archive_setting == "on"
+    health_outbox = getattr(args, "health_outbox", None)
+    if health_outbox is not None:
+        changes["health_outbox"] = health_outbox
     if args.source is not None:
         changes["allowed_sources"] = [args.source]
-    if cfg.get("enabled") and any(v is not None for v in changes.values()):
+    if (cfg.get("enabled") or cfg.get("health_export_enabled")) and any(
+        v is not None for v in changes.values()
+    ):
         raise hg_domain.SafeError(
             "先运行 ./health-garmin-sync disable，再修改单位、来源、时间或目录，并重新预览。"
         )
@@ -99,6 +106,14 @@ def update_settings(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
     for k, v in changes.items():
         if v is not None:
             prospective[k] = v
+    if health_outbox is not None:
+        from . import health_bridge
+
+        prospective["health_outbox"] = (
+            None
+            if health_outbox == "off"
+            else str(health_bridge.validate_outbox(health_outbox, prospective))
+        )
     hg_runtime.validate_config(prospective)
     if args.inbox is not None:
         p = Path(args.inbox).expanduser().resolve()
@@ -140,6 +155,9 @@ def inspect_files(cfg: dict[str, Any]) -> None:
 
 def show_status(cfg: dict[str, Any]) -> None:
     print("自动写入：", cfg.get("enabled"), "；地区：Garmin 中国区")
+    print("定时血压导出：", cfg.get("health_export_enabled", False))
+    if cfg.get("health_outbox"):
+        print("iPhone 血压交接目录：", cfg["health_outbox"])
     print("导出目录：", cfg["inbox"], "；上传起始日期：", cfg["since"])
     print("运行解释器：", sys.executable)
     print("登录令牌目录：", hg_runtime.STATE / "tokens", "（不要共享）")
@@ -153,6 +171,9 @@ def show_status(cfg: dict[str, Any]) -> None:
     p = hg_runtime.STATE / "last_run.json"
     if p.exists():
         print(hg_file_io.read_regular_text(p))
+    p = hg_runtime.STATE / "last_health_export.json"
+    if p.exists():
+        print("最近血压导出：", hg_file_io.read_regular_text(p))
     if sys.platform == "darwin":
         code = hg_launchagent.agent_service_command(
             "print", f"gui/{os.getuid()}/{hg_runtime.LABEL}", checked=False
@@ -178,6 +199,8 @@ def main() -> int:
         "run",
         "enable",
         "disable",
+        "enable-health",
+        "disable-health",
         "status",
         "install-agent",
         "uninstall-agent",
@@ -215,8 +238,14 @@ def main() -> int:
     p.add_argument("--source")
     p.add_argument("--inbox")
     p.add_argument("--archive-after-sync", choices=("on", "off"))
+    p.add_argument("--health-outbox", help="血压专用交接目录；off 清除配置")
     p = subs.add_parser("restore-exports", help="将当前 inbox 的本地原始 JSON 归档精确恢复到新目录")
     p.add_argument("--to", required=True)
+    p = subs.add_parser("export-health", help="只读 Garmin 血压及脉搏，发布给 iPhone 健康导入端")
+    p.add_argument("--outbox", required=True)
+    p.add_argument("--since")
+    p.add_argument("--until")
+    p.add_argument("--batch-size", type=int, default=100)
     p = subs.add_parser("resolve")
     p.add_argument("record_id")
     group = p.add_mutually_exclusive_group(required=True)
@@ -342,8 +371,45 @@ def main() -> int:
                     show_status(cfg)
                 elif args.command == "install-agent":
                     hg_launchagent.manage_agent(True, cfg)
+                elif args.command == "export-health":
+                    from . import health_bridge
+
+                    health_bridge.export(
+                        cfg,
+                        outbox=args.outbox,
+                        since=args.since,
+                        until=args.until,
+                        batch_size=args.batch_size,
+                    )
+                elif args.command == "enable-health":
+                    from . import health_bridge
+
+                    if not cfg.get("health_outbox"):
+                        raise hg_domain.SafeError(
+                            "先用 settings --health-outbox 设置血压专用交接目录。"
+                        )
+                    health_bridge.validate_outbox(cfg["health_outbox"], cfg)
+                    print("定时读取 Garmin 血压与脉搏，交接目录：", cfg["health_outbox"])
+                    print(
+                        "iPhone 导入端授权后保存到 Apple 健康；首次读取范围从",
+                        cfg["since"],
+                        "开始。",
+                    )
+                    if (
+                        input("确认开启定时血压导出，输入 ENABLE HEALTH：").strip()
+                        == "ENABLE HEALTH"
+                    ):
+                        cfg["health_export_enabled"] = True
+                        hg_runtime.validate_config(cfg)
+                        hg_file_io.write_json(hg_runtime.CONFIG, cfg)
+                        print("定时血压导出已开启。")
+                elif args.command == "disable-health":
+                    cfg["health_export_enabled"] = False
+                    hg_file_io.write_json(hg_runtime.CONFIG, cfg)
+                    print("定时血压导出已关闭。")
                 elif args.command == "disable":
                     cfg["enabled"] = False
+                    cfg["health_export_enabled"] = False
                     hg_file_io.write_json(hg_runtime.CONFIG, cfg)
                     print(
                         "自动写入已关闭。要停掉定时检查，再运行 ./health-garmin-sync uninstall-agent。"

@@ -226,9 +226,21 @@ def collect():
         add("config", "ok", "配置校验通过。")
         add(
             "enabled",
-            "info" if cfg["enabled"] else "warn",
+            "info" if cfg["enabled"] or cfg.get("health_export_enabled", False) else "warn",
             "自动写入已启用。" if cfg["enabled"] else "自动写入已关闭。",
         )
+        if cfg.get("health_outbox") is not None or cfg.get("health_export_enabled", False):
+            add(
+                "health_export",
+                "info",
+                "定时血压导出已开启。"
+                if cfg.get("health_export_enabled")
+                else "定时血压导出已关闭。",
+                data={
+                    "enabled": cfg.get("health_export_enabled", False),
+                    "outbox": cfg.get("health_outbox"),
+                },
+            )
 
     if cfg is not None:
         try:
@@ -673,7 +685,7 @@ def collect():
             latest = hg_domain.aware(attempt["finished_at"] or attempt["started_at"])
             stale = (
                 cfg is not None
-                and cfg["enabled"]
+                and (cfg["enabled"] or cfg.get("health_export_enabled", False))
                 and (reference_time - latest).total_seconds() > STALE_SECONDS
             )
             hint = None
@@ -683,7 +695,9 @@ def collect():
                 hint = "后台入口摘要距今超过两小时；请核对定时任务、设备状态与本地日志。"
             add("last_agent_attempt", status, messages[outcome], hint, data=attempt)
         except FileNotFoundError:
-            enabled = cfg is not None and cfg["enabled"]
+            enabled = cfg is not None and (
+                cfg["enabled"] or cfg.get("health_export_enabled", False)
+            )
             add(
                 "last_agent_attempt",
                 "warn" if enabled else "info",
@@ -711,7 +725,7 @@ def collect():
                 "检查 state/last_agent_attempt.json。",
             )
 
-    enabled = cfg is not None and cfg["enabled"]
+    enabled = cfg is not None and (cfg["enabled"] or cfg.get("health_export_enabled", False))
     try:
         tokens = hg_runtime.STATE / "tokens"
         if tokens.is_dir() and not tokens.is_symlink():
