@@ -1,0 +1,10 @@
+# Install the versions in requirements-dev.txt before installing this hook.
+repos:
+  - repo: local
+    hooks:
+      - id: project-check
+        name: Ruff, Markdown, shell, and whitespace checks
+        entry: make check
+        language: system
+        pass_filenames: false
+        always_run: true

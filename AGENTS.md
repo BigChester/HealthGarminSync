@@ -6,8 +6,8 @@
 
 # 项目与验证
 
-- Python 3.12+；入口 `hg`，主程序 `health_garmin.py`，历史替换 `replace_history.py`。
-- 回归：`.venv/bin/python -m unittest discover -s tests -v`；Shell：`bash -n setup.sh hg`；提交检查：`git diff --check`。
+- Python 3.12+；入口 `python -m health_garmin_sync` 或 `health-garmin-sync`，业务模块位于 `health_garmin_sync/`，历史替换由 `history.py` 处理。
+- 回归：`make test`；格式与静态检查：`make check`；Shell：`bash -n scripts/setup.sh health-garmin-sync`；提交检查：`git diff --check`。
 - 开发测试使用临时目录和模拟 API。真实 Garmin 操作、源数据修改与后台任务注册按用户明确需求执行。
 - `config.json`、`state/`、`.venv/`、凭据不进入 Git。未确定请求不自动重发，判断缺失使用完整称重明细，瘦体重仅本地保留。
 - 验证记录区分离线测试与设备验收。

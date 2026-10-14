@@ -1,0 +1,5 @@
+# Shared by local make targets, pre-commit, and CI.
+ruff==0.17.0
+mdformat==1.0.0
+mdformat-gfm==1.0.0
+pre-commit==4.7.0

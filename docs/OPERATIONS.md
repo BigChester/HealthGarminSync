@@ -1,0 +1,157 @@
+# 对账、恢复与维护
+
+本文命令在项目目录运行。`记录ID`、日期和清单文件名都需替换为实际值；写入命令先展示目标，按提示输入确认词。日常启用、安装与单条试传见 [README](../README.md)。
+
+## 状态与未确定请求
+
+pending 待比对；verified / verified_manual 为已读回 / 人工确认；conflict / verified_conflict 为差异或歧义；remote_missing 曾验证后缺失；repair_uncertain 有未完成修复；uncertain / inflight 为结果未知 / 已持久准备提交；ignored 保留人工跳过决定。
+
+### 核对后再决定
+
+先查询完整明细并在 Garmin 核对：
+
+```bash
+./health-garmin-sync remote 2026-09-29
+./health-garmin-sync status
+```
+
+`remote` 只读，结果保存到 `state/remote-日期.json`。只有确定结果后才选择以下一种处理：
+
+```bash
+./health-garmin-sync resolve 记录ID --present  # 输入 PRESENT，仅记录人工确认
+./health-garmin-sync resolve 记录ID --absent   # 输入 ABSENT，允许之后补传
+./health-garmin-sync resolve 记录ID --ignore   # 跳过本地任务
+```
+
+`resolve` 不修改 Garmin。结果仍不确定时先等待、查询；不要重发请求或删除 SQLite。存在未完成修复日志时，使用本文操作恢复流程。
+
+已发出但结果未确定的请求被忽略后，仍保留防重复提交记录；核对后用 `PRESENT` 或 `ABSENT` 确认结果。
+
+## 对账、修复与历史整理
+
+### 只读查看差异
+
+```bash
+./health-garmin-sync compare
+./health-garmin-sync compare --since 2020-01-01 --until 2026-09-29
+```
+
+`compare` 联网只读，日期不改变配置。完整历史放独立目录，用 `--inbox "完整路径"` 指定，避免混入已修订的旧导出。
+
+| 分类           | 含义与处理                             |
+| -------------- | -------------------------------------- |
+| matched        | 时间及 Apple 提供的字段一致，跳过写入  |
+| missing        | 首次缺失，启用同步后新增               |
+| repair         | 同次测量缺体脂/BMI，指定记录修复       |
+| replace        | 同次测量值不同，指定记录替换           |
+| conflict       | 时间、来源或远端字段有歧义，停止该条   |
+| review_missing | 以前验证的记录消失，人工核对后补传     |
+| uncertain      | 结果未确定，继续只读核对               |
+| ignored        | 保留人工忽略决定                       |
+| EXTRA          | 选定日期内的远端多余记录，自动同步保留 |
+
+手动清单保存到 `state/plans/compare-时间戳.json`；同步清单覆盖保存到 `state/plans/sync-latest.json`，最近摘要在 `state/last_compare.json`。匹配按绝对时间（允许 1 秒编码误差）和数值：体重/体脂误差 0.021，BMI 误差 0.11。同日多次称重分别核对；60 秒内无法唯一对应时为 conflict。判断缺失使用完整称重明细，不能用每日最后值代替。
+
+### 修复指定记录
+
+```bash
+./health-garmin-sync repair-one Apple记录ID --plan state/plans/实际清单.json
+# 核对原记录和目标值，输入 REPLACE 记录ID
+```
+
+删除前检查重建条件，随后备份、删除指定记录、确认删除、重建并读回核验。执行前重新查询，双方值变化需重新生成清单。备份在 `state/backups/时间戳/`，持久操作日志在 `state/operations/`；路径已占用时停止，不覆盖恢复证据。Apple 未提供的原有体脂和 BMI 会保留；原记录含无法保留的其他身体成分字段时拒绝删除。
+
+### 删除指定多余记录
+
+前提是已完整导出选定日期内全部需要保留的 Apple 来源测量。
+
+```bash
+./health-garmin-sync delete-extra Garmin记录ID \
+  --plan state/plans/实际清单.json --complete-export
+# 核对记录，输入 DELETE Garmin记录ID
+```
+
+匹配及歧义范围内的记录不会成为可删除 EXTRA。导出未覆盖的日期不能视为需要清理。
+
+### 以完整导出替换历史范围
+
+先完整导出全部需要保留的 PICOOC 测量，选择实际起始日期生成清单：
+
+```bash
+./health-garmin-sync compare --since 2024-09-04
+./health-garmin-sync replace-all --plan state/plans/实际清单.json --complete-export
+# 核对目标、保留、删除及新增/重建数量，输入 REPLACE ALL
+```
+
+以选定范围 Apple 数据为准，保留匹配项、删除其余并重建目标，包括近时刻但时间不同的记录；本地配对/时间有歧义时拒绝整批操作。
+
+先复核最新数据，备份 Garmin 响应、SQLite、配置、目标及原始导出到 `state/backups/full-时间戳/`。逐项删除/新增后核验全部目标、总数及重复；不受单次数量限制，不启用自动同步。
+
+### 延迟读回与中断恢复
+
+超时、读回未匹配或数据变化会暂停操作并保存日志；未完成日志阻止自动补传。先只读核对：
+
+```bash
+./health-garmin-sync verify-operation state/operations/实际操作.json
+```
+
+输出区分本次核验结果与历史操作阶段；匹配返回 0，未匹配或查询失败返回 2。查询失败也会记录本次未通过，供 `doctor` 排查。
+
+仅在已确认目标缺失、原记录已删除时，恢复已备份的单条修复：
+
+```bash
+./health-garmin-sync resume-operation state/operations/实际操作.json
+# 输入 RESUME Apple记录ID；不会再次删除
+```
+
+整批替换日志只能用 `verify-operation` 核对，不能用 `resume-operation` 重跑整批删除。`remote_missing` 经人工核对后用 `resolve 记录ID --absent`，输入 `ABSENT` 允许补传；有未完成修复时须先处理操作日志。
+
+## 归档与备份
+
+归档开关和恢复命令见 [README](../README.md#%E6%97%A5%E5%B8%B8%E5%91%BD%E4%BB%A4%E4%B8%8E%E6%95%B0%E6%8D%AE%E4%BF%9D%E7%95%99)。归档永久保留 JSON 原始字节、文件名、目录、导出时间及 SHA-256。只有同步范围内全部样本唯一对应已核验测量才清理；待上传、缺字段、孤立或歧义样本继续保留，未确定请求和未完成操作暂停清理。预览、失败或等待导出合并的轮次不清理，源文件变化或清理失败保留数据供重试。
+
+归档按来源目录隔离，独立 `--inbox` 仅读取该目录数据。恢复到新目录保持原始字节，同名不同内容使用摘要后缀；完整历史替换备份也包含归档导出。备份完整 state 与配置，云端清理后的原始历史由本地归档保留。
+
+## 诊断与后台运行
+
+```bash
+./health-garmin-sync doctor
+./health-garmin-sync doctor --json
+./health-garmin-sync status
+tail -n 80 state/sync.log
+tail -n 80 state/agent.out.log
+tail -n 80 state/agent.err.log
+```
+
+`doctor` 离线只读检查环境、配置、导出、进程锁、运行证据和 LaunchAgent；配置损坏或锁被占用时也可运行。错误返回 2，冲突、待修复和远端缺失为提醒。归档检查只看数据库文件可访问性，内容校验用 `preview`。虚拟环境缺失时，用 Python 3.12+ 执行 `python3 -m health_garmin_sync doctor`。
+
+| 证据                          | 用途                                            |
+| ----------------------------- | ----------------------------------------------- |
+| state/last_attempt.json       | 最近取得锁的尝试；未结束时核查进程              |
+| state/last_run.json           | 最近完成的同步摘要与未确定请求计数              |
+| state/last_agent_attempt.json | 后台入口日志/调用阶段；启用后超过两小时提示检查 |
+
+证据时间超前本机十分钟以上报错；导出更新或数量增加不表示远端缺失，用 compare 核对。sync.log 自动轮换；日志失败会报错但保留已保存状态。后台日志每份最多 1 MB、保留 3 份备份。status 查询 LaunchAgent 限时 5 秒，失败返回 2。
+
+| 现象                          | 排查                                                 |
+| ----------------------------- | ---------------------------------------------------- |
+| 没有 JSON / 没有 preview 记录 | 检查 iCloud 下载、since、来源、类型及健康权限        |
+| metrics / samples 成了字符串  | 保持词典/列表，仅保存前转完整 Payload 为文本         |
+| WAIT / 后到字段               | 核对候选时间，使用 compare / repair-one              |
+| 未来时间                      | 检查 at、exported_at、时区及手机时间                 |
+| settings 被拒绝               | 先 disable；enabled 使用 JSON 布尔值                 |
+| 命令忙碌返回 2                | 等锁释放；定时 run 遇锁跳过并返回 0                  |
+| 401 / 403 / 验证码 / 令牌失败 | 检查网络、账号、state/tokens 权限与磁盘，重新 login  |
+| 429 / 上传超时                | 暂停重试，按未确定请求流程只读核对                   |
+| 手动成功、后台失败            | 检查登录用户、解释器、下载与权限，查看 agent.err.log |
+| 卸载任务失败                  | doctor 核对服务；未确认卸载时保留任务文件            |
+
+先手动 `./health-garmin-sync preview` 接受目录授权。后台 Python 可能需要单独的 macOS 文件访问授权，实际解释器可这样确认：
+
+```bash
+./.venv/bin/python -c 'import os,sys; print(os.path.realpath(sys.executable))'
+```
+
+在系统设置 → 隐私与安全性 → 文件与文件夹检查进程授权。确被 TCC 拒绝且无更窄权限时，可为实际 Python 授予完全磁盘访问权限（也覆盖其他脚本）。授权后重装并验收任务，解释器更新后重查。
+
+Mac 睡眠、注销或关机期间暂停处理。移动项目前卸载任务，移动后重建虚拟环境并重新安装。首次安装可能遇到进程锁，后续仍会按间隔运行，可手动 `./health-garmin-sync run` 验证。
