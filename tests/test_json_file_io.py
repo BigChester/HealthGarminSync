@@ -1,17 +1,22 @@
 """Nonblocking JSON reads and atomic writes against real temporary paths."""
+
 import contextlib
 import io
 import json
+import json as hg_std_json
 import os
-from pathlib import Path
-import sys
+import os as hg_std_os
 import unittest
 from unittest.mock import patch
 
-import health_garmin as h
 import test_agent_attempts as agent_fixtures
 import test_diagnostics as fixtures
 import test_sync_log_open as log_fixtures
+from project_fixtures import REPO_ROOT
+
+from health_garmin_sync import domain as hg_domain
+from health_garmin_sync import file_io as hg_file_io
+from health_garmin_sync import runtime as hg_runtime
 
 
 class JSONFileIOTests(unittest.TestCase):
@@ -24,14 +29,14 @@ class JSONFileIOTests(unittest.TestCase):
     child = log_fixtures.SyncLogOpenTests.child
 
     def test_peer_connected_fifo_is_rejected_before_truncate_and_owned_fds_close(self):
-        fifo = self.root / 'connected-fifo'
+        fifo = self.root / "connected-fifo"
         os.mkfifo(fifo, 0o600)
         native_open = os.open
         reader = native_open(fifo, os.O_RDONLY | os.O_NONBLOCK)
         writer = native_open(fifo, os.O_WRONLY | os.O_NONBLOCK)
-        os.write(writer, b'Untouched queued bytes')
+        os.write(writer, b"Untouched queued bytes")
         try:
-            for mode in ('r', 'w'):
+            for mode in ("r", "w"):
                 with self.subTest(mode=mode):
                     opened = []
 
@@ -40,39 +45,43 @@ class JSONFileIOTests(unittest.TestCase):
                         opened.append(fd)
                         return fd
 
-                    with patch.object(h.os, 'open', side_effect=open_fd), patch.object(h.os, 'ftruncate') as truncate, \
-                            patch.object(h.os, 'fdopen') as wrap, self.assertRaises(h.SafeError):
-                        h.open_regular_text(fifo, mode, encoding='utf-8')
+                    with (
+                        patch.object(hg_std_os, "open", side_effect=open_fd),
+                        patch.object(hg_std_os, "ftruncate") as truncate,
+                        patch.object(hg_std_os, "fdopen") as wrap,
+                        self.assertRaises(hg_domain.SafeError),
+                    ):
+                        hg_file_io.open_regular_text(fifo, mode, encoding="utf-8")
                     truncate.assert_not_called()
                     wrap.assert_not_called()
                     self.assertEqual(len(opened), 1)
                     with self.assertRaises(OSError):
                         os.fstat(opened[0])
-            self.assertEqual(os.read(reader, 100), b'Untouched queued bytes')
+            self.assertEqual(os.read(reader, 100), b"Untouched queued bytes")
         finally:
             os.close(writer)
             os.close(reader)
 
     def test_config_regular_symlink_remains_supported_but_other_json_links_are_rejected(self):
-        target = self.base / 'actual-config.json'
+        target = self.base / "actual-config.json"
         self.config_path.rename(target)
         self.config_path.symlink_to(target)
-        self.assertEqual(h.config(), self.cfg)
+        self.assertEqual(hg_runtime.config(), self.cfg)
         before = target.read_bytes()
         with self.assertRaises(OSError):
-            h.read_regular_text(self.config_path)
-        with self.assertRaises(h.SafeError):
-            h.write_json(self.config_path, {'replacement': True})
+            hg_file_io.read_regular_text(self.config_path)
+        with self.assertRaises(hg_domain.SafeError):
+            hg_file_io.write_json(self.config_path, {"replacement": True})
         self.assertEqual(target.read_bytes(), before)
 
     def test_dump_and_native_close_failures_do_not_replace_target_or_hide_primary(self):
-        target = self.state / 'evidence.json'
-        h.write_json(target, {'previous': '保留'})
+        target = self.state / "evidence.json"
+        hg_file_io.write_json(target, {"previous": "保留"})
         original = target.read_bytes()
         with self.assertRaises(ValueError):
-            h.write_json(target, {'invalid': float('nan')})
+            hg_file_io.write_json(target, {"invalid": float("nan")})
         self.assertEqual(target.read_bytes(), original)
-        native_open = h.open_regular_text
+        native_open = hg_file_io.open_regular_text
 
         class CloseFailure:
             def __init__(self, stream):
@@ -98,12 +107,17 @@ class JSONFileIOTests(unittest.TestCase):
                     return stream
 
                 errors = io.StringIO()
-                with patch.object(h, 'open_regular_text', side_effect=open_with_close_failure), \
-                        contextlib.redirect_stderr(errors), contextlib.ExitStack() as stack:
+                with (
+                    patch.object(
+                        hg_file_io, "open_regular_text", side_effect=open_with_close_failure
+                    ),
+                    contextlib.redirect_stderr(errors),
+                    contextlib.ExitStack() as stack,
+                ):
                     if primary is not None:
-                        stack.enter_context(patch.object(h.json, 'dump', side_effect=primary))
+                        stack.enter_context(patch.object(hg_std_json, "dump", side_effect=primary))
                     with self.assertRaises(type(primary) if primary else OSError) as raised:
-                        h.write_json(target, {'new': True})
+                        hg_file_io.write_json(target, {"new": True})
                 if primary is not None:
                     self.assertIs(raised.exception, primary)
                 self.assertEqual(observed[0].calls, 1)
@@ -111,35 +125,47 @@ class JSONFileIOTests(unittest.TestCase):
                     os.fstat(observed[0].fd)
                 self.assertEqual(target.read_bytes(), original)
                 self.assertNotIn(fixtures.SECRET, errors.getvalue())
-        h.write_json(target, {'new': '完整 UTF-8'})
-        self.assertEqual(json.loads(target.read_text()), {'new': '完整 UTF-8'})
+        hg_file_io.write_json(target, {"new": "完整 UTF-8"})
+        self.assertEqual(json.loads(target.read_text()), {"new": "完整 UTF-8"})
         self.assertEqual(target.stat().st_mode & 0o777, 0o600)
-        self.assertFalse(target.with_name(target.name + '.tmp').exists())
+        self.assertFalse(target.with_name(target.name + ".tmp").exists())
 
     def test_real_cli_config_status_and_active_operation_fifo_fail_quickly(self):
-        script = '''
+        script = (
+            """
 import sys
 from pathlib import Path
 sys.path.insert(0, sys.argv[2])
-import health_garmin as h
-h.BASE = Path(sys.argv[1]); h.STATE = h.BASE / 'state'; h.CONFIG = h.BASE / 'config.json'
-''' + log_fixtures.OFFLINE.replace('subprocess.', 'h.subprocess.').replace('getpass.', 'h.getpass.').replace(
-            'if STATE /', 'if h.STATE /') + '''
+from health_garmin_sync import cli as hg_cli, domain as hg_domain, file_io as hg_file_io, garmin as hg_garmin, runtime as hg_runtime
+import getpass as hg_std_getpass
+import json as hg_std_json
+import os as hg_std_os
+import subprocess as hg_std_subprocess
+hg_runtime.BASE = Path(sys.argv[1]); hg_runtime.STATE = hg_runtime.BASE / 'state'; hg_runtime.CONFIG = hg_runtime.BASE / 'config.json'
+"""
+            + log_fixtures.OFFLINE.replace("subprocess.", "hg_std_subprocess.")
+            .replace("getpass.", "hg_std_getpass.")
+            .replace("if STATE /", "if hg_runtime.STATE /")
+            + """
 class ReadOnlyAPI:
     def get_body_composition(self, start, end):
         return {'dateWeightList': []}
     def add_body_composition(self, **kwargs):
         return forbidden()
     add_weigh_in = add_body_composition
-h.api_client = lambda: ReadOnlyAPI()
-sys.argv = ['hg', sys.argv[3]]
-raise SystemExit(h.main())
-'''
-        self.cfg['settle_seconds'] = 0
+hg_garmin.api_client = lambda: ReadOnlyAPI()
+sys.argv = ['health-garmin-sync', sys.argv[3]]
+raise SystemExit(hg_cli.main())
+"""
+        )
+        self.cfg["settle_seconds"] = 0
         self.save_config()
-        source, tokens = self.export.read_bytes(), (self.tokens / 'oauth.json').read_bytes()
-        cases = ((self.config_path, 'run'), (self.last, 'status'),
-                 (self.state / 'operations' / 'unfinished.json', 'run'))
+        source, tokens = self.export.read_bytes(), (self.tokens / "oauth.json").read_bytes()
+        cases = (
+            (self.config_path, "run"),
+            (self.last, "status"),
+            (self.state / "operations" / "unfinished.json", "run"),
+        )
         for path, command in cases:
             with self.subTest(path=path.name):
                 previous = path.read_bytes() if path.exists() else None
@@ -147,56 +173,94 @@ raise SystemExit(h.main())
                 path.unlink(missing_ok=True)
                 os.mkfifo(path, 0o600)
                 try:
-                    self.assertEqual(self.child('-c', script, str(self.base), str(Path(h.__file__).parent), command), 2)
-                    self.assertEqual((self.export.read_bytes(), (self.tokens / 'oauth.json').read_bytes()), (source, tokens))
+                    self.assertEqual(
+                        self.child("-c", script, str(self.base), str(REPO_ROOT), command), 2
+                    )
+                    self.assertEqual(
+                        (self.export.read_bytes(), (self.tokens / "oauth.json").read_bytes()),
+                        (source, tokens),
+                    )
                 finally:
                     path.unlink()
                     if previous is not None:
                         path.write_bytes(previous)
 
     def test_real_write_fifo_start_interrupt_and_agent_terminal_do_not_hang(self):
-        override = log_fixtures.OFFLINE + '''
-kind = (BASE / 'synthetic-mode').read_text()
-api_client = manage_agent = forbidden
+        override = (
+            log_fixtures.OFFLINE
+            + """
+kind = (hg_runtime.BASE / 'synthetic-mode').read_text()
+hg_garmin.api_client = hg_launchagent.manage_agent = forbidden
 if kind == 'start':
-    config = run_sync = forbidden
+    hg_runtime.config = hg_sync.run_sync = forbidden
 else:
     def run_sync(cfg):
         name = 'last_attempt.json.tmp' if kind == 'interrupt' else 'last_agent_attempt.json.tmp'
-        os.mkfifo(STATE / name, 0o600)
+        os.mkfifo(hg_runtime.STATE / name, 0o600)
         if kind == 'interrupt':
             raise KeyboardInterrupt()
-'''
+    hg_sync.run_sync = run_sync
+"""
+        )
         self.install_temporary_script(override)
-        cli = '''
-import health_garmin as h
+        cli = """
+from health_garmin_sync import cli as hg_cli, domain as hg_domain, file_io as hg_file_io, garmin as hg_garmin, runtime as hg_runtime
+import getpass as hg_std_getpass
+import json as hg_std_json
+import os as hg_std_os
+import subprocess as hg_std_subprocess
 import sys
-sys.argv = ['hg', 'run']
-raise SystemExit(h.main())
-'''
-        stamp = h.now().isoformat()
-        marker = self.state / 'last_attempt.json'
-        old = {'outcome': 'completed', 'stage': 'sync', 'started_at': stamp,
-               'finished_at': stamp, 'error_type': None}
-        source, tokens, summary = self.export.read_bytes(), (self.tokens / 'oauth.json').read_bytes(), self.last.read_bytes()
-        for kind, expected in (('start', 2), ('interrupt', 130), ('agent-terminal', 2)):
+sys.argv = ['health-garmin-sync', 'run']
+raise SystemExit(hg_cli.main())
+"""
+        stamp = hg_runtime.now().isoformat()
+        marker = self.state / "last_attempt.json"
+        old = {
+            "outcome": "completed",
+            "stage": "sync",
+            "started_at": stamp,
+            "finished_at": stamp,
+            "error_type": None,
+        }
+        source, tokens, summary = (
+            self.export.read_bytes(),
+            (self.tokens / "oauth.json").read_bytes(),
+            self.last.read_bytes(),
+        )
+        for kind, expected in (("start", 2), ("interrupt", 130), ("agent-terminal", 2)):
             with self.subTest(kind=kind):
                 marker.write_text(json.dumps(old))
                 before = marker.read_bytes()
-                (self.base / 'synthetic-mode').write_text(kind)
-                if kind == 'start':
-                    os.mkfifo(self.state / 'last_attempt.json.tmp', 0o600)
+                (self.base / "synthetic-mode").write_text(kind)
+                if kind == "start":
+                    os.mkfifo(self.state / "last_attempt.json.tmp", 0o600)
                 try:
-                    self.assertEqual(self.child(str(self.entry)) if kind == 'agent-terminal' else self.child('-c', cli), expected)
-                    if kind == 'start':
+                    self.assertEqual(
+                        self.child("-m", "health_garmin_sync.background")
+                        if kind == "agent-terminal"
+                        else self.child("-c", cli),
+                        expected,
+                    )
+                    if kind == "start":
                         self.assertEqual(marker.read_bytes(), before)
                     else:
-                        self.assertEqual(json.loads(marker.read_text())['outcome'], 'running' if kind == 'interrupt' else 'completed')
-                    if kind == 'agent-terminal':
-                        self.assertEqual(json.loads(self.agent_attempt.read_text())['outcome'], 'running')
+                        self.assertEqual(
+                            json.loads(marker.read_text())["outcome"],
+                            "running" if kind == "interrupt" else "completed",
+                        )
+                    if kind == "agent-terminal":
+                        self.assertEqual(
+                            json.loads(self.agent_attempt.read_text())["outcome"], "running"
+                        )
                         self.assertEqual(self.report()[0], 2)
-                    self.assertEqual((self.export.read_bytes(), (self.tokens / 'oauth.json').read_bytes(), self.last.read_bytes()),
-                                     (source, tokens, summary))
+                    self.assertEqual(
+                        (
+                            self.export.read_bytes(),
+                            (self.tokens / "oauth.json").read_bytes(),
+                            self.last.read_bytes(),
+                        ),
+                        (source, tokens, summary),
+                    )
                 finally:
-                    for name in ('last_attempt.json.tmp', 'last_agent_attempt.json.tmp'):
+                    for name in ("last_attempt.json.tmp", "last_agent_attempt.json.tmp"):
                         (self.state / name).unlink(missing_ok=True)

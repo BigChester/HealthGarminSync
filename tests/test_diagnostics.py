@@ -1,41 +1,55 @@
 """Doctor checks synthetic files without writes, authentication or real launchctl."""
+
 import builtins
 import contextlib
-from datetime import timedelta
 import fcntl
-from importlib.metadata import PackageNotFoundError
+import fcntl as hg_std_fcntl
 import io
 import json
+import logging as hg_std_logging
 import os
-from pathlib import Path
+import os as hg_std_os
 import plistlib
 import re
+import sqlite3 as hg_std_sqlite3
 import stat
 import subprocess
 import sys
 import tempfile
 import unittest
+from datetime import UTC as hg_std_UTC
+from datetime import timedelta
+from importlib.metadata import PackageNotFoundError
+from pathlib import Path
 from unittest.mock import patch
 
-import diagnostics as d
-import agent_runner as runner
-import health_garmin as h
+from health_garmin_sync import background as runner
+from health_garmin_sync import cli as hg_cli
+from health_garmin_sync import diagnostics as d
+from health_garmin_sync import domain as hg_domain
+from health_garmin_sync import file_io as hg_file_io
+from health_garmin_sync import garmin as hg_garmin
+from health_garmin_sync import launchagent as hg_launchagent
+from health_garmin_sync import runtime as hg_runtime
+from health_garmin_sync import state as hg_state
 
-
-SECRET = 'private-ticket-never-output'
+SECRET = "private-ticket-never-output"
 
 
 def without_evidence_times(output):
     def replace(match):
         try:
-            h.aware(match.group(2))
-        except h.SafeError:
+            hg_domain.aware(match.group(2))
+        except hg_domain.SafeError:
             return match.group(0)
         return match.group(1) + '<evidence time>"'
 
-    return re.sub(r'("(?:run_at|started_at|finished_at)"\s*:\s*")'
-                  r'(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2}))"',
-                  replace, output)
+    return re.sub(
+        r'("(?:run_at|started_at|finished_at)"\s*:\s*")'
+        r'(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2}))"',
+        replace,
+        output,
+    )
 
 
 class DoctorTests(unittest.TestCase):
@@ -43,63 +57,123 @@ class DoctorTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
-        self.home = self.root / 'home'
+        self.home = self.root / "home"
         self.home.mkdir()
-        self.base = self.root / 'project'
+        self.base = self.root / "project"
         self.base.mkdir()
-        self.state = self.base / 'state'
+        self.state = self.base / "state"
         self.state.mkdir()
-        self.inbox = self.root / 'inbox'
+        self.inbox = self.root / "inbox"
         self.inbox.mkdir()
-        self.config_path = self.base / 'config.json'
-        for name, value in (('BASE', self.base), ('STATE', self.state), ('CONFIG', self.config_path)):
-            self.enterContext(patch.object(h, name, value))
-        self.enterContext(patch.object(Path, 'home', return_value=self.home))
-        self.enterContext(patch.object(sys, 'platform', 'darwin'))
-        self.enterContext(patch.object(d, 'version', return_value=h.REQUIRED_GARMIN_VERSION))
-        self.service = self.enterContext(patch.object(d.subprocess, 'run',
-                             return_value=subprocess.CompletedProcess([], 0, SECRET, SECRET)))
-        self.cfg = {'is_cn': True, 'enabled': True, 'inbox': str(self.inbox),
-                    'since': '2020-01-01', 'allowed_sources': [SECRET],
-                    'weight_bare_unit': 'kg', 'fat_bare_unit': 'percent',
-                    'pair_window_seconds': 0, 'settle_seconds': 120, 'max_records_per_run': 10}
+        self.config_path = self.base / "config.json"
+        for name, value in (
+            ("BASE", self.base),
+            ("STATE", self.state),
+            ("CONFIG", self.config_path),
+        ):
+            self.enterContext(patch.object(hg_runtime, name, value))
+        self.enterContext(patch.object(Path, "home", return_value=self.home))
+        self.enterContext(patch.object(sys, "platform", "darwin"))
+        self.enterContext(
+            patch.object(d, "version", return_value=hg_runtime.REQUIRED_GARMIN_VERSION)
+        )
+        self.service = self.enterContext(
+            patch.object(
+                d.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, SECRET, SECRET)
+            )
+        )
+        self.cfg = {
+            "is_cn": True,
+            "enabled": True,
+            "inbox": str(self.inbox),
+            "since": "2020-01-01",
+            "allowed_sources": [SECRET],
+            "weight_bare_unit": "kg",
+            "fat_bare_unit": "percent",
+            "pair_window_seconds": 0,
+            "settle_seconds": 120,
+            "max_records_per_run": 10,
+        }
         self.save_config()
-        self.python = self.base / '.venv/bin/python'
+        self.python = self.base / ".venv/bin/python"
         self.python.parent.mkdir(parents=True)
-        self.python.write_text('synthetic executable')
+        self.python.write_text("synthetic executable")
         self.python.chmod(0o700)
-        self.entry = self.base / 'agent_runner.py'
-        self.entry.write_text('# synthetic background entry\n')
-        self.export = self.inbox / (SECRET + '.json')
-        self.export.write_text(json.dumps({'schema_version': 2,
-            'exported_at': '2020-02-20T09:00:00+08:00', 'metrics': {
-                'weight': [{'at': '2020-02-20T08:00:00+08:00', 'value': '73.123 kg', 'source': SECRET}],
-                'body_fat': [{'at': '2020-02-20T08:00:00+08:00', 'value': '26.789%', 'source': SECRET}]}}))
-        self.tokens = self.state / 'tokens'
+        self.entry = self.base / "health_garmin_sync" / "background.py"
+        self.entry.parent.mkdir(exist_ok=True)
+        self.entry.write_text("# synthetic background entry\n")
+        self.export = self.inbox / (SECRET + ".json")
+        self.export.write_text(
+            json.dumps(
+                {
+                    "schema_version": 2,
+                    "exported_at": "2020-02-20T09:00:00+08:00",
+                    "metrics": {
+                        "weight": [
+                            {
+                                "at": "2020-02-20T08:00:00+08:00",
+                                "value": "73.123 kg",
+                                "source": SECRET,
+                            }
+                        ],
+                        "body_fat": [
+                            {
+                                "at": "2020-02-20T08:00:00+08:00",
+                                "value": "26.789%",
+                                "source": SECRET,
+                            }
+                        ],
+                    },
+                }
+            )
+        )
+        self.tokens = self.state / "tokens"
         self.tokens.mkdir()
-        (self.tokens / 'oauth.json').write_text(SECRET)
-        self.last = self.state / 'last_run.json'
-        self.last.write_text(json.dumps({'run_at': h.now().isoformat(),
-            'results': {SECRET: 'verified'}, 'exports': {SECRET: SECRET}, 'payload': SECRET}))
-        stamp = h.now().isoformat()
-        self.agent_attempt = self.state / 'last_agent_attempt.json'
-        self.agent_attempt.write_text(json.dumps({'outcome': 'completed', 'started_at': stamp,
-            'finished_at': stamp, 'stage': 'run', 'error_type': None}))
+        (self.tokens / "oauth.json").write_text(SECRET)
+        self.last = self.state / "last_run.json"
+        self.last.write_text(
+            json.dumps(
+                {
+                    "run_at": hg_runtime.now().isoformat(),
+                    "results": {SECRET: "verified"},
+                    "exports": {SECRET: SECRET},
+                    "payload": SECRET,
+                }
+            )
+        )
+        stamp = hg_runtime.now().isoformat()
+        self.agent_attempt = self.state / "last_agent_attempt.json"
+        self.agent_attempt.write_text(
+            json.dumps(
+                {
+                    "outcome": "completed",
+                    "started_at": stamp,
+                    "finished_at": stamp,
+                    "stage": "run",
+                    "error_type": None,
+                }
+            )
+        )
         self.agent_attempt.chmod(0o600)
-        self.plist = self.home / 'Library/LaunchAgents' / (h.LABEL + '.plist')
+        self.plist = self.home / "Library/LaunchAgents" / (hg_runtime.LABEL + ".plist")
         self.plist.parent.mkdir(parents=True)
-        self.plist.write_bytes(plistlib.dumps(h.agent_plist()))
+        self.plist.write_bytes(plistlib.dumps(hg_launchagent.agent_plist()))
 
     def save_config(self):
         self.config_path.write_text(json.dumps(self.cfg))
 
     def snapshot(self):
         result = {}
-        for path in [self.root, *self.root.rglob('*')]:
+        for path in [self.root, *self.root.rglob("*")]:
             mode = path.stat(follow_symlinks=False).st_mode
             result[str(path.relative_to(self.root))] = (
-                stat.S_IMODE(mode), path.read_bytes() if stat.S_ISREG(mode)
-                and path.suffix != '.sqlite3' and not path.name.startswith('sync.sqlite3-') else None)
+                stat.S_IMODE(mode),
+                path.read_bytes()
+                if stat.S_ISREG(mode)
+                and path.suffix != ".sqlite3"
+                and not path.name.startswith("sync.sqlite3-")
+                else None,
+            )
         return result
 
     def invoke(self, *arguments):
@@ -107,72 +181,109 @@ class DoctorTests(unittest.TestCase):
         stdout, stderr = io.StringIO(), io.StringIO()
         original_import = builtins.__import__
         original_read = Path.read_text
-        original_open = h.open_regular_file
+        original_open = hg_file_io.open_regular_file
 
         def offline_import(name, *args, **kwargs):
-            if name.split('.')[0] in ('garminconnect', 'requests', 'curl_cffi', 'garth'):
-                raise AssertionError('network/auth module imported')
+            if name.split(".")[0] in ("garminconnect", "requests", "curl_cffi", "garth"):
+                raise AssertionError("network/auth module imported")
             return original_import(name, *args, **kwargs)
 
         def read_without_tokens(path, *args, **kwargs):
             if self.tokens in path.parents:
-                raise AssertionError('token content read')
-            if path.suffix == '.sqlite3' or path.name.startswith('sync.sqlite3-'):
-                raise AssertionError('database content read')
-            if path.parent == self.state and re.fullmatch(r'agent\.(?:out|err)\.log(?:\.[0-9]+)?', path.name):
-                raise AssertionError('background log content read')
+                raise AssertionError("token content read")
+            if path.suffix == ".sqlite3" or path.name.startswith("sync.sqlite3-"):
+                raise AssertionError("database content read")
+            if path.parent == self.state and re.fullmatch(
+                r"agent\.(?:out|err)\.log(?:\.[0-9]+)?", path.name
+            ):
+                raise AssertionError("background log content read")
             return original_read(path, *args, **kwargs)
 
         def open_readonly_without_tokens(path, mode, *args, **kwargs):
             path = Path(path)
-            if mode not in ('r', 'rb') or path == self.tokens or self.tokens in path.parents:
-                raise AssertionError('unsafe local file access')
-            if path.suffix == '.sqlite3' or path.name.startswith('sync.sqlite3-'):
-                raise AssertionError('database content read')
-            if path.parent == self.state and re.fullmatch(r'agent\.(?:out|err)\.log(?:\.[0-9]+)?', path.name):
-                raise AssertionError('background log content read')
+            if mode not in ("r", "rb") or path == self.tokens or self.tokens in path.parents:
+                raise AssertionError("unsafe local file access")
+            if path.suffix == ".sqlite3" or path.name.startswith("sync.sqlite3-"):
+                raise AssertionError("database content read")
+            if path.parent == self.state and re.fullmatch(
+                r"agent\.(?:out|err)\.log(?:\.[0-9]+)?", path.name
+            ):
+                raise AssertionError("background log content read")
             return original_open(path, mode, *args, **kwargs)
 
         with contextlib.ExitStack() as stack:
-            stack.enter_context(patch.object(sys, 'argv', ['health_garmin.py', *arguments]))
-            for name in ('private_dir', 'write_json', 'database', 'api_client', 'manage_agent',
-                         'RotatingFileHandler', 'PrivateRotatingFileHandler'):
-                stack.enter_context(patch.object(h, name, side_effect=AssertionError('mutating helper called')))
-            stack.enter_context(patch.object(h.logging, 'basicConfig', side_effect=AssertionError('log setup')))
-            stack.enter_context(patch.object(h.os, 'umask', side_effect=AssertionError('umask changed')))
-            stack.enter_context(patch.object(h.fcntl, 'flock', side_effect=AssertionError('lock acquired')))
-            stack.enter_context(patch.object(h.sqlite3, 'connect', side_effect=AssertionError('SQLite opened')))
-            for name in ('mkdir', 'chmod', 'write_text', 'write_bytes', 'replace', 'touch', 'unlink'):
-                stack.enter_context(patch.object(Path, name, side_effect=AssertionError('filesystem mutation')))
-            stack.enter_context(patch.object(Path, 'read_text', read_without_tokens))
-            stack.enter_context(patch.object(h, 'open_regular_file', open_readonly_without_tokens))
-            stack.enter_context(patch('builtins.__import__', side_effect=offline_import))
+            stack.enter_context(patch.object(sys, "argv", ["health-garmin-sync", *arguments]))
+            for module, name in (
+                (hg_file_io, "private_dir"),
+                (hg_file_io, "write_json"),
+                (hg_state, "database"),
+                (hg_garmin, "api_client"),
+                (hg_launchagent, "manage_agent"),
+                (hg_file_io, "PrivateRotatingFileHandler"),
+            ):
+                stack.enter_context(
+                    patch.object(module, name, side_effect=AssertionError("mutating helper called"))
+                )
+            stack.enter_context(
+                patch.object(hg_std_logging, "basicConfig", side_effect=AssertionError("log setup"))
+            )
+            stack.enter_context(
+                patch.object(hg_std_os, "umask", side_effect=AssertionError("umask changed"))
+            )
+            stack.enter_context(
+                patch.object(hg_std_fcntl, "flock", side_effect=AssertionError("lock acquired"))
+            )
+            stack.enter_context(
+                patch.object(hg_std_sqlite3, "connect", side_effect=AssertionError("SQLite opened"))
+            )
+            for name in (
+                "mkdir",
+                "chmod",
+                "write_text",
+                "write_bytes",
+                "replace",
+                "touch",
+                "unlink",
+            ):
+                stack.enter_context(
+                    patch.object(Path, name, side_effect=AssertionError("filesystem mutation"))
+                )
+            stack.enter_context(patch.object(Path, "read_text", read_without_tokens))
+            stack.enter_context(
+                patch.object(hg_file_io, "open_regular_file", open_readonly_without_tokens)
+            )
+            stack.enter_context(patch("builtins.__import__", side_effect=offline_import))
             stack.enter_context(contextlib.redirect_stdout(stdout))
             stack.enter_context(contextlib.redirect_stderr(stderr))
             try:
-                result = h.main()
+                result = hg_cli.main()
             except SystemExit as exc:
                 result = exc.code
         self.assertEqual(self.snapshot(), before)
-        self.assertEqual(stderr.getvalue(), '')
+        self.assertEqual(stderr.getvalue(), "")
         self.assertNotIn(SECRET, stdout.getvalue())
         visible = without_evidence_times(stdout.getvalue())
-        self.assertNotIn('73.123', visible)
-        self.assertNotIn('26.789', visible)
+        self.assertNotIn("73.123", visible)
+        self.assertNotIn("26.789", visible)
         return result, stdout.getvalue()
 
     def report(self):
-        result, output = self.invoke('doctor', '--json')
+        result, output = self.invoke("doctor", "--json")
         report = json.loads(output)
-        self.assertEqual(result, 2 if report['summary']['error'] else 0)
-        return result, report, {item['id']: item for item in report['checks']}
+        self.assertEqual(result, 2 if report["summary"]["error"] else 0)
+        return result, report, {item["id"]: item for item in report["checks"]}
 
     def test_fifo_json_and_plist_reads_finish_with_safe_errors_in_real_cli(self):
-        script = '''import os, pathlib, socket, sys
+        script = """import os, pathlib, socket, sys
 from unittest.mock import patch
 sys.path[:0] = [sys.argv[1], str(pathlib.Path(sys.argv[1]) / 'tests')]
 from test_diagnostics import DoctorTests
-import health_garmin as h
+from health_garmin_sync import cli as hg_cli, domain as hg_domain, file_io as hg_file_io, garmin as hg_garmin, launchagent as hg_launchagent, runtime as hg_runtime, sources as hg_sources, state as hg_state
+from datetime import UTC as hg_std_UTC
+import fcntl as hg_std_fcntl
+import logging as hg_std_logging
+import os as hg_std_os
+import sqlite3 as hg_std_sqlite3
 fixture = DoctorTests()
 fixture.setUp()
 try:
@@ -183,15 +294,15 @@ try:
     if path.exists():
         path.unlink()
     os.mkfifo(path, 0o600)
-    stamp = h.now()
-    with patch.object(h, 'now', return_value=stamp), \\
+    stamp = hg_runtime.now()
+    with patch.object(hg_runtime, 'now', return_value=stamp), \\
          patch.object(socket, 'create_connection', side_effect=AssertionError('network called')), \\
          patch.object(socket.socket, 'connect', side_effect=AssertionError('network called')):
         code, _, checks = fixture.report()
         fixture.assertEqual(code, 2)
         fixture.assertEqual(checks[identifier]['status'], 'error')
         fixture.service.assert_called_once_with(
-            ['/bin/launchctl', 'print', f'gui/{os.getuid()}/{h.LABEL}'], capture_output=True, timeout=5)
+            ['/bin/launchctl', 'print', f'gui/{os.getuid()}/{hg_runtime.LABEL}'], capture_output=True, timeout=5)
         text_code, _ = fixture.invoke('doctor')
         fixture.assertEqual(text_code, 2)
         if identifier != 'last_run':
@@ -199,22 +310,38 @@ try:
         fixture.assertEqual(checks['last_agent_attempt']['status'], 'info')
 finally:
     fixture.doCleanups()
-'''
-        for name, identifier in (('config.json', 'config'), ('last_attempt.json', 'last_attempt'),
-                                 ('last_run.json', 'last_run'), ('operations/test.json', 'operations'),
-                                 ('agent.plist', 'agent_plist')):
+"""
+        for name, identifier in (
+            ("config.json", "config"),
+            ("last_attempt.json", "last_attempt"),
+            ("last_run.json", "last_run"),
+            ("operations/test.json", "operations"),
+            ("agent.plist", "agent_plist"),
+        ):
             with self.subTest(path=name), tempfile.TemporaryDirectory() as isolated:
-                child = subprocess.Popen([sys.executable, '-B', '-c', script,
-                    str(Path(__file__).resolve().parents[1]), name, identifier], cwd=isolated,
-                    env={'HOME': isolated, 'TMPDIR': isolated}, stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE, text=True)
+                child = subprocess.Popen(
+                    [
+                        sys.executable,
+                        "-B",
+                        "-c",
+                        script,
+                        str(Path(__file__).resolve().parents[1]),
+                        name,
+                        identifier,
+                    ],
+                    cwd=isolated,
+                    env={"HOME": isolated, "TMPDIR": isolated},
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
                 try:
                     try:
                         stdout, stderr = child.communicate(timeout=2)
                     except subprocess.TimeoutExpired:
                         child.kill()
                         child.communicate(timeout=2)
-                        self.fail('FIFO file read blocked the doctor command')
+                        self.fail("FIFO file read blocked the doctor command")
                     self.assertEqual(child.returncode, 0, stdout + stderr)
                 finally:
                     if child.poll() is None:
@@ -224,45 +351,45 @@ finally:
                         pipe.close()
 
     def test_regular_config_symlink_remains_supported_without_writes(self):
-        target = self.root / 'linked-config.json'
+        target = self.root / "linked-config.json"
         self.config_path.replace(target)
         self.config_path.symlink_to(target)
         self.assertEqual(self.report()[0], 0)
-        self.assertEqual(self.invoke('doctor')[0], 0)
+        self.assertEqual(self.invoke("doctor")[0], 0)
 
     def test_plist_xml_and_binary_remain_readable_and_nonregular_paths_are_errors(self):
-        document = dict(h.agent_plist(), SyntheticNote='临时中文 ' + SECRET)
+        document = dict(hg_launchagent.agent_plist(), SyntheticNote="临时中文 " + SECRET)
         for fmt in (plistlib.FMT_XML, plistlib.FMT_BINARY):
             with self.subTest(format=fmt):
                 self.plist.write_bytes(plistlib.dumps(document, fmt=fmt))
                 code, _, checks = self.report()
                 self.assertEqual(code, 0)
-                self.assertEqual(checks['agent_plist']['status'], 'ok')
-                self.assertEqual(self.invoke('doctor')[0], 0)
-        target = self.root / 'external-plist'
+                self.assertEqual(checks["agent_plist"]["status"], "ok")
+                self.assertEqual(self.invoke("doctor")[0], 0)
+        target = self.root / "external-plist"
         self.plist.replace(target)
         original = target.read_bytes()
-        for kind in ('directory', 'symlink'):
+        for kind in ("directory", "symlink"):
             with self.subTest(kind=kind):
-                self.plist.mkdir() if kind == 'directory' else self.plist.symlink_to(target)
+                self.plist.mkdir() if kind == "directory" else self.plist.symlink_to(target)
                 try:
                     code, _, checks = self.report()
                     self.assertEqual(code, 2)
-                    self.assertEqual(checks['agent_plist']['status'], 'error')
-                    self.assertEqual(checks['last_run']['status'], 'info')
-                    self.assertEqual(checks['last_agent_attempt']['status'], 'info')
-                    self.assertEqual(self.invoke('doctor')[0], 2)
+                    self.assertEqual(checks["agent_plist"]["status"], "error")
+                    self.assertEqual(checks["last_run"]["status"], "info")
+                    self.assertEqual(checks["last_agent_attempt"]["status"], "info")
+                    self.assertEqual(self.invoke("doctor")[0], 2)
                     self.assertEqual(target.read_bytes(), original)
                 finally:
-                    self.plist.rmdir() if kind == 'directory' else self.plist.unlink()
+                    self.plist.rmdir() if kind == "directory" else self.plist.unlink()
 
     def test_binary_reader_rejects_connected_fifo_without_consuming_or_leaking_fd(self):
-        fifo = self.root / 'connected-fifo'
+        fifo = self.root / "connected-fifo"
         os.mkfifo(fifo, 0o600)
         native_open = os.open
         peer = native_open(fifo, os.O_RDWR | os.O_NONBLOCK)
         try:
-            os.write(peer, b'Untouched queued bytes')
+            os.write(peer, b"Untouched queued bytes")
             opened = []
 
             def open_fd(*args, **kwargs):
@@ -270,29 +397,42 @@ finally:
                 opened.append(fd)
                 return fd
 
-            with patch.object(h.os, 'open', side_effect=open_fd), \
-                    patch.object(h.os, 'fdopen') as wrap, self.assertRaises(h.SafeError):
-                h.open_regular_file(fifo, 'rb')
+            with (
+                patch.object(hg_std_os, "open", side_effect=open_fd),
+                patch.object(hg_std_os, "fdopen") as wrap,
+                self.assertRaises(hg_domain.SafeError),
+            ):
+                hg_file_io.open_regular_file(fifo, "rb")
             wrap.assert_not_called()
             self.assertEqual(len(opened), 1)
             with self.assertRaises(OSError):
                 os.fstat(opened[0])
-            self.assertEqual(os.read(peer, 100), b'Untouched queued bytes')
+            self.assertEqual(os.read(peer, 100), b"Untouched queued bytes")
         finally:
             os.close(peer)
 
     def test_invalid_background_logs_are_diagnosed_before_entry_and_recover(self):
-        script = '''import contextlib, io, os, pathlib, socket, sys
+        script = """import contextlib, io, os, pathlib, socket, sys
 from unittest.mock import patch
 sys.path[:0] = [sys.argv[1], str(pathlib.Path(sys.argv[1]) / 'tests')]
 from test_diagnostics import DoctorTests, SECRET
-import health_garmin as h
-import agent_runner as runner
+from health_garmin_sync import cli as hg_cli, domain as hg_domain, file_io as hg_file_io, garmin as hg_garmin, launchagent as hg_launchagent, runtime as hg_runtime, sources as hg_sources, state as hg_state
+from datetime import UTC as hg_std_UTC
+import fcntl as hg_std_fcntl
+import logging as hg_std_logging
+import os as hg_std_os
+import sqlite3 as hg_std_sqlite3
+from health_garmin_sync import background as runner
+from datetime import UTC as hg_std_UTC
+import fcntl as hg_std_fcntl
+import logging as hg_std_logging
+import os as hg_std_os
+import sqlite3 as hg_std_sqlite3
 fixture = DoctorTests()
 fixture.setUp()
 def forbidden(*args, **kwargs):
     raise AssertionError('unexpected network/API/service request')
-h.api_client = h.manage_agent = forbidden
+hg_garmin.api_client = hg_launchagent.manage_agent = forbidden
 socket.create_connection = socket.socket.connect = forbidden
 try:
     name, kind = sys.argv[2:]
@@ -314,7 +454,7 @@ try:
     fixture.assertEqual(checks['last_agent_attempt']['status'], 'info')
     fixture.assertEqual(fixture.invoke('doctor')[0], 2)
     errors = io.StringIO()
-    with patch.object(h, 'main', return_value=0) as business, contextlib.redirect_stderr(errors):
+    with patch.object(hg_cli, 'main', return_value=0) as business, contextlib.redirect_stderr(errors):
         fixture.assertEqual(runner.entrypoint(), 2)
         business.assert_not_called()
         path.rmdir() if kind == 'directory' else path.unlink()
@@ -328,22 +468,38 @@ try:
     fixture.assertEqual((fixture.tokens / 'oauth.json').read_bytes(), tokens)
 finally:
     fixture.doCleanups()
-'''
-        for name, kind in (('agent.out.log', 'directory'), ('agent.err.log', 'fifo'),
-                           ('agent.out.log.1', 'symlink'), ('agent.err.log.3', 'directory'),
-                           ('agent.out.log.4', 'fifo')):
+"""
+        for name, kind in (
+            ("agent.out.log", "directory"),
+            ("agent.err.log", "fifo"),
+            ("agent.out.log.1", "symlink"),
+            ("agent.err.log.3", "directory"),
+            ("agent.out.log.4", "fifo"),
+        ):
             with self.subTest(path=name), tempfile.TemporaryDirectory() as isolated:
-                child = subprocess.Popen([sys.executable, '-B', '-c', script,
-                    str(Path(__file__).resolve().parents[1]), name, kind], cwd=isolated,
-                    env={'HOME': isolated, 'TMPDIR': isolated}, stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE, text=True)
+                child = subprocess.Popen(
+                    [
+                        sys.executable,
+                        "-B",
+                        "-c",
+                        script,
+                        str(Path(__file__).resolve().parents[1]),
+                        name,
+                        kind,
+                    ],
+                    cwd=isolated,
+                    env={"HOME": isolated, "TMPDIR": isolated},
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
                 try:
                     try:
                         stdout, stderr = child.communicate(timeout=2)
                     except subprocess.TimeoutExpired:
                         child.kill()
                         child.communicate(timeout=2)
-                        self.fail('background log path blocked the command')
+                        self.fail("background log path blocked the command")
                     self.assertEqual(child.returncode, 0, stdout + stderr)
                 finally:
                     if child.poll() is None:
@@ -353,119 +509,130 @@ finally:
                         pipe.close()
 
     def test_background_log_metadata_checks_preserve_regular_logs_and_ignore_unrelated_names(self):
-        for name in ('agent.out.log', 'agent.err.log.1', 'agent.out.log.3'):
-            (self.state / name).write_bytes((SECRET + '\n').encode() * 100_000)
-        for name in ('agent.out.log.4', 'agent.err.log.01'):
+        for name in ("agent.out.log", "agent.err.log.1", "agent.out.log.3"):
+            (self.state / name).write_bytes((SECRET + "\n").encode() * 100_000)
+        for name in ("agent.out.log.4", "agent.err.log.01"):
             path = self.state / name
             path.touch()
             path.chmod(0o400)
-        for name in ('agent.out.log.1x', 'agent.err.log.-1'):
+        for name in ("agent.out.log.1x", "agent.err.log.-1"):
             (self.state / name).mkdir()
         self.assertEqual(self.report()[0], 0)
-        self.assertEqual(self.invoke('doctor')[0], 0)
+        self.assertEqual(self.invoke("doctor")[0], 0)
         native_access = os.access
 
         def denied_readwrite(path, mode, *args, **kwargs):
-            if Path(path) == self.state / 'agent.err.log.1' and mode == os.R_OK | os.W_OK:
+            if Path(path) == self.state / "agent.err.log.1" and mode == os.R_OK | os.W_OK:
                 return False
             return native_access(path, mode, *args, **kwargs)
 
-        with patch.object(os, 'access', denied_readwrite):
+        with patch.object(os, "access", denied_readwrite):
             code, _, checks = self.report()
-            self.assertEqual(self.invoke('doctor')[0], 2)
+            self.assertEqual(self.invoke("doctor")[0], 2)
         self.assertEqual(code, 2)
-        self.assertIn('state/agent.err.log.1', checks['state']['hint'])
-        self.assertEqual(checks['last_run']['status'], 'info')
+        self.assertIn("state/agent.err.log.1", checks["state"]["hint"])
+        self.assertEqual(checks["last_run"]["status"], "info")
 
     def test_nonregular_evidence_temporary_files_do_not_hide_healthy_completed_evidence(self):
-        for name in ('last_attempt.json.tmp', 'last_agent_attempt.json.tmp', 'last_run.json.tmp'):
+        for name in ("last_attempt.json.tmp", "last_agent_attempt.json.tmp", "last_run.json.tmp"):
             path = self.state / name
             path.write_text(SECRET)
             self.assertEqual(self.report()[0], 0)
             path.unlink()
-            for kind in ('fifo', 'directory'):
+            for kind in ("fifo", "directory"):
                 with self.subTest(path=name, kind=kind):
-                    os.mkfifo(path, 0o600) if kind == 'fifo' else path.mkdir()
+                    os.mkfifo(path, 0o600) if kind == "fifo" else path.mkdir()
                     try:
                         code, _, checks = self.report()
-                        text_code, output = self.invoke('doctor')
+                        text_code, output = self.invoke("doctor")
                         self.assertEqual((code, text_code), (2, 2))
-                        self.assertEqual(checks['state']['status'], 'error')
-                        self.assertIn('state/' + name, checks['state']['hint'])
-                        self.assertIn('state/' + name, output)
-                        self.assertEqual(checks['last_run']['status'], 'info')
-                        self.assertEqual(checks['last_agent_attempt']['status'], 'info')
+                        self.assertEqual(checks["state"]["status"], "error")
+                        self.assertIn("state/" + name, checks["state"]["hint"])
+                        self.assertIn("state/" + name, output)
+                        self.assertEqual(checks["last_run"]["status"], "info")
+                        self.assertEqual(checks["last_agent_attempt"]["status"], "info")
                     finally:
-                        path.unlink() if kind == 'fifo' else path.rmdir()
+                        path.unlink() if kind == "fifo" else path.rmdir()
 
     def test_automatic_comparison_write_obstacles_keep_completed_evidence_visible(self):
-        outside = self.root / 'outside-comparison'
+        outside = self.root / "outside-comparison"
         outside.write_text(SECRET)
-        cases = [('plans', kind) for kind in ('regular', 'fifo', 'symlink')]
-        cases += [(name, 'fifo') for name in ('plans/sync-latest.json.tmp',
-                                             'last_compare.json.tmp', 'last_sync_comparison.json.tmp')]
-        cases += [(name, 'directory') for name in ('plans/sync-latest.json',
-                                                  'last_compare.json', 'last_sync_comparison.json')]
-        cases += [('last_compare.json', 'symlink'), ('plans/sync-latest.json.tmp', 'symlink'),
-                  ('last_sync_comparison.json.tmp', 'readonly')]
+        cases = [("plans", kind) for kind in ("regular", "fifo", "symlink")]
+        cases += [
+            (name, "fifo")
+            for name in (
+                "plans/sync-latest.json.tmp",
+                "last_compare.json.tmp",
+                "last_sync_comparison.json.tmp",
+            )
+        ]
+        cases += [
+            (name, "directory")
+            for name in ("plans/sync-latest.json", "last_compare.json", "last_sync_comparison.json")
+        ]
+        cases += [
+            ("last_compare.json", "symlink"),
+            ("plans/sync-latest.json.tmp", "symlink"),
+            ("last_sync_comparison.json.tmp", "readonly"),
+        ]
         for name, kind in cases:
             with self.subTest(name=name, kind=kind):
                 path = self.state / name
                 path.parent.mkdir(exist_ok=True)
-                if kind == 'directory':
+                if kind == "directory":
                     path.mkdir()
-                elif kind == 'fifo':
+                elif kind == "fifo":
                     os.mkfifo(path, 0o600)
-                elif kind == 'symlink':
+                elif kind == "symlink":
                     path.symlink_to(outside)
                 else:
                     path.write_text(SECRET)
-                    if kind == 'readonly':
+                    if kind == "readonly":
                         path.chmod(0o400)
                 try:
                     code, _, checks = self.report()
-                    text_code, output = self.invoke('doctor')
+                    text_code, output = self.invoke("doctor")
                     self.assertEqual((code, text_code), (2, 2))
-                    self.assertEqual(checks['state']['status'], 'error')
-                    self.assertIn('state/' + name, checks['state']['hint'])
-                    self.assertIn('state/' + name, output)
-                    self.assertEqual(checks['last_run']['status'], 'info')
-                    self.assertEqual(checks['last_agent_attempt']['status'], 'info')
+                    self.assertEqual(checks["state"]["status"], "error")
+                    self.assertIn("state/" + name, checks["state"]["hint"])
+                    self.assertIn("state/" + name, output)
+                    self.assertEqual(checks["last_run"]["status"], "info")
+                    self.assertEqual(checks["last_agent_attempt"]["status"], "info")
                     self.assertEqual(outside.read_text(), SECRET)
                 finally:
-                    path.rmdir() if kind == 'directory' else path.unlink()
-                if name.startswith('plans/'):
+                    path.rmdir() if kind == "directory" else path.unlink()
+                if name.startswith("plans/"):
                     path.parent.rmdir()
 
     def test_automatic_comparison_metadata_preserves_atomically_replaceable_files(self):
         self.assertEqual(self.report()[0], 0)
-        plans = self.state / 'plans'
+        plans = self.state / "plans"
         plans.mkdir()
-        targets = ('plans/sync-latest.json', 'last_compare.json', 'last_sync_comparison.json')
-        protected = {self.state / name for name in (*targets, *(name + '.tmp' for name in targets))}
+        targets = ("plans/sync-latest.json", "last_compare.json", "last_sync_comparison.json")
+        protected = {self.state / name for name in (*targets, *(name + ".tmp" for name in targets))}
         for name in targets:
             final = self.state / name
             os.mkfifo(final, 0o600)
-            final.with_name(final.name + '.tmp').write_text(SECRET)
+            final.with_name(final.name + ".tmp").write_text(SECRET)
         # Manual historical plans are not required by the automatic writer.
-        (plans / 'compare-unrelated.json').mkdir()
-        original_open = h.open_regular_file
+        (plans / "compare-unrelated.json").mkdir()
+        original_open = hg_file_io.open_regular_file
 
         def metadata_only(path, mode, *args, **kwargs):
             if Path(path) in protected:
-                raise AssertionError('comparison file content read')
+                raise AssertionError("comparison file content read")
             return original_open(path, mode, *args, **kwargs)
 
-        with patch.object(h, 'open_regular_file', metadata_only):
+        with patch.object(hg_file_io, "open_regular_file", metadata_only):
             self.assertEqual(self.report()[0], 0)
-            self.assertEqual(self.invoke('doctor')[0], 0)
+            self.assertEqual(self.invoke("doctor")[0], 0)
             for name in targets:
                 final = self.state / name
                 final.unlink()
                 final.write_text(SECRET)
                 final.chmod(0o400)
             self.assertEqual(self.report()[0], 0)
-            self.assertEqual(self.invoke('doctor')[0], 0)
+            self.assertEqual(self.invoke("doctor")[0], 0)
             plans.chmod(0o500)
             try:
                 self.assertEqual(self.report()[0], 0)
@@ -474,47 +641,70 @@ finally:
             before = self.snapshot()
             plans.chmod(0o400)
             try:
-                with (patch.object(h, 'write_json', side_effect=AssertionError('doctor wrote JSON')),
-                      patch.object(h, 'private_dir', side_effect=AssertionError('doctor changed directory')),
-                      patch.object(h.sqlite3, 'connect', side_effect=AssertionError('doctor opened SQLite')),
-                      patch.object(Path, 'chmod', side_effect=AssertionError('doctor changed permissions'))):
+                with (
+                    patch.object(
+                        hg_file_io, "write_json", side_effect=AssertionError("doctor wrote JSON")
+                    ),
+                    patch.object(
+                        hg_file_io,
+                        "private_dir",
+                        side_effect=AssertionError("doctor changed directory"),
+                    ),
+                    patch.object(
+                        hg_std_sqlite3,
+                        "connect",
+                        side_effect=AssertionError("doctor opened SQLite"),
+                    ),
+                    patch.object(
+                        Path, "chmod", side_effect=AssertionError("doctor changed permissions")
+                    ),
+                ):
                     for json_output in (True, False):
                         output = io.StringIO()
                         with contextlib.redirect_stdout(output):
                             self.assertEqual(d.doctor(json_output=json_output), 0)
-                        self.assertIn('下次运行会恢复 state/plans 权限', output.getvalue())
+                        self.assertIn("下次运行会恢复 state/plans 权限", output.getvalue())
                         self.assertNotIn(SECRET, output.getvalue())
                     report = d.collect()
-                checks = {check['id']: check for check in report['checks']}
-                self.assertEqual(checks['state']['status'], 'warn')
-                self.assertEqual(checks['last_run']['status'], 'info')
-                self.assertEqual(checks['last_agent_attempt']['status'], 'info')
+                checks = {check["id"]: check for check in report["checks"]}
+                self.assertEqual(checks["state"]["status"], "warn")
+                self.assertEqual(checks["last_run"]["status"], "info")
+                self.assertEqual(checks["last_agent_attempt"]["status"], "info")
                 self.assertEqual(stat.S_IMODE(plans.stat().st_mode), 0o400)
             finally:
                 plans.chmod(0o700)
             self.assertEqual(self.snapshot(), before)
-        source, token = self.export.read_bytes(), (self.tokens / 'oauth.json').read_bytes()
+        source, token = self.export.read_bytes(), (self.tokens / "oauth.json").read_bytes()
         plans.chmod(0o400)
-        h.write_json(plans / 'sync-latest.json', {'control': True})
+        hg_file_io.write_json(plans / "sync-latest.json", {"control": True})
         self.assertEqual(stat.S_IMODE(plans.stat().st_mode), 0o700)
-        self.assertEqual(json.loads((plans / 'sync-latest.json').read_text()), {'control': True})
+        self.assertEqual(json.loads((plans / "sync-latest.json").read_text()), {"control": True})
         self.assertEqual(self.report()[0], 0)
-        self.assertEqual((self.export.read_bytes(), (self.tokens / 'oauth.json').read_bytes()), (source, token))
+        self.assertEqual(
+            (self.export.read_bytes(), (self.tokens / "oauth.json").read_bytes()), (source, token)
+        )
 
-    def test_database_metadata_diagnoses_real_cli_type_permission_and_sidecar_directory_failures(self):
-        script = '''import contextlib, io, json, os, pathlib, socket, sys
+    def test_database_metadata_diagnoses_real_cli_type_permission_and_sidecar_directory_failures(
+        self,
+    ):
+        script = """import contextlib, io, json, os, pathlib, socket, sys
 from unittest.mock import patch
 sys.path[:0] = [sys.argv[1], str(pathlib.Path(sys.argv[1]) / 'tests')]
 from test_diagnostics import DoctorTests, SECRET
 from test_reconciliation import row
-import health_garmin as h
+from health_garmin_sync import cli as hg_cli, domain as hg_domain, file_io as hg_file_io, garmin as hg_garmin, launchagent as hg_launchagent, runtime as hg_runtime, sources as hg_sources, state as hg_state
+from datetime import UTC as hg_std_UTC
+import fcntl as hg_std_fcntl
+import logging as hg_std_logging
+import os as hg_std_os
+import sqlite3 as hg_std_sqlite3
 fixture = DoctorTests()
 fixture.setUp()
 try:
     kind = sys.argv[2]
     database = fixture.state / 'sync.sqlite3'
     if kind != 'missing':
-        connection = h.database()
+        connection = hg_state.database()
         fixture.assertEqual(connection.execute('PRAGMA journal_mode').fetchone()[0], 'delete')
         connection.close()
     if kind in ('symlink', 'directory', 'fifo'):
@@ -531,7 +721,7 @@ try:
     elif kind.startswith(('journal-', 'wal-')):
         sidecar = fixture.state / ('sync.sqlite3-journal' if kind.startswith('journal-') else 'sync.sqlite3-wal')
         sidecar.mkdir() if kind.endswith('-directory') else sidecar.touch()
-    native_open, native_connect = pathlib.Path.open, h.sqlite3.connect
+    native_open, native_connect = pathlib.Path.open, hg_std_sqlite3.connect
     def file_open(path, *args, **kwargs):
         if path.suffix == '.sqlite3' or path.name.startswith('sync.sqlite3-'):
             raise AssertionError('database content read as file')
@@ -544,12 +734,12 @@ try:
         raise AssertionError('unexpected network/service/mutation')
     socket.create_connection = socket.getaddrinfo = forbidden
     socket.socket.connect = socket.socket.connect_ex = forbidden
-    h.manage_agent = forbidden
+    hg_launchagent.manage_agent = forbidden
     calls = {'api': 0, 'get': 0, 'post': 0, 'delete': 0}
     class API:
         def get_body_composition(self, start, end):
             calls['get'] += 1
-            return {'dateWeightList': [row(h.load_measurements(h.config())[1][0])]}
+            return {'dateWeightList': [row(hg_sources.load_measurements(hg_runtime.config())[1][0])]}
         def add_body_composition(self, *args, **kwargs):
             calls['post'] += 1
             return forbidden()
@@ -562,7 +752,7 @@ try:
         return API()
     source, token = fixture.export.read_bytes(), (fixture.tokens / 'oauth.json').read_bytes()
     expected = 0 if kind in ('missing', 'normal', 'journal-regular', 'wal-regular') else 2
-    with patch.object(pathlib.Path, 'open', file_open), patch.object(h.sqlite3, 'connect', connect):
+    with patch.object(pathlib.Path, 'open', file_open), patch.object(hg_std_sqlite3, 'connect', connect):
         code, _, checks = fixture.report()
         fixture.assertEqual(code, expected)
         fixture.assertEqual(checks['state']['status'], 'info' if expected == 0 else 'error')
@@ -574,11 +764,11 @@ try:
             expected_name = sidecar.name if kind.endswith('-directory') else 'sync.sqlite3'
             fixture.assertIn('state/' + expected_name, checks['state']['hint'])
             fixture.assertIn('state/' + expected_name, text)
-        h.api_client = client
-        sys.argv = ['hg', 'run']
+        hg_garmin.api_client = client
+        sys.argv = ['health-garmin-sync', 'run']
         output, errors = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
-            fixture.assertEqual(h.main(), expected)
+            fixture.assertEqual(hg_cli.main(), expected)
         fixture.assertNotIn(SECRET, errors.getvalue())
         fixture.assertEqual(fixture.report()[0], expected)
     expected_calls = 1 if kind in ('missing', 'normal', 'readonly', 'journal-regular', 'wal-regular') else 0
@@ -589,21 +779,43 @@ try:
     fixture.assertEqual((fixture.tokens / 'oauth.json').read_bytes(), token)
 finally:
     fixture.doCleanups()
-'''
-        for kind in ('missing', 'normal', 'symlink', 'directory', 'fifo', 'readonly', 'writeonly',
-                     'journal-directory', 'wal-directory', 'journal-regular', 'wal-regular'):
+"""
+        for kind in (
+            "missing",
+            "normal",
+            "symlink",
+            "directory",
+            "fifo",
+            "readonly",
+            "writeonly",
+            "journal-directory",
+            "wal-directory",
+            "journal-regular",
+            "wal-regular",
+        ):
             with self.subTest(kind=kind), tempfile.TemporaryDirectory() as isolated:
-                child = subprocess.Popen([sys.executable, '-B', '-c', script,
-                    str(Path(__file__).resolve().parents[1]), kind], cwd=isolated,
-                    env={'HOME': isolated, 'TMPDIR': isolated}, stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE, text=True)
+                child = subprocess.Popen(
+                    [
+                        sys.executable,
+                        "-B",
+                        "-c",
+                        script,
+                        str(Path(__file__).resolve().parents[1]),
+                        kind,
+                    ],
+                    cwd=isolated,
+                    env={"HOME": isolated, "TMPDIR": isolated},
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
                 try:
                     try:
                         stdout, stderr = child.communicate(timeout=2)
                     except subprocess.TimeoutExpired:
                         child.kill()
                         child.communicate(timeout=2)
-                        self.fail('database path blocked the command')
+                        self.fail("database path blocked the command")
                     self.assertEqual(child.returncode, 0, stdout + stderr)
                 finally:
                     if child.poll() is None:
@@ -615,60 +827,76 @@ finally:
     def test_healthy_setup_returns_parseable_safe_report_and_only_queries_service(self):
         result, report, checks = self.report()
         self.assertEqual(result, 0)
-        self.assertEqual(checks['state']['status'], 'info')
-        for name in ('run.lock', 'agent-log.lock', 'sync.log'):
+        self.assertEqual(checks["state"]["status"], "info")
+        for name in ("run.lock", "agent-log.lock", "sync.log"):
             self.assertFalse((self.state / name).exists())
-        self.assertEqual(report['status'], 'ok')
-        self.assertEqual(checks['inbox']['data']['measurements'], 1)
-        self.assertEqual(checks['last_run']['data']['results'], {'verified': 1})
-        self.assertIn('当前进程', report['scope'])
-        self.service.assert_called_once_with(['/bin/launchctl', 'print', f'gui/{os.getuid()}/{h.LABEL}'],
-                                             capture_output=True, timeout=5)
+        self.assertEqual(report["status"], "ok")
+        self.assertEqual(checks["inbox"]["data"]["measurements"], 1)
+        self.assertEqual(checks["last_run"]["data"]["results"], {"verified": 1})
+        self.assertIn("当前进程", report["scope"])
+        self.service.assert_called_once_with(
+            ["/bin/launchctl", "print", f"gui/{os.getuid()}/{hg_runtime.LABEL}"],
+            capture_output=True,
+            timeout=5,
+        )
 
     def test_plain_output_is_readable_and_contains_current_process_scope(self):
-        stamp = h.now().replace(second=26, microsecond=789919).isoformat()
+        stamp = hg_runtime.now().replace(second=26, microsecond=789919).isoformat()
         last = json.loads(self.last.read_text())
-        last['run_at'] = stamp
+        last["run_at"] = stamp
         self.last.write_text(json.dumps(last))
         attempt = json.loads(self.agent_attempt.read_text())
         attempt.update(started_at=stamp, finished_at=stamp)
         self.agent_attempt.write_text(json.dumps(attempt))
-        attempt['stage'] = 'sync'
-        (self.state / 'last_attempt.json').write_text(json.dumps(attempt))
-        result, output = self.invoke('doctor')
+        attempt["stage"] = "sync"
+        (self.state / "last_attempt.json").write_text(json.dumps(attempt))
+        result, output = self.invoke("doctor")
         self.assertEqual(result, 0)
-        self.assertIn('离线诊断', output)
-        self.assertIn('当前进程可读取导出', output)
-        self.assertIn('后台执行', output)
+        self.assertIn("离线诊断", output)
+        self.assertIn("当前进程可读取导出", output)
+        self.assertIn("后台执行", output)
         self.assertIn(stamp, output)
-        self.assertEqual(self.invoke('doctor', '--json')[0], 0)
-        for arguments in (('doctor',), ('doctor', '--json')):
-            for payload in ('{"body_fat": 26.789}', '{"weight": "73.123 kg"}',
-                            '{"run_at": "26.789"}', '{"note": "2026-10-01T23:57:26.789919+00:00"}'):
+        self.assertEqual(self.invoke("doctor", "--json")[0], 0)
+        for arguments in (("doctor",), ("doctor", "--json")):
+            for payload in (
+                '{"body_fat": 26.789}',
+                '{"weight": "73.123 kg"}',
+                '{"run_at": "26.789"}',
+                '{"note": "2026-10-01T23:57:26.789919+00:00"}',
+            ):
                 with self.subTest(arguments=arguments, payload=payload):
+
                     def emit(json_output=False):
                         print(payload)
                         return 0
 
-                    with patch.object(d, 'doctor', side_effect=emit), self.assertRaises(AssertionError):
+                    with (
+                        patch.object(d, "doctor", side_effect=emit),
+                        self.assertRaises(AssertionError),
+                    ):
                         self.invoke(*arguments)
 
     def test_disabled_uninstalled_with_missing_optional_state_is_warning(self):
-        self.cfg['enabled'] = False
+        self.cfg["enabled"] = False
         self.save_config()
         self.plist.unlink()
         self.last.unlink()
         self.service.return_value.returncode = 1
         result, report, checks = self.report()
         self.assertEqual(result, 0)
-        self.assertEqual(report['status'], 'warning')
-        for identifier in ('enabled', 'agent_plist', 'agent_service', 'last_run'):
-            self.assertEqual(checks[identifier]['status'], 'warn')
+        self.assertEqual(report["status"], "warning")
+        for identifier in ("enabled", "agent_plist", "agent_service", "last_run"):
+            self.assertEqual(checks[identifier]["status"], "warn")
 
     def test_missing_or_corrupt_config_and_absent_state_do_not_initialize_files(self):
         import shutil
+
         shutil.rmtree(self.state)
-        for content in (None, '{"secret":"' + SECRET + '",', json.dumps(dict(self.cfg, enabled='false'))):
+        for content in (
+            None,
+            '{"secret":"' + SECRET + '",',
+            json.dumps(dict(self.cfg, enabled="false")),
+        ):
             with self.subTest(content=content):
                 if content is None:
                     self.config_path.unlink()
@@ -676,112 +904,113 @@ finally:
                     self.config_path.write_text(content)
                 result, _, checks = self.report()
                 self.assertEqual(result, 2)
-                self.assertEqual(checks['config']['status'], 'error')
-                self.assertEqual(checks['state']['status'], 'warn')
+                self.assertEqual(checks["config"]["status"], "error")
+                self.assertEqual(checks["state"]["status"], "warn")
                 self.assertFalse(self.state.exists())
 
     def test_real_busy_lock_does_not_block_doctor(self):
         with contextlib.ExitStack() as stack:
-            for name in ('run.lock', 'agent-log.lock'):
-                holder = stack.enter_context((self.state / name).open('a'))
+            for name in ("run.lock", "agent-log.lock"):
+                holder = stack.enter_context((self.state / name).open("a"))
                 fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
             result, _, checks = self.report()
         self.assertEqual(result, 0)
-        self.assertEqual(checks['state']['status'], 'info')
+        self.assertEqual(checks["state"]["status"], "info")
 
     def test_unusable_agent_lock_cannot_be_hidden_by_old_completed_evidence(self):
-        (self.state / 'agent-log.lock').mkdir()
+        (self.state / "agent-log.lock").mkdir()
         previous = self.agent_attempt.read_bytes()
         errors = io.StringIO()
-        with patch.object(h, 'main') as main, contextlib.redirect_stderr(errors):
+        with patch.object(hg_cli, "main") as main, contextlib.redirect_stderr(errors):
             self.assertEqual(runner.entrypoint(), 2)
         main.assert_not_called()
         self.assertEqual(self.agent_attempt.read_bytes(), previous)
         self.assertNotIn(SECRET, errors.getvalue())
         code, _, checks = self.report()
         self.assertEqual(code, 2)
-        self.assertEqual(checks['state']['status'], 'error')
-        self.assertIn('state/agent-log.lock', checks['state']['hint'])
-        self.assertEqual(checks['last_agent_attempt']['status'], 'info')
-        text_code, output = self.invoke('doctor')
+        self.assertEqual(checks["state"]["status"], "error")
+        self.assertIn("state/agent-log.lock", checks["state"]["hint"])
+        self.assertEqual(checks["last_agent_attempt"]["status"], "info")
+        text_code, output = self.invoke("doctor")
         self.assertEqual(text_code, 2)
-        self.assertIn('state/agent-log.lock', output)
+        self.assertIn("state/agent-log.lock", output)
 
     def test_nonregular_lock_paths_are_readonly_errors(self):
-        outside = self.root / 'outside-lock'
+        outside = self.root / "outside-lock"
         outside.write_text(SECRET)
-        for name in ('run.lock', 'agent-log.lock'):
+        for name in ("run.lock", "agent-log.lock"):
             path = self.state / name
-            for kind in ('directory', 'symlink'):
+            for kind in ("directory", "symlink"):
                 with self.subTest(name=name, kind=kind):
-                    if kind == 'directory':
+                    if kind == "directory":
                         path.mkdir()
                     else:
                         path.symlink_to(outside)
                     try:
                         code, _, checks = self.report()
                         self.assertEqual(code, 2)
-                        self.assertEqual(checks['state']['status'], 'error')
-                        self.assertIn('state/' + name, checks['state']['hint'])
-                        self.assertEqual(checks['last_run']['status'], 'info')
-                        text_code, output = self.invoke('doctor')
+                        self.assertEqual(checks["state"]["status"], "error")
+                        self.assertIn("state/" + name, checks["state"]["hint"])
+                        self.assertEqual(checks["last_run"]["status"], "info")
+                        text_code, output = self.invoke("doctor")
                         self.assertEqual(text_code, 2)
-                        self.assertIn('state/' + name, output)
+                        self.assertIn("state/" + name, output)
                     finally:
-                        path.rmdir() if kind == 'directory' else path.unlink()
+                        path.rmdir() if kind == "directory" else path.unlink()
 
     def test_fifo_sync_log_cannot_be_hidden_by_healthy_completed_evidence(self):
-        path = self.state / 'sync.log'
-        path.write_text('synthetic log')
+        path = self.state / "sync.log"
+        path.write_text("synthetic log")
         self.assertEqual(self.report()[0], 0)
         path.unlink()
         os.mkfifo(path, 0o600)
         code, _, checks = self.report()
         self.assertEqual(code, 2)
-        self.assertEqual(checks['state']['status'], 'error')
-        self.assertIn('state/sync.log', checks['state']['hint'])
-        self.assertEqual(checks['last_run']['status'], 'info')
-        self.assertEqual(checks['last_agent_attempt']['status'], 'info')
-        text_code, output = self.invoke('doctor')
+        self.assertEqual(checks["state"]["status"], "error")
+        self.assertIn("state/sync.log", checks["state"]["hint"])
+        self.assertEqual(checks["last_run"]["status"], "info")
+        self.assertEqual(checks["last_agent_attempt"]["status"], "info")
+        text_code, output = self.invoke("doctor")
         self.assertEqual(text_code, 2)
-        self.assertIn('state/sync.log', output)
+        self.assertIn("state/sync.log", output)
 
     def test_sync_log_directory_and_external_symlink_are_not_opened(self):
         with tempfile.TemporaryDirectory() as outside:
             target = Path(outside) / SECRET
             target.write_text(SECRET)
-            path = self.state / 'sync.log'
+            path = self.state / "sync.log"
             original_open = Path.open
 
             def guarded_open(candidate, *args, **kwargs):
                 if candidate in (path, target):
-                    raise AssertionError('unsafe log content read')
+                    raise AssertionError("unsafe log content read")
                 return original_open(candidate, *args, **kwargs)
 
-            for kind in ('directory', 'symlink'):
+            for kind in ("directory", "symlink"):
                 with self.subTest(kind=kind):
-                    path.mkdir() if kind == 'directory' else path.symlink_to(target)
+                    path.mkdir() if kind == "directory" else path.symlink_to(target)
                     try:
-                        with patch.object(Path, 'open', guarded_open):
+                        with patch.object(Path, "open", guarded_open):
                             code, _, checks = self.report()
-                            text_code, output = self.invoke('doctor')
+                            text_code, output = self.invoke("doctor")
                         self.assertEqual((code, text_code), (2, 2))
-                        self.assertEqual(checks['state']['status'], 'error')
-                        self.assertIn('state/sync.log', checks['state']['hint'])
-                        self.assertIn('state/sync.log', output)
-                        self.assertEqual(checks['last_run']['status'], 'info')
-                        self.assertEqual(checks['last_agent_attempt']['status'], 'info')
+                        self.assertEqual(checks["state"]["status"], "error")
+                        self.assertIn("state/sync.log", checks["state"]["hint"])
+                        self.assertIn("state/sync.log", output)
+                        self.assertEqual(checks["last_run"]["status"], "info")
+                        self.assertEqual(checks["last_agent_attempt"]["status"], "info")
                     finally:
-                        path.rmdir() if kind == 'directory' else path.unlink()
+                        path.rmdir() if kind == "directory" else path.unlink()
             self.assertEqual(target.read_text(), SECRET)
 
     def test_lock_permission_or_metadata_errors_keep_other_evidence_and_private_details_safe(self):
         original_access, original_lstat = os.access, Path.lstat
-        for name in ('run.lock', 'agent-log.lock', 'sync.log'):
+        for name in ("run.lock", "agent-log.lock", "sync.log"):
             path = self.state / name
-            path.write_text('synthetic lock')
-            for failure in ('permission', 'metadata'):
+            path.write_text("synthetic lock")
+            for failure in ("permission", "metadata"):
                 with self.subTest(name=name, failure=failure):
+
                     def access(target, mode, *args, **kwargs):
                         if Path(target) == path and mode == os.W_OK:
                             return False
@@ -792,690 +1021,996 @@ finally:
                             raise OSError(SECRET)
                         return original_lstat(target, *args, **kwargs)
 
-                    patcher = patch.object(os, 'access', access) if failure == 'permission' else patch.object(Path, 'lstat', lstat)
+                    patcher = (
+                        patch.object(os, "access", access)
+                        if failure == "permission"
+                        else patch.object(Path, "lstat", lstat)
+                    )
                     with patcher:
                         code, _, checks = self.report()
-                        text_code, output = self.invoke('doctor')
+                        text_code, output = self.invoke("doctor")
                     self.assertEqual(code, 2)
                     self.assertEqual(text_code, 2)
-                    self.assertEqual(checks['state']['status'], 'error')
-                    self.assertIn('state/' + name, checks['state']['hint'])
-                    self.assertIn('state/' + name, output)
-                    self.assertEqual(checks['last_run']['status'], 'info')
-                    self.assertEqual(checks['last_agent_attempt']['status'], 'info')
+                    self.assertEqual(checks["state"]["status"], "error")
+                    self.assertIn("state/" + name, checks["state"]["hint"])
+                    self.assertIn("state/" + name, output)
+                    self.assertEqual(checks["last_run"]["status"], "info")
+                    self.assertEqual(checks["last_agent_attempt"]["status"], "info")
             path.unlink()
 
     def test_help_does_not_create_runtime_files(self):
-        for args in (('--help',), ('doctor', '--help')):
+        for args in (("--help",), ("doctor", "--help")):
             with self.subTest(args=args):
                 result, output = self.invoke(*args)
                 self.assertEqual(result, 0)
-                self.assertIn('doctor', output)
+                self.assertIn("doctor", output)
         self.service.assert_not_called()
 
     def test_missing_dependency_wrong_version_and_missing_interpreter_are_errors(self):
-        for version_result in (PackageNotFoundError('garminconnect'), '0.0.1'):
+        for version_result in (PackageNotFoundError("garminconnect"), "0.0.1"):
             with self.subTest(version_result=version_result):
-                with patch.object(d, 'version', side_effect=version_result if isinstance(version_result, Exception) else None,
-                                  return_value=version_result):
+                with patch.object(
+                    d,
+                    "version",
+                    side_effect=version_result if isinstance(version_result, Exception) else None,
+                    return_value=version_result,
+                ):
                     result, _, checks = self.report()
                 self.assertEqual(result, 2)
-                self.assertEqual(checks['dependency']['status'], 'error')
+                self.assertEqual(checks["dependency"]["status"], "error")
         self.python.unlink()
         result, _, checks = self.report()
         self.assertEqual(result, 2)
-        self.assertEqual(checks['interpreter']['status'], 'error')
+        self.assertEqual(checks["interpreter"]["status"], "error")
 
     def test_missing_or_unreadable_background_entry_is_error(self):
         original = d.os.access
-        with patch.object(d.os, 'access', side_effect=lambda path, mode: False if path == self.entry else original(path, mode)):
+        with patch.object(
+            d.os,
+            "access",
+            side_effect=lambda path, mode: False if path == self.entry else original(path, mode),
+        ):
             result, _, checks = self.report()
         self.assertEqual(result, 2)
-        self.assertEqual(checks['agent_entry']['status'], 'error')
+        self.assertEqual(checks["agent_entry"]["status"], "error")
         self.entry.unlink()
         result, _, checks = self.report()
         self.assertEqual(result, 2)
-        self.assertEqual(checks['agent_entry']['status'], 'error')
+        self.assertEqual(checks["agent_entry"]["status"], "error")
 
     def test_old_direct_output_plist_requires_update(self):
-        doc = h.agent_plist()
-        doc['ProgramArguments'] = [str(self.python), str(self.base / 'health_garmin.py'), 'run']
-        doc['StandardOutPath'] = str(self.state / 'agent.out.log')
-        doc['StandardErrorPath'] = str(self.state / 'agent.err.log')
+        doc = hg_launchagent.agent_plist()
+        doc["ProgramArguments"] = [str(self.python), "health_garmin_sync", "run"]
+        doc["StandardOutPath"] = str(self.state / "agent.out.log")
+        doc["StandardErrorPath"] = str(self.state / "agent.err.log")
         self.plist.write_bytes(plistlib.dumps(doc))
         result, _, checks = self.report()
         self.assertEqual(result, 2)
-        self.assertEqual(checks['agent_plist']['status'], 'error')
-        self.assertIn('./hg install-agent', checks['agent_plist']['hint'])
+        self.assertEqual(checks["agent_plist"]["status"], "error")
+        self.assertIn("./health-garmin-sync install-agent", checks["agent_plist"]["hint"])
 
     def test_old_python_and_nonexecutable_interpreter_are_errors(self):
         self.python.chmod(0o600)
-        with patch.object(sys, 'version_info', (3, 11)):
+        with patch.object(sys, "version_info", (3, 11)):
             result, _, checks = self.report()
         self.assertEqual(result, 2)
-        self.assertEqual(checks['python']['status'], 'error')
-        self.assertEqual(checks['interpreter']['status'], 'error')
+        self.assertEqual(checks["python"]["status"], "error")
+        self.assertEqual(checks["interpreter"]["status"], "error")
 
     def test_unreadable_inbox_error_does_not_echo_exception(self):
         original = Path.iterdir
+
         def unreadable(path):
             if path == self.inbox:
                 raise PermissionError(SECRET)
             return original(path)
-        with patch.object(Path, 'iterdir', unreadable):
+
+        with patch.object(Path, "iterdir", unreadable):
             result, _, checks = self.report()
         self.assertEqual(result, 2)
-        self.assertEqual(checks['inbox']['status'], 'error')
+        self.assertEqual(checks["inbox"]["status"], "error")
 
     def test_unknown_home_in_inbox_is_reported_as_json_error(self):
         original_expand = Path.expanduser
+
         def unavailable_home(path):
-            if path == Path(self.cfg['inbox']):
+            if path == Path(self.cfg["inbox"]):
                 raise RuntimeError(SECRET)
             return original_expand(path)
-        with patch.object(Path, 'expanduser', unavailable_home):
+
+        with patch.object(Path, "expanduser", unavailable_home):
             result, _, checks = self.report()
         self.assertEqual(result, 2)
-        self.assertEqual(checks['inbox']['status'], 'error')
+        self.assertEqual(checks["inbox"]["status"], "error")
 
     def test_unreadable_state_reports_error_without_initializing_evidence(self):
         original_access = os.access
+
         def denied(path, mode):
             return False if path == self.state else original_access(path, mode)
-        with patch.object(d.os, 'access', denied):
+
+        with patch.object(d.os, "access", denied):
             result, _, checks = self.report()
         self.assertEqual(result, 2)
-        self.assertEqual(checks['state']['status'], 'error')
-        self.assertNotIn('last_run', checks)
+        self.assertEqual(checks["state"]["status"], "error")
+        self.assertNotIn("last_run", checks)
 
     def test_absent_state_when_disabled_remains_warning(self):
         import shutil
-        self.cfg['enabled'] = False
+
+        self.cfg["enabled"] = False
         self.save_config()
         shutil.rmtree(self.state)
         result, _, checks = self.report()
         self.assertEqual(result, 0)
-        self.assertEqual(checks['state']['status'], 'warn')
-        self.assertEqual(checks['tokens']['status'], 'warn')
+        self.assertEqual(checks["state"]["status"], "warn")
+        self.assertEqual(checks["tokens"]["status"], "warn")
 
     def test_malformed_export_and_pairing_ambiguity_are_errors(self):
         self.export.write_text('{"secret":"' + SECRET + '",')
         result, _, checks = self.report()
         self.assertEqual(result, 2)
-        self.assertEqual(checks['inbox']['status'], 'error')
-        doc = {'schema_version': 2, 'exported_at': '2020-02-20T09:00:00+08:00', 'metrics': {
-            'weight': [{'at': '2020-02-20T08:00:00+08:00', 'value': 70, 'source': SECRET}],
-            'body_fat': [{'at': at, 'value': '25%', 'source': SECRET}
-                         for at in ('2020-02-20T07:59:55+08:00', '2020-02-20T08:00:05+08:00')]}}
-        self.cfg['pair_window_seconds'] = 10
+        self.assertEqual(checks["inbox"]["status"], "error")
+        doc = {
+            "schema_version": 2,
+            "exported_at": "2020-02-20T09:00:00+08:00",
+            "metrics": {
+                "weight": [{"at": "2020-02-20T08:00:00+08:00", "value": 70, "source": SECRET}],
+                "body_fat": [
+                    {"at": at, "value": "25%", "source": SECRET}
+                    for at in ("2020-02-20T07:59:55+08:00", "2020-02-20T08:00:05+08:00")
+                ],
+            },
+        }
+        self.cfg["pair_window_seconds"] = 10
         self.save_config()
         self.export.write_text(json.dumps(doc))
         result, _, checks = self.report()
         self.assertEqual(result, 2)
-        self.assertGreater(checks['inbox']['data']['waiting_pairs'], 0)
+        self.assertGreater(checks["inbox"]["data"]["waiting_pairs"], 0)
 
     def test_empty_inbox_and_missing_tokens_are_warnings(self):
-        self.cfg['enabled'] = False
+        self.cfg["enabled"] = False
         self.save_config()
         self.export.unlink()
-        (self.tokens / 'oauth.json').unlink()
+        (self.tokens / "oauth.json").unlink()
         self.tokens.rmdir()
         result, _, checks = self.report()
         self.assertEqual(result, 0)
-        self.assertEqual(checks['inbox']['status'], 'warn')
-        self.assertEqual(checks['tokens']['status'], 'warn')
+        self.assertEqual(checks["inbox"]["status"], "warn")
+        self.assertEqual(checks["tokens"]["status"], "warn")
 
     def test_enabled_missing_or_empty_token_directory_is_error(self):
-        (self.tokens / 'oauth.json').unlink()
+        (self.tokens / "oauth.json").unlink()
         for present in (True, False):
             with self.subTest(directory_exists=present):
                 if not present:
                     self.tokens.rmdir()
                 result, _, checks = self.report()
                 self.assertEqual(result, 2)
-                self.assertEqual(checks['tokens']['status'], 'error')
-                self.assertIn('./hg login', checks['tokens']['hint'])
+                self.assertEqual(checks["tokens"]["status"], "error")
+                self.assertIn("./health-garmin-sync login", checks["tokens"]["hint"])
 
     def test_all_emitted_single_and_full_operation_phases_and_run_results_are_readable(self):
-        phases = ('verified', 'deleted_verified', 'closed_partial', 'uncertain',
-                  'deleting', 'deleted', 'uploading', 'replacing')
-        operations = self.state / 'operations'
+        phases = (
+            "verified",
+            "deleted_verified",
+            "closed_partial",
+            "uncertain",
+            "deleting",
+            "deleted",
+            "uploading",
+            "replacing",
+        )
+        operations = self.state / "operations"
         operations.mkdir()
         for index, phase in enumerate(phases):
-            (operations / f'job-{index}.json').write_text(json.dumps({
-                'phase': phase, 'key': SECRET + str(index),
-                'type': 'full_replacement' if phase in ('replacing', 'closed_partial') else 'repair',
-                'record_ids': [SECRET], 'payload': SECRET}))
-        results = ('pending', 'verified', 'verified_manual', 'verified_conflict', 'remote_missing',
-                   'repair_uncertain', 'uncertain', 'inflight', 'ignored', 'repair', 'replace', 'conflict', 'deferred')
-        self.last.write_text(json.dumps({'run_at': h.now().isoformat(),
-            'results': {str(index): result for index, result in enumerate(results)}}))
+            (operations / f"job-{index}.json").write_text(
+                json.dumps(
+                    {
+                        "phase": phase,
+                        "key": SECRET + str(index),
+                        "type": "full_replacement"
+                        if phase in ("replacing", "closed_partial")
+                        else "repair",
+                        "record_ids": [SECRET],
+                        "payload": SECRET,
+                    }
+                )
+            )
+        results = (
+            "pending",
+            "verified",
+            "verified_manual",
+            "verified_conflict",
+            "remote_missing",
+            "repair_uncertain",
+            "uncertain",
+            "inflight",
+            "ignored",
+            "repair",
+            "replace",
+            "conflict",
+            "deferred",
+        )
+        self.last.write_text(
+            json.dumps(
+                {
+                    "run_at": hg_runtime.now().isoformat(),
+                    "results": {str(index): result for index, result in enumerate(results)},
+                }
+            )
+        )
         result, _, checks = self.report()
         self.assertEqual(result, 2)
-        self.assertEqual(checks['operations']['data'], {'total': 8, 'unfinished': 5, 'failed_checks': 0})
-        self.assertEqual(checks['last_run']['data']['results'], {result: 1 for result in results})
+        self.assertEqual(
+            checks["operations"]["data"], {"total": 8, "unfinished": 5, "failed_checks": 0}
+        )
+        self.assertEqual(checks["last_run"]["data"]["results"], {result: 1 for result in results})
 
     def test_recent_run_result_severity_and_safe_counts(self):
-        groups = {'error': ('inflight', 'uncertain', 'repair_uncertain'),
-                  'warn': ('repair', 'replace', 'conflict', 'verified_conflict', 'remote_missing'),
-                  'info': ('verified', 'verified_manual', 'ignored', 'deferred', 'pending')}
+        groups = {
+            "error": ("inflight", "uncertain", "repair_uncertain"),
+            "warn": ("repair", "replace", "conflict", "verified_conflict", "remote_missing"),
+            "info": ("verified", "verified_manual", "ignored", "deferred", "pending"),
+        }
         for severity, outcomes in groups.items():
             for outcome in outcomes:
                 with self.subTest(outcome=outcome):
-                    self.last.write_text(json.dumps({'run_at': h.now().isoformat(),
-                        'results': {SECRET: outcome}, 'error': SECRET}))
+                    self.last.write_text(
+                        json.dumps(
+                            {
+                                "run_at": hg_runtime.now().isoformat(),
+                                "results": {SECRET: outcome},
+                                "error": SECRET,
+                            }
+                        )
+                    )
                     code, report, checks = self.report()
-                    check = checks['last_run']
-                    self.assertEqual(code, 2 if severity == 'error' else 0)
-                    self.assertEqual(report['status'],
-                                     {'error': 'error', 'warn': 'warning', 'info': 'ok'}[severity])
-                    self.assertEqual(check['status'], severity)
-                    self.assertIn('最近运行摘要', check['message'])
-                    self.assertEqual(check['data']['results'], {outcome: 1})
-                    if severity != 'info':
-                        self.assertIn('核对', check['hint'])
+                    check = checks["last_run"]
+                    self.assertEqual(code, 2 if severity == "error" else 0)
+                    self.assertEqual(
+                        report["status"],
+                        {"error": "error", "warn": "warning", "info": "ok"}[severity],
+                    )
+                    self.assertEqual(check["status"], severity)
+                    self.assertIn("最近运行摘要", check["message"])
+                    self.assertEqual(check["data"]["results"], {outcome: 1})
+                    if severity != "info":
+                        self.assertIn("核对", check["hint"])
 
     def test_mixed_recent_results_keep_highest_severity(self):
-        for outcomes, severity in ((('verified', 'repair', 'uncertain'), 'error'),
-                                   (('pending', 'conflict'), 'warn'),
-                                   (('ignored', 'deferred', 'verified_manual'), 'info')):
+        for outcomes, severity in (
+            (("verified", "repair", "uncertain"), "error"),
+            (("pending", "conflict"), "warn"),
+            (("ignored", "deferred", "verified_manual"), "info"),
+        ):
             with self.subTest(outcomes=outcomes):
-                self.last.write_text(json.dumps({'run_at': h.now().isoformat(),
-                    'results': {str(index): value for index, value in enumerate(outcomes)}}))
+                self.last.write_text(
+                    json.dumps(
+                        {
+                            "run_at": hg_runtime.now().isoformat(),
+                            "results": {str(index): value for index, value in enumerate(outcomes)},
+                        }
+                    )
+                )
                 code, _, checks = self.report()
-                self.assertEqual(code, 2 if severity == 'error' else 0)
-                self.assertEqual(checks['last_run']['status'], severity)
-                self.assertEqual(checks['last_run']['data']['results'], {value: 1 for value in outcomes})
+                self.assertEqual(code, 2 if severity == "error" else 0)
+                self.assertEqual(checks["last_run"]["status"], severity)
+                self.assertEqual(
+                    checks["last_run"]["data"]["results"], {value: 1 for value in outcomes}
+                )
 
     def test_local_state_snapshot_severity_includes_records_outside_latest_results(self):
         for status in sorted(d.RESULTS):
             with self.subTest(status=status):
-                self.last.write_text(json.dumps({'run_at': h.now().isoformat(),
-                    'results': {SECRET: 'verified'}, 'local_status_counts': {status: 2}}))
+                self.last.write_text(
+                    json.dumps(
+                        {
+                            "run_at": hg_runtime.now().isoformat(),
+                            "results": {SECRET: "verified"},
+                            "local_status_counts": {status: 2},
+                        }
+                    )
+                )
                 code, _, checks = self.report()
-                expected = 'error' if status in d.UNCERTAIN_RESULTS else 'warn' if status in d.REVIEW_RESULTS else 'info'
-                self.assertEqual(code, 2 if expected == 'error' else 0)
-                check = checks['last_run']
-                self.assertEqual(check['status'], expected)
-                self.assertEqual(check['data']['local_status_counts'], {status: 2})
-                self.assertEqual(check['data']['results'], {'verified': 1})
-                if expected != 'info':
-                    self.assertIn('快照', check['hint'])
-                    self.assertIn('./hg status', check['hint'])
+                expected = (
+                    "error"
+                    if status in d.UNCERTAIN_RESULTS
+                    else "warn"
+                    if status in d.REVIEW_RESULTS
+                    else "info"
+                )
+                self.assertEqual(code, 2 if expected == "error" else 0)
+                check = checks["last_run"]
+                self.assertEqual(check["status"], expected)
+                self.assertEqual(check["data"]["local_status_counts"], {status: 2})
+                self.assertEqual(check["data"]["results"], {"verified": 1})
+                if expected != "info":
+                    self.assertIn("快照", check["hint"])
+                    self.assertIn("./health-garmin-sync status", check["hint"])
 
     def test_zero_local_counts_do_not_report_unresolved_records(self):
-        self.last.write_text(json.dumps({'run_at': h.now().isoformat(), 'results': {},
-            'local_status_counts': {'uncertain': 0, 'verified_conflict': 0}}))
+        self.last.write_text(
+            json.dumps(
+                {
+                    "run_at": hg_runtime.now().isoformat(),
+                    "results": {},
+                    "local_status_counts": {"uncertain": 0, "verified_conflict": 0},
+                }
+            )
+        )
         code, _, checks = self.report()
         self.assertEqual(code, 0)
-        self.assertEqual(checks['last_run']['status'], 'info')
+        self.assertEqual(checks["last_run"]["status"], "info")
 
     def test_unknown_request_snapshot_count_is_optional_strict_and_controls_severity(self):
-        base = {'run_at': h.now().isoformat(), 'results': {}, 'local_status_counts': {'ignored': 1}}
-        for value, expected in ((None, 'info'), (0, 'info'), (1, 'error')):
+        base = {
+            "run_at": hg_runtime.now().isoformat(),
+            "results": {},
+            "local_status_counts": {"ignored": 1},
+        }
+        for value, expected in ((None, "info"), (0, "info"), (1, "error")):
             with self.subTest(count=value):
                 summary = dict(base)
                 if value is not None:
-                    summary['unknown_request_count'] = value
+                    summary["unknown_request_count"] = value
                 self.last.write_text(json.dumps(summary))
                 code, _, checks = self.report()
-                self.assertEqual(code, 2 if expected == 'error' else 0)
-                self.assertEqual(checks['last_run']['status'], expected)
+                self.assertEqual(code, 2 if expected == "error" else 0)
+                self.assertEqual(checks["last_run"]["status"], expected)
                 if value is None:
-                    self.assertNotIn('unknown_request_count', checks['last_run']['data'])
+                    self.assertNotIn("unknown_request_count", checks["last_run"]["data"])
                 else:
-                    self.assertEqual(checks['last_run']['data']['unknown_request_count'], value)
-        for invalid in (True, False, -1, '1', 1.0, None, [], {}):
+                    self.assertEqual(checks["last_run"]["data"]["unknown_request_count"], value)
+        for invalid in (True, False, -1, "1", 1.0, None, [], {}):
             with self.subTest(invalid=invalid):
                 self.last.write_text(json.dumps(dict(base, unknown_request_count=invalid)))
                 code, _, checks = self.report()
                 self.assertEqual(code, 2)
-                self.assertIn('结构无效', checks['last_run']['message'])
-                self.assertNotIn('data', checks['last_run'])
+                self.assertIn("结构无效", checks["last_run"]["message"])
+                self.assertNotIn("data", checks["last_run"])
 
     def test_invalid_local_status_counts_are_errors_without_private_details(self):
-        for counts in (None, [], {SECRET: 1}, {'uncertain': -1}, {'uncertain': True},
-                       {'verified': '1'}, {'verified': 1.5}, {'verified': {}}, {'verified': None}):
+        for counts in (
+            None,
+            [],
+            {SECRET: 1},
+            {"uncertain": -1},
+            {"uncertain": True},
+            {"verified": "1"},
+            {"verified": 1.5},
+            {"verified": {}},
+            {"verified": None},
+        ):
             with self.subTest(counts=counts):
-                self.last.write_text(json.dumps({'run_at': h.now().isoformat(),
-                    'results': {}, 'local_status_counts': counts}))
+                self.last.write_text(
+                    json.dumps(
+                        {
+                            "run_at": hg_runtime.now().isoformat(),
+                            "results": {},
+                            "local_status_counts": counts,
+                        }
+                    )
+                )
                 code, _, checks = self.report()
                 self.assertEqual(code, 2)
-                self.assertEqual(checks['last_run']['status'], 'error')
-                self.assertNotIn('data', checks['last_run'])
+                self.assertEqual(checks["last_run"]["status"], "error")
+                self.assertNotIn("data", checks["last_run"])
 
     def test_stale_summary_keeps_uncertain_error_and_task_hint(self):
-        self.last.write_text(json.dumps({'run_at': (h.now() - timedelta(hours=3)).isoformat(),
-                                        'results': {SECRET: 'uncertain'}}))
+        self.last.write_text(
+            json.dumps(
+                {
+                    "run_at": (hg_runtime.now() - timedelta(hours=3)).isoformat(),
+                    "results": {SECRET: "uncertain"},
+                }
+            )
+        )
         code, _, checks = self.report()
         self.assertEqual(code, 2)
-        self.assertEqual(checks['last_run']['status'], 'error')
-        self.assertIn('超过两小时', checks['last_run']['hint'])
-        self.assertIn('核对', checks['last_run']['hint'])
-        self.assertEqual(checks['last_run']['data']['results'], {'uncertain': 1})
+        self.assertEqual(checks["last_run"]["status"], "error")
+        self.assertIn("超过两小时", checks["last_run"]["hint"])
+        self.assertIn("核对", checks["last_run"]["hint"])
+        self.assertEqual(checks["last_run"]["data"]["results"], {"uncertain": 1})
 
     def test_disabled_sync_keeps_recent_uncertain_summary_visible(self):
-        self.cfg['enabled'] = False
+        self.cfg["enabled"] = False
         self.save_config()
-        for outcome in ('inflight', 'uncertain', 'repair_uncertain'):
+        for outcome in ("inflight", "uncertain", "repair_uncertain"):
             with self.subTest(outcome=outcome):
-                self.last.write_text(json.dumps({'run_at': h.now().isoformat(), 'results': {SECRET: outcome}}))
+                self.last.write_text(
+                    json.dumps(
+                        {"run_at": hg_runtime.now().isoformat(), "results": {SECRET: outcome}}
+                    )
+                )
                 code, report, checks = self.report()
                 self.assertEqual(code, 2)
-                self.assertEqual(report['status'], 'error')
-                self.assertEqual(checks['last_run']['status'], 'error')
+                self.assertEqual(report["status"], "error")
+                self.assertEqual(checks["last_run"]["status"], "error")
 
     def test_run_summary_future_tolerance_and_stale_boundary(self):
-        current = h.now()
-        other_zone = h.aware('2026-10-02T10:00:00+08:00').tzinfo
-        cases = [(timedelta(minutes=10), h.UTC, {}, 'info'),
-                 (timedelta(minutes=10), other_zone, {}, 'info'),
-                 (timedelta(minutes=10, microseconds=1), h.UTC, {}, 'error'),
-                 (timedelta(days=30), other_zone, {}, 'error'),
-                 (-timedelta(hours=2), h.UTC, {}, 'info'),
-                 (-timedelta(hours=2, microseconds=1), h.UTC, {}, 'warn'),
-                 (timedelta(minutes=10), h.UTC, {SECRET: 'uncertain'}, 'error')]
+        current = hg_runtime.now()
+        other_zone = hg_domain.aware("2026-10-02T10:00:00+08:00").tzinfo
+        cases = [
+            (timedelta(minutes=10), hg_std_UTC, {}, "info"),
+            (timedelta(minutes=10), other_zone, {}, "info"),
+            (timedelta(minutes=10, microseconds=1), hg_std_UTC, {}, "error"),
+            (timedelta(days=30), other_zone, {}, "error"),
+            (-timedelta(hours=2), hg_std_UTC, {}, "info"),
+            (-timedelta(hours=2, microseconds=1), hg_std_UTC, {}, "warn"),
+            (timedelta(minutes=10), hg_std_UTC, {SECRET: "uncertain"}, "error"),
+        ]
         for skew, zone, results, expected in cases:
             with self.subTest(skew=skew, zone=zone, results=results):
                 stamp = (current + skew).astimezone(zone).isoformat()
-                self.last.write_text(json.dumps({'run_at': stamp, 'results': results}))
-                with patch.object(h, 'now', return_value=current):
+                self.last.write_text(json.dumps({"run_at": stamp, "results": results}))
+                with patch.object(hg_runtime, "now", return_value=current):
                     code, _, checks = self.report()
-                check = checks['last_run']
-                self.assertEqual(code, 2 if expected == 'error' else 0)
-                self.assertEqual(check['status'], expected)
+                check = checks["last_run"]
+                self.assertEqual(code, 2 if expected == "error" else 0)
+                self.assertEqual(check["status"], expected)
                 if skew > timedelta(minutes=10):
-                    self.assertIn('Mac 时间', check['hint'])
-                    self.assertIn('state/last_run.json', check['hint'])
-                    self.assertNotIn('data', check)
+                    self.assertIn("Mac 时间", check["hint"])
+                    self.assertIn("state/last_run.json", check["hint"])
+                    self.assertNotIn("data", check)
                 elif results:
-                    self.assertIn('未确定', check['message'])
+                    self.assertIn("未确定", check["message"])
                 else:
-                    self.assertEqual('超过两小时' in check.get('hint', ''), expected == 'warn')
+                    self.assertEqual("超过两小时" in check.get("hint", ""), expected == "warn")
 
     def test_attempt_start_and_finish_share_future_tolerance(self):
-        current = h.now()
-        other_zone = h.aware('2026-10-02T10:00:00+08:00').tzinfo
-        paths = ((self.state / 'last_attempt.json', 'sync', 'last_attempt'),
-                 (self.agent_attempt, 'run', 'last_agent_attempt'))
-        cases = [('running', 'started_at', timedelta(minutes=10), 'warn'),
-                 ('running', 'started_at', timedelta(minutes=10, microseconds=1), 'error'),
-                 ('completed', 'finished_at', timedelta(minutes=10), 'info'),
-                 ('completed', 'finished_at', timedelta(minutes=10, microseconds=1), 'error'),
-                 ('completed', 'started_at', timedelta(days=30), 'error'),
-                 ('failed', 'finished_at', timedelta(minutes=10), 'error'),
-                 ('interrupted', 'finished_at', timedelta(minutes=10), 'error')]
+        current = hg_runtime.now()
+        other_zone = hg_domain.aware("2026-10-02T10:00:00+08:00").tzinfo
+        paths = (
+            (self.state / "last_attempt.json", "sync", "last_attempt"),
+            (self.agent_attempt, "run", "last_agent_attempt"),
+        )
+        cases = [
+            ("running", "started_at", timedelta(minutes=10), "warn"),
+            ("running", "started_at", timedelta(minutes=10, microseconds=1), "error"),
+            ("completed", "finished_at", timedelta(minutes=10), "info"),
+            ("completed", "finished_at", timedelta(minutes=10, microseconds=1), "error"),
+            ("completed", "started_at", timedelta(days=30), "error"),
+            ("failed", "finished_at", timedelta(minutes=10), "error"),
+            ("interrupted", "finished_at", timedelta(minutes=10), "error"),
+        ]
         for path, stage, identifier in paths:
-            if identifier == 'last_agent_attempt':
-                (self.state / 'last_attempt.json').unlink()
+            if identifier == "last_agent_attempt":
+                (self.state / "last_attempt.json").unlink()
             for outcome, field, skew, expected in cases:
                 with self.subTest(identifier=identifier, outcome=outcome, field=field, skew=skew):
                     stamp = (current + skew).astimezone(other_zone).isoformat()
-                    document = {'outcome': outcome, 'stage': stage,
-                                'started_at': current.isoformat(),
-                                'finished_at': None if outcome == 'running' else current.isoformat(),
-                                'error_type': {'failed': 'OSError',
-                                               'interrupted': 'KeyboardInterrupt'}.get(outcome)}
+                    document = {
+                        "outcome": outcome,
+                        "stage": stage,
+                        "started_at": current.isoformat(),
+                        "finished_at": None if outcome == "running" else current.isoformat(),
+                        "error_type": {"failed": "OSError", "interrupted": "KeyboardInterrupt"}.get(
+                            outcome
+                        ),
+                    }
                     document[field] = stamp
-                    if field == 'started_at' and outcome != 'running':
-                        document['finished_at'] = stamp
+                    if field == "started_at" and outcome != "running":
+                        document["finished_at"] = stamp
                     path.write_text(json.dumps(document))
-                    with patch.object(h, 'now', return_value=current):
+                    with patch.object(hg_runtime, "now", return_value=current):
                         code, _, checks = self.report()
                     check = checks[identifier]
-                    self.assertEqual(check['status'], expected)
-                    self.assertEqual(code, 2 if expected == 'error' else 0)
+                    self.assertEqual(check["status"], expected)
+                    self.assertEqual(code, 2 if expected == "error" else 0)
                     if skew > timedelta(minutes=10):
-                        self.assertIn('Mac 时间', check['hint'])
-                        self.assertIn('state/' + path.name, check['hint'])
-                        self.assertNotIn('data', check)
-                    elif outcome in ('failed', 'interrupted'):
-                        self.assertIn('失败' if outcome == 'failed' else '中断', check['message'])
-                    elif outcome == 'running':
-                        self.assertIsNone(check['data']['finished_at'])
+                        self.assertIn("Mac 时间", check["hint"])
+                        self.assertIn("state/" + path.name, check["hint"])
+                        self.assertNotIn("data", check)
+                    elif outcome in ("failed", "interrupted"):
+                        self.assertIn("失败" if outcome == "failed" else "中断", check["message"])
+                    elif outcome == "running":
+                        self.assertIsNone(check["data"]["finished_at"])
 
     def test_disabled_future_evidence_is_error_in_json_and_text_reports(self):
-        self.cfg['enabled'] = False
+        self.cfg["enabled"] = False
         self.save_config()
-        current = h.now()
+        current = hg_runtime.now()
         future = (current + timedelta(days=30)).isoformat()
-        self.last.write_text(json.dumps({'run_at': future, 'results': {SECRET: 'verified'}}))
-        for path, stage in ((self.state / 'last_attempt.json', 'sync'), (self.agent_attempt, 'run')):
-            path.write_text(json.dumps({'outcome': 'completed', 'stage': stage,
-                'started_at': future, 'finished_at': future, 'error_type': None}))
-        with patch.object(h, 'now', return_value=current):
+        self.last.write_text(json.dumps({"run_at": future, "results": {SECRET: "verified"}}))
+        for path, stage in (
+            (self.state / "last_attempt.json", "sync"),
+            (self.agent_attempt, "run"),
+        ):
+            path.write_text(
+                json.dumps(
+                    {
+                        "outcome": "completed",
+                        "stage": stage,
+                        "started_at": future,
+                        "finished_at": future,
+                        "error_type": None,
+                    }
+                )
+            )
+        with patch.object(hg_runtime, "now", return_value=current):
             code, _, checks = self.report()
-            text_code, output = self.invoke('doctor')
+            text_code, output = self.invoke("doctor")
         self.assertEqual(code, 2)
         self.assertEqual(text_code, 2)
-        for identifier in ('last_run', 'last_attempt', 'last_agent_attempt'):
-            self.assertEqual(checks[identifier]['status'], 'error')
-            self.assertIn('Mac 时间', checks[identifier]['hint'])
-            self.assertIn('state/' + identifier + '.json', checks[identifier]['hint'])
-            self.assertNotIn('data', checks[identifier])
+        for identifier in ("last_run", "last_attempt", "last_agent_attempt"):
+            self.assertEqual(checks[identifier]["status"], "error")
+            self.assertIn("Mac 时间", checks[identifier]["hint"])
+            self.assertIn("state/" + identifier + ".json", checks[identifier]["hint"])
+            self.assertNotIn("data", checks[identifier])
         self.assertNotIn(future, output)
-        self.assertNotIn('已停止', output)
+        self.assertNotIn("已停止", output)
 
     def test_fresh_manual_run_does_not_hide_stale_background_entry(self):
-        current = h.now()
-        self.last.write_text(json.dumps({'run_at': current.isoformat(), 'results': {SECRET: 'verified'}}))
-        for age, severity in ((timedelta(hours=2), 'info'),
-                              (timedelta(hours=2, seconds=1), 'warn')):
+        current = hg_runtime.now()
+        self.last.write_text(
+            json.dumps({"run_at": current.isoformat(), "results": {SECRET: "verified"}})
+        )
+        for age, severity in (
+            (timedelta(hours=2), "info"),
+            (timedelta(hours=2, seconds=1), "warn"),
+        ):
             with self.subTest(age=age):
                 stamp = (current - age).isoformat()
-                self.agent_attempt.write_text(json.dumps({'outcome': 'completed', 'started_at': stamp,
-                    'finished_at': stamp, 'stage': 'run', 'error_type': None}))
-                with patch.object(h, 'now', return_value=current):
+                self.agent_attempt.write_text(
+                    json.dumps(
+                        {
+                            "outcome": "completed",
+                            "started_at": stamp,
+                            "finished_at": stamp,
+                            "stage": "run",
+                            "error_type": None,
+                        }
+                    )
+                )
+                with patch.object(hg_runtime, "now", return_value=current):
                     code, report, checks = self.report()
                 self.assertEqual(code, 0)
-                self.assertEqual(checks['agent_service']['status'], 'ok')
-                self.assertEqual(checks['last_run']['status'], 'info')
-                self.assertEqual(checks['last_agent_attempt']['status'], severity)
-                self.assertEqual(report['status'], 'warning' if severity == 'warn' else 'ok')
-                if severity == 'warn':
-                    self.assertIn('超过两小时', checks['last_agent_attempt']['hint'])
+                self.assertEqual(checks["agent_service"]["status"], "ok")
+                self.assertEqual(checks["last_run"]["status"], "info")
+                self.assertEqual(checks["last_agent_attempt"]["status"], severity)
+                self.assertEqual(report["status"], "warning" if severity == "warn" else "ok")
+                if severity == "warn":
+                    self.assertIn("超过两小时", checks["last_agent_attempt"]["hint"])
 
     def test_stale_background_failure_keeps_error_and_disabled_entry_has_no_age_reminder(self):
-        stamp = (h.now() - timedelta(days=2)).isoformat()
+        stamp = (hg_runtime.now() - timedelta(days=2)).isoformat()
         for enabled in (True, False):
-            self.cfg['enabled'] = enabled
+            self.cfg["enabled"] = enabled
             self.save_config()
-            for outcome in ('completed', 'failed', 'interrupted'):
+            for outcome in ("completed", "failed", "interrupted"):
                 with self.subTest(enabled=enabled, outcome=outcome):
-                    self.agent_attempt.write_text(json.dumps({'outcome': outcome, 'started_at': stamp,
-                        'finished_at': stamp, 'stage': 'run',
-                        'error_type': {'completed': None, 'failed': 'OSError',
-                                       'interrupted': 'KeyboardInterrupt'}[outcome]}))
+                    self.agent_attempt.write_text(
+                        json.dumps(
+                            {
+                                "outcome": outcome,
+                                "started_at": stamp,
+                                "finished_at": stamp,
+                                "stage": "run",
+                                "error_type": {
+                                    "completed": None,
+                                    "failed": "OSError",
+                                    "interrupted": "KeyboardInterrupt",
+                                }[outcome],
+                            }
+                        )
+                    )
                     code, _, checks = self.report()
-                    check = checks['last_agent_attempt']
-                    self.assertEqual(code, 0 if outcome == 'completed' else 2)
-                    self.assertEqual(check['status'], 'warn' if enabled and outcome == 'completed'
-                                     else 'info' if outcome == 'completed' else 'error')
-                    self.assertEqual('hint' in check, enabled)
+                    check = checks["last_agent_attempt"]
+                    self.assertEqual(code, 0 if outcome == "completed" else 2)
+                    self.assertEqual(
+                        check["status"],
+                        "warn"
+                        if enabled and outcome == "completed"
+                        else "info"
+                        if outcome == "completed"
+                        else "error",
+                    )
+                    self.assertEqual("hint" in check, enabled)
 
     def test_stale_unfinished_entry_only_reminds_without_claiming_it_stopped(self):
-        stamp = (h.now() - timedelta(hours=3)).isoformat()
-        self.agent_attempt.write_text(json.dumps({'outcome': 'running', 'started_at': stamp,
-            'finished_at': None, 'stage': 'run', 'error_type': None}))
+        stamp = (hg_runtime.now() - timedelta(hours=3)).isoformat()
+        self.agent_attempt.write_text(
+            json.dumps(
+                {
+                    "outcome": "running",
+                    "started_at": stamp,
+                    "finished_at": None,
+                    "stage": "run",
+                    "error_type": None,
+                }
+            )
+        )
         code, _, checks = self.report()
-        check = checks['last_agent_attempt']
+        check = checks["last_agent_attempt"]
         self.assertEqual(code, 0)
-        self.assertEqual(check['status'], 'warn')
-        self.assertIn('可能仍在运行或曾被中断', check['message'])
-        self.assertIn('超过两小时', check['hint'])
+        self.assertEqual(check["status"], "warn")
+        self.assertIn("可能仍在运行或曾被中断", check["message"])
+        self.assertIn("超过两小时", check["hint"])
 
     def test_recent_entry_finish_is_fresh_even_when_it_started_hours_ago(self):
-        current = h.now()
-        self.agent_attempt.write_text(json.dumps({'outcome': 'completed',
-            'started_at': (current - timedelta(hours=3)).isoformat(),
-            'finished_at': current.isoformat(), 'stage': 'run', 'error_type': None}))
-        with patch.object(h, 'now', return_value=current):
+        current = hg_runtime.now()
+        self.agent_attempt.write_text(
+            json.dumps(
+                {
+                    "outcome": "completed",
+                    "started_at": (current - timedelta(hours=3)).isoformat(),
+                    "finished_at": current.isoformat(),
+                    "stage": "run",
+                    "error_type": None,
+                }
+            )
+        )
+        with patch.object(hg_runtime, "now", return_value=current):
             code, report, checks = self.report()
         self.assertEqual(code, 0)
-        self.assertEqual(report['status'], 'ok')
-        self.assertEqual(checks['last_agent_attempt']['status'], 'info')
-        self.assertNotIn('hint', checks['last_agent_attempt'])
+        self.assertEqual(report["status"], "ok")
+        self.assertEqual(checks["last_agent_attempt"]["status"], "info")
+        self.assertNotIn("hint", checks["last_agent_attempt"])
 
     def test_excessively_nested_local_json_is_reported_without_traceback(self):
-        nested = '[' * 2000 + '0' + ']' * 2000
-        for path, identifier in ((self.config_path, 'config'), (self.last, 'last_run'), (self.export, 'inbox')):
+        nested = "[" * 2000 + "0" + "]" * 2000
+        for path, identifier in (
+            (self.config_path, "config"),
+            (self.last, "last_run"),
+            (self.export, "inbox"),
+        ):
             with self.subTest(identifier=identifier):
                 original = path.read_bytes()
                 path.write_text(nested)
                 result, _, checks = self.report()
                 self.assertEqual(result, 2)
-                self.assertEqual(checks[identifier]['status'], 'error')
+                self.assertEqual(checks[identifier]["status"], "error")
                 path.write_bytes(original)
 
     def test_journals_count_unfinished_without_printing_ids_and_malformed_evidence_errors(self):
-        operations = self.state / 'operations'
+        operations = self.state / "operations"
         operations.mkdir()
-        path = operations / 'job.json'
-        path.write_text(json.dumps({'phase': 'uncertain', 'key': SECRET, 'payload': SECRET}))
+        path = operations / "job.json"
+        path.write_text(json.dumps({"phase": "uncertain", "key": SECRET, "payload": SECRET}))
         result, _, checks = self.report()
         self.assertEqual(result, 0)
-        self.assertEqual(checks['operations']['data'], {'total': 1, 'unfinished': 1, 'failed_checks': 0})
-        for content in ('{"private":"' + SECRET + '",', json.dumps({'phase': [], 'key': SECRET})):
+        self.assertEqual(
+            checks["operations"]["data"], {"total": 1, "unfinished": 1, "failed_checks": 0}
+        )
+        for content in ('{"private":"' + SECRET + '",', json.dumps({"phase": [], "key": SECRET})):
             path.write_text(content)
             result, _, checks = self.report()
             self.assertEqual(result, 2)
-            self.assertEqual(checks['operations']['status'], 'error')
+            self.assertEqual(checks["operations"]["status"], "error")
 
     def test_journal_verification_severity_keeps_historical_phase_and_unfinished_count(self):
-        operations = self.state / 'operations'
+        operations = self.state / "operations"
         operations.mkdir()
-        path = operations / 'job.json'
+        path = operations / "job.json"
         for phase in sorted(d.PHASES):
             for passed in (False, True):
                 with self.subTest(phase=phase, passed=passed):
-                    path.write_text(json.dumps({'phase': phase, 'key': SECRET,
-                        'last_checked_at': h.now().isoformat(), 'last_check_passed': passed}))
+                    path.write_text(
+                        json.dumps(
+                            {
+                                "phase": phase,
+                                "key": SECRET,
+                                "last_checked_at": hg_runtime.now().isoformat(),
+                                "last_check_passed": passed,
+                            }
+                        )
+                    )
                     previous = path.read_bytes()
                     code, _, checks = self.report()
                     unfinished = int(phase not in d.TERMINAL_PHASES)
-                    severity = 'error' if not passed else 'warn' if unfinished else 'ok'
+                    severity = "error" if not passed else "warn" if unfinished else "ok"
                     self.assertEqual(code, 0 if passed else 2)
-                    self.assertEqual(checks['operations']['status'], severity)
-                    self.assertEqual(checks['operations']['data'], {'total': 1,
-                        'unfinished': unfinished, 'failed_checks': int(not passed)})
+                    self.assertEqual(checks["operations"]["status"], severity)
+                    self.assertEqual(
+                        checks["operations"]["data"],
+                        {"total": 1, "unfinished": unfinished, "failed_checks": int(not passed)},
+                    )
                     self.assertEqual(path.read_bytes(), previous)
 
     def test_invalid_journal_verification_is_reported_without_raw_values(self):
-        operations = self.state / 'operations'
+        operations = self.state / "operations"
         operations.mkdir()
-        path = operations / 'job.json'
-        stamp = h.now().isoformat()
-        cases = [{'last_checked_at': stamp}, {'last_check_passed': False},
-                 {'last_checked_at': None, 'last_check_passed': False},
-                 {'last_checked_at': [], 'last_check_passed': False},
-                 {'last_checked_at': SECRET, 'last_check_passed': False},
-                 {'last_checked_at': '2026-10-02T12:00:00', 'last_check_passed': True}]
-        cases += [{'last_checked_at': stamp, 'last_check_passed': value}
-                  for value in (None, 0, 1, 'false', SECRET, [], {})]
+        path = operations / "job.json"
+        stamp = hg_runtime.now().isoformat()
+        cases = [
+            {"last_checked_at": stamp},
+            {"last_check_passed": False},
+            {"last_checked_at": None, "last_check_passed": False},
+            {"last_checked_at": [], "last_check_passed": False},
+            {"last_checked_at": SECRET, "last_check_passed": False},
+            {"last_checked_at": "2026-10-02T12:00:00", "last_check_passed": True},
+        ]
+        cases += [
+            {"last_checked_at": stamp, "last_check_passed": value}
+            for value in (None, 0, 1, "false", SECRET, [], {})
+        ]
         for fields in cases:
             with self.subTest(fields=fields):
-                path.write_text(json.dumps({'phase': 'verified', 'key': SECRET, **fields}))
+                path.write_text(json.dumps({"phase": "verified", "key": SECRET, **fields}))
                 code, _, checks = self.report()
                 self.assertEqual(code, 2)
-                self.assertEqual(checks['operations']['status'], 'error')
-                self.assertNotIn('data', checks['operations'])
+                self.assertEqual(checks["operations"]["status"], "error")
+                self.assertNotIn("data", checks["operations"])
 
     def test_invalid_last_run_does_not_emit_raw_result_and_old_heartbeat_only_warns(self):
-        for content in ('not JSON ' + SECRET, json.dumps({'run_at': h.now().isoformat(), 'results': {'id': SECRET}})):
+        for content in (
+            "not JSON " + SECRET,
+            json.dumps({"run_at": hg_runtime.now().isoformat(), "results": {"id": SECRET}}),
+        ):
             self.last.write_text(content)
             result, _, checks = self.report()
             self.assertEqual(result, 2)
-            self.assertEqual(checks['last_run']['status'], 'error')
-        self.last.write_text(json.dumps({'run_at': (h.now() - timedelta(hours=3)).isoformat(), 'results': {}}))
+            self.assertEqual(checks["last_run"]["status"], "error")
+        self.last.write_text(
+            json.dumps(
+                {"run_at": (hg_runtime.now() - timedelta(hours=3)).isoformat(), "results": {}}
+            )
+        )
         result, _, checks = self.report()
         self.assertEqual(result, 0)
-        self.assertEqual(checks['last_run']['status'], 'warn')
+        self.assertEqual(checks["last_run"]["status"], "warn")
 
     def test_historical_replacement_reports_newer_source_without_claiming_remote_absence(self):
-        self.cfg['enabled'] = False
+        self.cfg["enabled"] = False
         self.save_config()
-        summary = {'kind': 'full_replacement', 'phase': 'verified',
-                   'finished_at': '2020-02-19T00:00:00+00:00',
-                   'source_measurements': 0, 'remote_measurements': 0,
-                   'matched': 0, 'extra': 0, 'backup': SECRET, 'payload': SECRET}
+        summary = {
+            "kind": "full_replacement",
+            "phase": "verified",
+            "finished_at": "2020-02-19T00:00:00+00:00",
+            "source_measurements": 0,
+            "remote_measurements": 0,
+            "matched": 0,
+            "extra": 0,
+            "backup": SECRET,
+            "payload": SECRET,
+        }
         self.last.write_text(json.dumps(summary))
         code, _, checks = self.report()
         self.assertEqual(code, 0)
-        self.assertEqual(checks['last_run']['status'], 'info')
-        self.assertIn('历史完整替换', checks['last_run']['message'])
-        fresh = checks['source_freshness']
-        self.assertEqual(fresh['status'], 'warn')
-        self.assertEqual(fresh['data']['source_measurements'], 1)
-        self.assertEqual(fresh['data']['historically_verified_measurements'], 0)
-        self.assertEqual(fresh['data']['measurement_count_difference'], 1)
-        self.assertIn('不表示 Garmin 缺失', fresh['hint'])
-        summary['finished_at'] = '2020-02-21T00:00:00+00:00'
+        self.assertEqual(checks["last_run"]["status"], "info")
+        self.assertIn("历史完整替换", checks["last_run"]["message"])
+        fresh = checks["source_freshness"]
+        self.assertEqual(fresh["status"], "warn")
+        self.assertEqual(fresh["data"]["source_measurements"], 1)
+        self.assertEqual(fresh["data"]["historically_verified_measurements"], 0)
+        self.assertEqual(fresh["data"]["measurement_count_difference"], 1)
+        self.assertIn("不表示 Garmin 缺失", fresh["hint"])
+        summary["finished_at"] = "2020-02-21T00:00:00+00:00"
         self.last.write_text(json.dumps(summary))
         _, _, checks = self.report()
-        self.assertNotIn('source_freshness', checks)
+        self.assertNotIn("source_freshness", checks)
 
     def test_historical_replacement_rejects_invalid_counts_phase_and_time(self):
-        summary = {'kind': 'full_replacement', 'phase': 'verified',
-                   'finished_at': h.now().isoformat(), 'source_measurements': 1,
-                   'remote_measurements': 1, 'matched': 1, 'extra': 0}
-        cases = [('source_measurements', True), ('matched', -1), ('matched', 0),
-                 ('remote_measurements', 2), ('extra', SECRET), ('phase', 'uncertain'),
-                 ('finished_at', SECRET),
-                 ('finished_at', (h.now() + timedelta(hours=1)).isoformat())]
+        summary = {
+            "kind": "full_replacement",
+            "phase": "verified",
+            "finished_at": hg_runtime.now().isoformat(),
+            "source_measurements": 1,
+            "remote_measurements": 1,
+            "matched": 1,
+            "extra": 0,
+        }
+        cases = [
+            ("source_measurements", True),
+            ("matched", -1),
+            ("matched", 0),
+            ("remote_measurements", 2),
+            ("extra", SECRET),
+            ("phase", "uncertain"),
+            ("finished_at", SECRET),
+            ("finished_at", (hg_runtime.now() + timedelta(hours=1)).isoformat()),
+        ]
         for key, value in cases:
             with self.subTest(key=key, value=value):
                 self.last.write_text(json.dumps({**summary, key: value}))
                 code, _, checks = self.report()
                 self.assertEqual(code, 2)
-                self.assertEqual(checks['last_run']['status'], 'error')
-                self.assertNotIn('data', checks['last_run'])
-                self.assertNotIn('source_freshness', checks)
-        self.last.write_text(json.dumps({**summary, 'extra': 1, 'remote_measurements': 2}))
+                self.assertEqual(checks["last_run"]["status"], "error")
+                self.assertNotIn("data", checks["last_run"])
+                self.assertNotIn("source_freshness", checks)
+        self.last.write_text(json.dumps({**summary, "extra": 1, "remote_measurements": 2}))
         code, _, checks = self.report()
         self.assertEqual(code, 2)
-        self.assertEqual(checks['last_run']['status'], 'error')
-        self.assertNotIn('data', checks['last_run'])
-        self.assertNotIn('source_freshness', checks)
+        self.assertEqual(checks["last_run"]["status"], "error")
+        self.assertNotIn("data", checks["last_run"])
+        self.assertNotIn("source_freshness", checks)
 
     def test_newer_export_also_warns_for_modern_summary_without_inventing_pending_count(self):
-        self.last.write_text(json.dumps({'run_at': '2020-02-19T00:00:00+00:00',
-                                         'results': {SECRET: 'verified'}}))
+        self.last.write_text(
+            json.dumps({"run_at": "2020-02-19T00:00:00+00:00", "results": {SECRET: "verified"}})
+        )
         _, _, checks = self.report()
-        fresh = checks['source_freshness']
-        self.assertEqual(fresh['status'], 'warn')
-        self.assertEqual(fresh['data']['source_measurements'], 1)
-        self.assertNotIn('measurement_count_difference', fresh['data'])
-        self.assertNotIn('pending', fresh['data'])
-        code, output = self.invoke('doctor')
+        fresh = checks["source_freshness"]
+        self.assertEqual(fresh["status"], "warn")
+        self.assertEqual(fresh["data"]["source_measurements"], 1)
+        self.assertNotIn("measurement_count_difference", fresh["data"])
+        self.assertNotIn("pending", fresh["data"])
+        code, output = self.invoke("doctor")
         self.assertEqual(code, 0)
-        self.assertIn('不表示 Garmin 缺失', output)
+        self.assertIn("不表示 Garmin 缺失", output)
 
     def test_historical_closed_operations_allow_timestamp_without_modern_result(self):
-        operations = self.state / 'operations'
+        operations = self.state / "operations"
         operations.mkdir()
-        path = operations / 'job.json'
-        for phase in ('verified', 'closed_partial'):
+        path = operations / "job.json"
+        for phase in ("verified", "closed_partial"):
             with self.subTest(phase=phase):
-                path.write_text(json.dumps({'type': 'full_replacement', 'phase': phase,
-                    'key': SECRET, 'last_checked_at': h.now().isoformat(),
-                    'verification': {'matched': 1, 'target_count': 1, 'remote_count': 1, 'extra': 0}}))
+                path.write_text(
+                    json.dumps(
+                        {
+                            "type": "full_replacement",
+                            "phase": phase,
+                            "key": SECRET,
+                            "last_checked_at": hg_runtime.now().isoformat(),
+                            "verification": {
+                                "matched": 1,
+                                "target_count": 1,
+                                "remote_count": 1,
+                                "extra": 0,
+                            },
+                        }
+                    )
+                )
                 code, _, checks = self.report()
                 self.assertEqual(code, 0)
-                self.assertEqual(checks['operations']['status'], 'ok')
-                self.assertEqual(checks['operations']['data']['unfinished'], 0)
-                self.assertEqual(checks['historical_operations']['data'], {'count': 1})
-        for phase, stamp in [('uncertain', h.now().isoformat()),
-                             ('verified', SECRET),
-                             ('verified', (h.now() + timedelta(hours=1)).isoformat())]:
+                self.assertEqual(checks["operations"]["status"], "ok")
+                self.assertEqual(checks["operations"]["data"]["unfinished"], 0)
+                self.assertEqual(checks["historical_operations"]["data"], {"count": 1})
+        for phase, stamp in [
+            ("uncertain", hg_runtime.now().isoformat()),
+            ("verified", SECRET),
+            ("verified", (hg_runtime.now() + timedelta(hours=1)).isoformat()),
+        ]:
             with self.subTest(phase=phase, stamp=stamp):
-                path.write_text(json.dumps({'type': 'full_replacement', 'phase': phase,
-                                           'key': SECRET, 'last_checked_at': stamp}))
+                path.write_text(
+                    json.dumps(
+                        {
+                            "type": "full_replacement",
+                            "phase": phase,
+                            "key": SECRET,
+                            "last_checked_at": stamp,
+                        }
+                    )
+                )
                 code, _, checks = self.report()
                 self.assertEqual(code, 2)
-                self.assertEqual(checks['operations']['status'], 'error')
+                self.assertEqual(checks["operations"]["status"], "error")
 
     def test_historical_verification_counts_override_closed_phase_after_failed_readback(self):
-        operations = self.state / 'operations'
+        operations = self.state / "operations"
         operations.mkdir()
-        path = operations / 'job.json'
-        counts = {'matched': 2, 'target_count': 2, 'remote_count': 2, 'extra': 0}
-        for phase in ('verified', 'closed_partial'):
-            for changes in ({'matched': 1}, {'remote_count': 1}, {'remote_count': 3}, {'extra': 1}):
+        path = operations / "job.json"
+        counts = {"matched": 2, "target_count": 2, "remote_count": 2, "extra": 0}
+        for phase in ("verified", "closed_partial"):
+            for changes in ({"matched": 1}, {"remote_count": 1}, {"remote_count": 3}, {"extra": 1}):
                 with self.subTest(phase=phase, changes=changes):
-                    path.write_text(json.dumps({'type': 'full_replacement', 'phase': phase,
-                        'key': SECRET, 'last_checked_at': h.now().isoformat(),
-                        'verification': {**counts, **changes}}))
+                    path.write_text(
+                        json.dumps(
+                            {
+                                "type": "full_replacement",
+                                "phase": phase,
+                                "key": SECRET,
+                                "last_checked_at": hg_runtime.now().isoformat(),
+                                "verification": {**counts, **changes},
+                            }
+                        )
+                    )
                     code, _, checks = self.report()
                     self.assertEqual(code, 2)
-                    self.assertEqual(checks['operations']['status'], 'error')
-                    self.assertEqual(checks['operations']['data'],
-                                     {'total': 1, 'unfinished': 0, 'failed_checks': 1})
-        invalid = [None, SECRET, {}, {**counts, 'matched': True},
-                   {**counts, 'extra': -1}, {**counts, 'matched': SECRET},
-                   {**counts, 'payload': SECRET}]
+                    self.assertEqual(checks["operations"]["status"], "error")
+                    self.assertEqual(
+                        checks["operations"]["data"],
+                        {"total": 1, "unfinished": 0, "failed_checks": 1},
+                    )
+        invalid = [
+            None,
+            SECRET,
+            {},
+            {**counts, "matched": True},
+            {**counts, "extra": -1},
+            {**counts, "matched": SECRET},
+            {**counts, "payload": SECRET},
+        ]
         for verification in invalid:
             with self.subTest(verification=verification):
-                path.write_text(json.dumps({'type': 'full_replacement', 'phase': 'verified',
-                    'key': SECRET, 'last_checked_at': h.now().isoformat(), 'verification': verification}))
+                path.write_text(
+                    json.dumps(
+                        {
+                            "type": "full_replacement",
+                            "phase": "verified",
+                            "key": SECRET,
+                            "last_checked_at": hg_runtime.now().isoformat(),
+                            "verification": verification,
+                        }
+                    )
+                )
                 code, _, checks = self.report()
                 self.assertEqual(code, 2)
-                self.assertEqual(checks['operations']['status'], 'error')
-                self.assertNotIn('data', checks['operations'])
+                self.assertEqual(checks["operations"]["status"], "error")
+                self.assertNotIn("data", checks["operations"])
 
     def test_malformed_plist_and_runtime_paths_are_errors_without_value_dump(self):
-        self.plist.write_text('<plist><dict>' + SECRET)
+        self.plist.write_text("<plist><dict>" + SECRET)
         result, _, checks = self.report()
         self.assertEqual(result, 2)
-        self.assertEqual(checks['agent_plist']['status'], 'error')
-        for field, value in (('ProgramArguments', [SECRET]), ('WorkingDirectory', SECRET),
-                             ('StartInterval', 10), ('StandardOutPath', SECRET)):
+        self.assertEqual(checks["agent_plist"]["status"], "error")
+        for field, value in (
+            ("ProgramArguments", [SECRET]),
+            ("WorkingDirectory", SECRET),
+            ("StartInterval", 10),
+            ("StandardOutPath", SECRET),
+        ):
             with self.subTest(field=field):
-                doc = h.agent_plist()
+                doc = hg_launchagent.agent_plist()
                 doc[field] = value
                 self.plist.write_bytes(plistlib.dumps(doc))
                 result, _, checks = self.report()
                 self.assertEqual(result, 2)
-                self.assertIn(field, checks['agent_plist']['message'])
+                self.assertIn(field, checks["agent_plist"]["message"])
 
     def test_plist_program_override_is_reported_without_private_values(self):
-        for program in ('/bin/false', SECRET, False, 0, [], {}):
+        for program in ("/bin/false", SECRET, False, 0, [], {}):
             with self.subTest(program=program):
-                document = h.agent_plist()
-                document['Program'] = program
+                document = hg_launchagent.agent_plist()
+                document["Program"] = program
                 self.plist.write_bytes(plistlib.dumps(document))
                 code, _, checks = self.report()
                 self.assertEqual(code, 2)
-                self.assertEqual(checks['agent_plist']['status'], 'error')
-                self.assertIn('Program', checks['agent_plist']['message'])
-                self.assertIn('./hg install-agent', checks['agent_plist']['hint'])
-                code, output = self.invoke('doctor')
+                self.assertEqual(checks["agent_plist"]["status"], "error")
+                self.assertIn("Program", checks["agent_plist"]["message"])
+                self.assertIn("./health-garmin-sync install-agent", checks["agent_plist"]["hint"])
+                code, output = self.invoke("doctor")
                 self.assertEqual(code, 2)
-                self.assertIn('任务配置不匹配：Program', output)
-                self.assertNotIn('/bin/false', output)
+                self.assertIn("任务配置不匹配：Program", output)
+                self.assertNotIn("/bin/false", output)
 
     def test_plist_program_default_or_explicit_expected_interpreter_is_valid(self):
         for explicit in (False, True):
             with self.subTest(explicit=explicit):
-                document = h.agent_plist()
+                document = hg_launchagent.agent_plist()
                 if explicit:
-                    document['Program'] = document['ProgramArguments'][0]
-                document['Comment'] = SECRET
+                    document["Program"] = document["ProgramArguments"][0]
+                document["Comment"] = SECRET
                 self.plist.write_bytes(plistlib.dumps(document))
                 code, _, checks = self.report()
                 self.assertEqual(code, 0)
-                self.assertEqual(checks['agent_plist']['status'], 'ok')
-                code, output = self.invoke('doctor')
+                self.assertEqual(checks["agent_plist"]["status"], "ok")
+                code, output = self.invoke("doctor")
                 self.assertEqual(code, 0)
-                self.assertIn('LaunchAgent 配置与当前项目匹配', output)
+                self.assertIn("LaunchAgent 配置与当前项目匹配", output)
 
     def test_enabled_missing_plist_or_unloaded_service_is_error_with_install_hint(self):
         self.plist.unlink()
         result, _, checks = self.report()
         self.assertEqual(result, 2)
-        self.assertIn('./hg install-agent', checks['agent_plist']['hint'])
-        self.plist.write_bytes(plistlib.dumps(h.agent_plist()))
+        self.assertIn("./health-garmin-sync install-agent", checks["agent_plist"]["hint"])
+        self.plist.write_bytes(plistlib.dumps(hg_launchagent.agent_plist()))
         self.service.return_value.returncode = 1
         result, _, checks = self.report()
         self.assertEqual(result, 2)
-        self.assertEqual(checks['agent_plist']['status'], 'ok')
-        self.assertEqual(checks['agent_service']['status'], 'error')
+        self.assertEqual(checks["agent_plist"]["status"], "ok")
+        self.assertEqual(checks["agent_service"]["status"], "error")
 
     def test_service_timeout_and_unavailable_are_distinct_from_not_loaded(self):
-        for exception, diagnosis in ((subprocess.TimeoutExpired('launchctl', 5, SECRET, SECRET), '超时'),
-                                     (FileNotFoundError(SECRET), '不可用')):
+        for exception, diagnosis in (
+            (subprocess.TimeoutExpired("launchctl", 5, SECRET, SECRET), "超时"),
+            (FileNotFoundError(SECRET), "不可用"),
+        ):
             with self.subTest(exception=exception):
                 self.service.side_effect = exception
                 result, _, checks = self.report()
                 self.assertEqual(result, 2)
-                self.assertIn(diagnosis, checks['agent_service']['message'])
+                self.assertIn(diagnosis, checks["agent_service"]["message"])
 
     def test_nonmacos_skips_service_query(self):
-        with patch.object(sys, 'platform', 'linux'):
+        with patch.object(sys, "platform", "linux"):
             result, _, checks = self.report()
         self.assertEqual(result, 0)
-        self.assertEqual(checks['agent']['status'], 'info')
+        self.assertEqual(checks["agent"]["status"], "info")
         self.service.assert_not_called()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     unittest.main()

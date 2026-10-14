@@ -1,20 +1,32 @@
 """Configuration and CLI locking checks using only private temporary files."""
+
 import contextlib
 import copy
 import fcntl
 import io
 import json
 import logging
+import logging as hg_std_logging
 import os
-from pathlib import Path
+import os as hg_std_os
 import subprocess
 import sys
 import tempfile
-from types import SimpleNamespace
 import unittest
+from logging.handlers import RotatingFileHandler as hg_std_RotatingFileHandler
+from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
-import health_garmin as h
+from project_fixtures import REPO_ROOT
+
+from health_garmin_sync import cli as hg_cli
+from health_garmin_sync import domain as hg_domain
+from health_garmin_sync import file_io as hg_file_io
+from health_garmin_sync import garmin as hg_garmin
+from health_garmin_sync import launchagent as hg_launchagent
+from health_garmin_sync import runtime as hg_runtime
+from health_garmin_sync import sync as hg_sync
 
 
 class ConfigFixture(unittest.TestCase):
@@ -26,14 +38,19 @@ class ConfigFixture(unittest.TestCase):
         self.state.mkdir()
         self.config_path = self.root / "config.json"
         self.cfg = {
-            "is_cn": True, "enabled": False, "inbox": str(self.root),
-            "since": "2020-02-20", "allowed_sources": ["PICOOC"],
-            "weight_bare_unit": "kg", "fat_bare_unit": "percent",
-            "pair_window_seconds": 0, "settle_seconds": 120,
+            "is_cn": True,
+            "enabled": False,
+            "inbox": str(self.root),
+            "since": "2020-02-20",
+            "allowed_sources": ["PICOOC"],
+            "weight_bare_unit": "kg",
+            "fat_bare_unit": "percent",
+            "pair_window_seconds": 0,
+            "settle_seconds": 120,
             "max_records_per_run": 10,
         }
-        self.enterContext(patch.object(h, "CONFIG", self.config_path))
-        self.enterContext(patch.object(h, "STATE", self.state))
+        self.enterContext(patch.object(hg_runtime, "CONFIG", self.config_path))
+        self.enterContext(patch.object(hg_runtime, "STATE", self.state))
         self.save(self.cfg)
 
     def save(self, cfg):
@@ -45,14 +62,14 @@ class ConfigTests(ConfigFixture):
         for enabled in (True, False):
             cfg = dict(self.cfg, enabled=enabled, custom_note="retain")
             self.save(cfg)
-            self.assertEqual(h.config(), cfg)
+            self.assertEqual(hg_runtime.config(), cfg)
 
     def test_enabled_requires_json_boolean(self):
         for value in ("false", "true", 0, 1, None, [], {}):
             with self.subTest(value=value):
                 self.save(dict(self.cfg, enabled=value))
-                with self.assertRaisesRegex(h.SafeError, "enabled"):
-                    h.config()
+                with self.assertRaisesRegex(hg_domain.SafeError, "enabled"):
+                    hg_runtime.config()
 
     def test_required_consumed_fields_cannot_be_missing(self):
         for key in self.cfg:
@@ -60,8 +77,8 @@ class ConfigTests(ConfigFixture):
                 cfg = dict(self.cfg)
                 del cfg[key]
                 self.save(cfg)
-                with self.assertRaisesRegex(h.SafeError, key):
-                    h.config()
+                with self.assertRaisesRegex(hg_domain.SafeError, key):
+                    hg_runtime.config()
 
     def test_invalid_shapes_and_units_report_field(self):
         invalid = {
@@ -76,8 +93,8 @@ class ConfigTests(ConfigFixture):
             for value in values:
                 with self.subTest(key=key, value=value):
                     self.save(dict(self.cfg, **{key: value}))
-                    with self.assertRaisesRegex(h.SafeError, key):
-                        h.config()
+                    with self.assertRaisesRegex(hg_domain.SafeError, key):
+                        hg_runtime.config()
 
     def test_integer_settings_reject_coercion_and_invalid_ranges(self):
         invalid = {
@@ -89,41 +106,52 @@ class ConfigTests(ConfigFixture):
             for value in values:
                 with self.subTest(key=key, value=value):
                     self.save(dict(self.cfg, **{key: value}))
-                    with self.assertRaisesRegex(h.SafeError, key):
-                        h.config()
+                    with self.assertRaisesRegex(hg_domain.SafeError, key):
+                        hg_runtime.config()
 
     def test_valid_integer_boundaries(self):
-        self.save(dict(self.cfg, pair_window_seconds=120,
-                       settle_seconds=0, max_records_per_run=1))
-        self.assertEqual(h.config()["pair_window_seconds"], 120)
+        self.save(dict(self.cfg, pair_window_seconds=120, settle_seconds=0, max_records_per_run=1))
+        self.assertEqual(hg_runtime.config()["pair_window_seconds"], 120)
 
     def test_invalid_json_and_top_level_report_safe_error(self):
         for content in ('{"secret":"private-token",', "[]", "null", "true"):
             with self.subTest(content=content):
                 self.config_path.write_text(content, encoding="utf-8")
-                with self.assertRaises(h.SafeError) as raised:
-                    h.config()
+                with self.assertRaises(hg_domain.SafeError) as raised:
+                    hg_runtime.config()
                 self.assertIn("config.json", str(raised.exception))
                 self.assertNotIn("private-token", str(raised.exception))
 
     def test_rejected_settings_preserve_file_and_caller_config(self):
-        invalid = ({"source": "   "}, {"source": ""}, {"inbox": ""},
-                   {"inbox": "  "}, {"since": "2020-02-30"},
-                   {"pair_window": 121}, {"inbox": str(self.root / "missing")})
+        invalid = (
+            {"source": "   "},
+            {"source": ""},
+            {"inbox": ""},
+            {"inbox": "  "},
+            {"since": "2020-02-30"},
+            {"pair_window": 121},
+            {"inbox": str(self.root / "missing")},
+        )
         for changes in invalid:
             with self.subTest(changes=changes):
                 cfg = copy.deepcopy(self.cfg)
                 before = copy.deepcopy(cfg)
                 stored = self.config_path.read_bytes()
-                args = SimpleNamespace(fat_unit=None, weight_unit=None, pair_window=None,
-                                       since=None, inbox=None, source="ChangedSource")
+                args = SimpleNamespace(
+                    fat_unit=None,
+                    weight_unit=None,
+                    pair_window=None,
+                    since=None,
+                    inbox=None,
+                    source="ChangedSource",
+                )
                 for key, value in changes.items():
                     setattr(args, key, value)
-                with self.assertRaises(h.SafeError):
-                    h.update_settings(args, cfg)
+                with self.assertRaises(hg_domain.SafeError):
+                    hg_cli.update_settings(args, cfg)
                 self.assertEqual(cfg, before)
                 self.assertEqual(self.config_path.read_bytes(), stored)
-                self.assertEqual(h.config(), self.cfg)
+                self.assertEqual(hg_runtime.config(), self.cfg)
 
 
 class CliTests(ConfigFixture):
@@ -131,19 +159,27 @@ class CliTests(ConfigFixture):
         output, errors = io.StringIO(), io.StringIO()
         previous_umask = os.umask(0o077)
         try:
-            with patch.object(sys, "argv", ["health_garmin.py", command, *arguments]), \
-                    patch.object(h, "PrivateRotatingFileHandler", return_value=logging.NullHandler()), \
-                    patch.object(h.logging, "basicConfig"), \
-                    patch.object(h.LOG, "error"), \
-                    contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
-                result = h.main()
+            with (
+                patch.object(sys, "argv", ["health-garmin-sync", command, *arguments]),
+                patch.object(
+                    hg_file_io, "PrivateRotatingFileHandler", return_value=logging.NullHandler()
+                ),
+                patch.object(hg_std_logging, "basicConfig"),
+                patch.object(hg_runtime.LOG, "error"),
+                contextlib.redirect_stdout(output),
+                contextlib.redirect_stderr(errors),
+            ):
+                result = hg_cli.main()
         finally:
             os.umask(previous_umask)
         return result, output.getvalue(), errors.getvalue()
 
     def test_invalid_enabled_stops_run_before_api_or_processing(self):
         self.save(dict(self.cfg, enabled="false"))
-        with patch.object(h, "api_client") as api, patch.object(h, "run_sync") as sync:
+        with (
+            patch.object(hg_garmin, "api_client") as api,
+            patch.object(hg_sync, "run_sync") as sync,
+        ):
             result, _, errors = self.invoke("run")
         self.assertEqual(result, 2)
         self.assertIn("enabled", errors)
@@ -153,7 +189,7 @@ class CliTests(ConfigFixture):
     def test_busy_scheduled_run_skips_successfully(self):
         with (self.state / "run.lock").open("a") as holder:
             fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            with patch.object(h, "run_sync") as sync:
+            with patch.object(hg_sync, "run_sync") as sync:
                 result, output, errors = self.invoke("run")
         self.assertEqual(result, 0)
         self.assertIn("另一个进程", output)
@@ -175,7 +211,7 @@ class CliTests(ConfigFixture):
 
     def test_disable_when_idle_updates_only_temporary_config(self):
         self.save(dict(self.cfg, enabled=True))
-        with patch.object(h, "api_client") as api:
+        with patch.object(hg_garmin, "api_client") as api:
             result, output, errors = self.invoke("disable")
         self.assertEqual(result, 0)
         self.assertEqual(errors, "")
@@ -184,26 +220,28 @@ class CliTests(ConfigFixture):
         api.assert_not_called()
 
     def test_rejected_cli_settings_allow_valid_settings_and_disable(self):
-        for option, value, field in (("--source", "   ", "allowed_sources"),
-                                     ("--source", "", "allowed_sources"),
-                                     ("--inbox", "", "inbox")):
+        for option, value, field in (
+            ("--source", "   ", "allowed_sources"),
+            ("--source", "", "allowed_sources"),
+            ("--inbox", "", "inbox"),
+        ):
             with self.subTest(option=option, value=value):
                 self.save(self.cfg)
                 stored = self.config_path.read_bytes()
-                with patch.object(h, "api_client") as api:
+                with patch.object(hg_garmin, "api_client") as api:
                     result, _, errors = self.invoke("settings", option, value)
                     self.assertEqual(result, 2)
                     self.assertIn(field, errors)
                     self.assertEqual(self.config_path.read_bytes(), stored)
-                    self.assertEqual(h.config(), self.cfg)
+                    self.assertEqual(hg_runtime.config(), self.cfg)
                     result, _, errors = self.invoke("settings", "--source", "NewSource")
                     self.assertEqual(result, 0)
                     self.assertEqual(errors, "")
-                    self.assertEqual(h.config()["allowed_sources"], ["NewSource"])
+                    self.assertEqual(hg_runtime.config()["allowed_sources"], ["NewSource"])
                     result, _, errors = self.invoke("disable")
                     self.assertEqual(result, 0)
                     self.assertEqual(errors, "")
-                    self.assertIs(h.config()["enabled"], False)
+                    self.assertIs(hg_runtime.config()["enabled"], False)
                     api.assert_not_called()
 
 
@@ -227,170 +265,222 @@ class LoggingOwnershipTests(ConfigFixture):
         errors = io.StringIO()
         previous_umask = os.umask(0o077)
         try:
-            with patch.object(sys, "argv", ["health_garmin.py", command]), \
-                    contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(errors):
-                result = h.main()
+            with (
+                patch.object(sys, "argv", ["health-garmin-sync", command]),
+                contextlib.redirect_stdout(io.StringIO()),
+                contextlib.redirect_stderr(errors),
+            ):
+                result = hg_cli.main()
         finally:
             os.umask(previous_umask)
         return result, errors.getvalue()
 
     def test_busy_commands_skip_unopenable_log_without_initializing_logging(self):
-        (self.state / 'sync.log').mkdir()
+        (self.state / "sync.log").mkdir()
         before = self.config_path.read_bytes()
-        with (self.state / 'run.lock').open('a') as holder:
+        with (self.state / "run.lock").open("a") as holder:
             fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            with patch.object(h, 'PrivateRotatingFileHandler', wraps=h.PrivateRotatingFileHandler) as factory, \
-                    patch.object(h.logging, 'basicConfig') as configure, \
-                    patch.object(h.LOG, 'error') as error, patch.object(h, 'config') as config, \
-                    patch.object(h, 'run_with_attempt') as run, patch.object(h, 'manage_agent') as service:
-                for command, expected in (('run', 0), ('status', 2), ('install-agent', 2)):
+            with (
+                patch.object(
+                    hg_file_io,
+                    "PrivateRotatingFileHandler",
+                    wraps=hg_file_io.PrivateRotatingFileHandler,
+                ) as factory,
+                patch.object(hg_std_logging, "basicConfig") as configure,
+                patch.object(hg_runtime.LOG, "error") as error,
+                patch.object(hg_runtime, "config") as config,
+                patch.object(hg_sync, "run_with_attempt") as run,
+                patch.object(hg_launchagent, "manage_agent") as service,
+            ):
+                for command, expected in (("run", 0), ("status", 2), ("install-agent", 2)):
                     with self.subTest(command=command):
                         code, errors = self.invoke(command)
                         self.assertEqual(code, expected)
-                        self.assertEqual(errors, '' if command == 'run' else
-                            f'停止： 另一个进程正在处理，{command} 未执行；请等待当前进程结束后重试。\n')
+                        self.assertEqual(
+                            errors,
+                            ""
+                            if command == "run"
+                            else f"停止： 另一个进程正在处理，{command} 未执行；请等待当前进程结束后重试。\n",
+                        )
                 for boundary in (factory, configure, error, config, run, service):
                     boundary.assert_not_called()
         self.assertEqual(self.config_path.read_bytes(), before)
-        self.assertEqual({path.name for path in self.state.iterdir()}, {'sync.log', 'run.lock'})
+        self.assertEqual({path.name for path in self.state.iterdir()}, {"sync.log", "run.lock"})
 
     def test_busy_subprocess_does_not_rotate_active_owner_log(self):
-        log = self.state / 'sync.log'
-        prefix = 'retained owner evidence\n'
-        log.write_text(prefix + 'x' * (999_980 - len(prefix)))
+        log = self.state / "sync.log"
+        prefix = "retained owner evidence\n"
+        log.write_text(prefix + "x" * (999_980 - len(prefix)))
         original = log.read_bytes()
-        owner = h.RotatingFileHandler(log, maxBytes=1_000_000, backupCount=3, encoding='utf-8')
-        script = '''
+        owner = hg_std_RotatingFileHandler(log, maxBytes=1_000_000, backupCount=3, encoding="utf-8")
+        script = """
 import builtins, socket, sys
 from pathlib import Path
 sys.path.insert(0, sys.argv[3])
-import health_garmin as h
-h.STATE = Path(sys.argv[1])
+from health_garmin_sync import cli as hg_cli, domain as hg_domain, file_io as hg_file_io, garmin as hg_garmin, launchagent as hg_launchagent, runtime as hg_runtime, sync as hg_sync
+from logging.handlers import RotatingFileHandler as hg_std_RotatingFileHandler
+import getpass as hg_std_getpass
+import logging as hg_std_logging
+import os as hg_std_os
+hg_runtime.STATE = Path(sys.argv[1])
 def forbidden(*args, **kwargs):
     raise AssertionError("real config, API, home or service access forbidden")
-h.config = h.api_client = h.manage_agent = forbidden
+hg_runtime.config = hg_garmin.api_client = hg_launchagent.manage_agent = forbidden
 Path.home = classmethod(lambda cls: forbidden())
 socket.create_connection = socket.getaddrinfo = forbidden
 socket.socket.connect = socket.socket.connect_ex = forbidden
-builtins.input = h.getpass.getpass = forbidden
+builtins.input = hg_std_getpass.getpass = forbidden
 command = sys.argv[2]
-sys.argv = ['hg', command]
-raise SystemExit(h.main())
-'''
+sys.argv = ['health-garmin-sync', command]
+raise SystemExit(hg_cli.main())
+"""
         try:
             inode = os.fstat(owner.stream.fileno()).st_ino
-            with (self.state / 'run.lock').open('a') as holder:
+            with (self.state / "run.lock").open("a") as holder:
                 fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                for command in ('status', 'install-agent'):
+                for command in ("status", "install-agent"):
                     with self.subTest(command=command):
-                        child = subprocess.run([sys.executable, '-B', '-c', script, str(self.state),
-                                                command, str(Path(h.__file__).resolve().parent)],
-                                               cwd=self.root, env={'HOME': str(self.root)},
-                                               capture_output=True, text=True, timeout=5)
+                        child = subprocess.run(
+                            [
+                                sys.executable,
+                                "-B",
+                                "-c",
+                                script,
+                                str(self.state),
+                                command,
+                                str(REPO_ROOT),
+                            ],
+                            cwd=self.root,
+                            env={"HOME": str(self.root)},
+                            capture_output=True,
+                            text=True,
+                            timeout=5,
+                        )
                         self.assertEqual(child.returncode, 2)
-                        self.assertIn(command + ' 未执行', child.stderr)
+                        self.assertIn(command + " 未执行", child.stderr)
                         self.assertEqual(log.read_bytes(), original)
                         self.assertEqual(log.stat().st_ino, inode)
                         self.assertEqual(os.fstat(owner.stream.fileno()).st_ino, inode)
-                        self.assertEqual(list(self.state.glob('sync.log.*')), [])
-                owner.emit(logging.LogRecord('owner', logging.INFO, '', 0, 'owner resumes', (), None))
-                self.assertEqual(log.read_bytes(), original + b'owner resumes\n')
+                        self.assertEqual(list(self.state.glob("sync.log.*")), [])
+                owner.emit(
+                    logging.LogRecord("owner", logging.INFO, "", 0, "owner resumes", (), None)
+                )
+                self.assertEqual(log.read_bytes(), original + b"owner resumes\n")
                 self.assertEqual(log.stat().st_ino, inode)
         finally:
             owner.close()
 
     def test_log_creation_error_reporting_and_close_remain_inside_run_lock(self):
-        factory, log_error = h.PrivateRotatingFileHandler, h.LOG.error
-        for primary, expected in ((h.SafeError('controlled'), 2),
-                                  (OSError('private-secret'), 2), (KeyboardInterrupt(), 130)):
+        factory, log_error = hg_file_io.PrivateRotatingFileHandler, hg_runtime.LOG.error
+        for primary, expected in (
+            (hg_domain.SafeError("controlled"), 2),
+            (OSError("private-secret"), 2),
+            (KeyboardInterrupt(), 130),
+        ):
             with self.subTest(expected=expected, primary=type(primary).__name__):
                 observed = []
 
                 def locked():
-                    with (self.state / 'run.lock').open('r') as probe:
+                    with (self.state / "run.lock").open("r") as probe:
                         with self.assertRaises(BlockingIOError):
                             fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
 
                 def create(*args, **kwargs):
                     locked()
-                    observed.append('create')
+                    observed.append("create")
                     owned = factory(*args, **kwargs)
                     close = owned.close
 
                     def close_locked():
                         locked()
-                        observed.append('close')
+                        observed.append("close")
                         close()
 
-                    self.enterContext(patch.object(owned, 'close', side_effect=close_locked))
+                    self.enterContext(patch.object(owned, "close", side_effect=close_locked))
                     return owned
 
                 def error(*args, **kwargs):
                     locked()
-                    observed.append('error')
+                    observed.append("error")
                     log_error(*args, **kwargs)
 
-                with patch.object(h, 'PrivateRotatingFileHandler', side_effect=create), \
-                        patch.object(h.LOG, 'error', side_effect=error), \
-                        patch.object(h, 'run_with_attempt', side_effect=primary):
+                with (
+                    patch.object(hg_file_io, "PrivateRotatingFileHandler", side_effect=create),
+                    patch.object(hg_runtime.LOG, "error", side_effect=error),
+                    patch.object(hg_sync, "run_with_attempt", side_effect=primary),
+                ):
                     code, errors = self.invoke()
                 self.assertEqual(code, expected)
-                self.assertNotIn('private-secret', errors)
-                self.assertEqual(observed, ['create', 'close'] if expected == 130 else ['create', 'error', 'close'])
+                self.assertNotIn("private-secret", errors)
+                self.assertEqual(
+                    observed,
+                    ["create", "close"] if expected == 130 else ["create", "error", "close"],
+                )
                 self.assertEqual(self.root_logger.handlers, [])
-                with (self.state / 'run.lock').open('r') as probe:
+                with (self.state / "run.lock").open("r") as probe:
                     fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
 
     def test_lock_open_failure_is_safe_and_does_not_create_log_handler(self):
-        (self.state / 'run.lock').mkdir()
-        with patch.object(h, 'PrivateRotatingFileHandler') as factory, \
-                patch.object(h.LOG, 'error') as error, patch.object(h, 'run_with_attempt') as run:
+        (self.state / "run.lock").mkdir()
+        with (
+            patch.object(hg_file_io, "PrivateRotatingFileHandler") as factory,
+            patch.object(hg_runtime.LOG, "error") as error,
+            patch.object(hg_sync, "run_with_attempt") as run,
+        ):
             code, errors = self.invoke()
         self.assertEqual(code, 2)
-        self.assertIn('IsADirectoryError', errors)
-        self.assertNotIn('Traceback', errors)
+        self.assertIn("IsADirectoryError", errors)
+        self.assertNotIn("Traceback", errors)
         factory.assert_not_called()
         error.assert_not_called()
         run.assert_not_called()
 
     def test_invalid_run_lock_paths_fail_quickly_before_any_command_work(self):
-        script = '''
+        script = """
 import builtins, socket, sys
 from pathlib import Path
 sys.path.insert(0, sys.argv[2])
-import health_garmin as h
-h.BASE = Path(sys.argv[1]).parent
-h.STATE = Path(sys.argv[1])
-h.CONFIG = h.BASE / 'config.json'
+from health_garmin_sync import cli as hg_cli, domain as hg_domain, file_io as hg_file_io, garmin as hg_garmin, launchagent as hg_launchagent, runtime as hg_runtime, sync as hg_sync
+from logging.handlers import RotatingFileHandler as hg_std_RotatingFileHandler
+import getpass as hg_std_getpass
+import logging as hg_std_logging
+import os as hg_std_os
+hg_runtime.BASE = Path(sys.argv[1]).parent
+hg_runtime.STATE = Path(sys.argv[1])
+hg_runtime.CONFIG = hg_runtime.BASE / 'config.json'
 def forbidden(*args, **kwargs):
     raise AssertionError('config, API, home, service or logging accessed before lock validation')
-h.config = h.api_client = h.manage_agent = h.PrivateRotatingFileHandler = forbidden
-h.run_with_attempt = forbidden
+hg_runtime.config = hg_garmin.api_client = hg_launchagent.manage_agent = hg_file_io.PrivateRotatingFileHandler = forbidden
+hg_sync.run_with_attempt = forbidden
 Path.home = classmethod(lambda cls: forbidden())
 socket.create_connection = socket.getaddrinfo = forbidden
 socket.socket.connect = socket.socket.connect_ex = forbidden
-builtins.input = h.getpass.getpass = forbidden
-sys.argv = ['hg', 'run']
-raise SystemExit(h.main())
-'''
-        marker = self.state / 'last_attempt.json'
-        marker.write_bytes(b'Preserved old run evidence')
-        summary = self.state / 'last_run.json'
-        summary.write_bytes(b'Preserved old summary')
+builtins.input = hg_std_getpass.getpass = forbidden
+sys.argv = ['health-garmin-sync', 'run']
+raise SystemExit(hg_cli.main())
+"""
+        marker = self.state / "last_attempt.json"
+        marker.write_bytes(b"Preserved old run evidence")
+        summary = self.state / "last_run.json"
+        summary.write_bytes(b"Preserved old summary")
         before = marker.read_bytes(), summary.read_bytes(), self.config_path.read_bytes()
-        target = self.root / 'untouched-target'
-        target.write_bytes(b'Preserved external target')
-        lock = self.state / 'run.lock'
-        for kind in ('fifo', 'symlink'):
+        target = self.root / "untouched-target"
+        target.write_bytes(b"Preserved external target")
+        lock = self.state / "run.lock"
+        for kind in ("fifo", "symlink"):
             with self.subTest(kind=kind):
-                if kind == 'fifo':
+                if kind == "fifo":
                     os.mkfifo(lock, 0o600)
                 else:
                     lock.symlink_to(target)
-                child = subprocess.Popen([sys.executable, '-B', '-c', script, str(self.state),
-                                          str(Path(h.__file__).resolve().parent)], cwd=self.root,
-                                         env={'HOME': str(self.root)}, stdout=subprocess.PIPE,
-                                         stderr=subprocess.PIPE, text=True)
+                child = subprocess.Popen(
+                    [sys.executable, "-B", "-c", script, str(self.state), str(REPO_ROOT)],
+                    cwd=self.root,
+                    env={"HOME": str(self.root)},
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
                 try:
                     output, errors = child.communicate(timeout=2)
                 finally:
@@ -401,15 +491,18 @@ raise SystemExit(h.main())
                     child.stderr.close()
                     lock.unlink()
                 self.assertEqual(child.returncode, 2)
-                self.assertEqual(output, '')
-                self.assertNotIn('AssertionError', errors)
-                self.assertNotIn('Traceback', errors)
-                self.assertEqual(target.read_bytes(), b'Preserved external target')
-                self.assertFalse((self.state / 'sync.log').exists())
-                self.assertEqual((marker.read_bytes(), summary.read_bytes(), self.config_path.read_bytes()), before)
+                self.assertEqual(output, "")
+                self.assertNotIn("AssertionError", errors)
+                self.assertNotIn("Traceback", errors)
+                self.assertEqual(target.read_bytes(), b"Preserved external target")
+                self.assertFalse((self.state / "sync.log").exists())
+                self.assertEqual(
+                    (marker.read_bytes(), summary.read_bytes(), self.config_path.read_bytes()),
+                    before,
+                )
 
     def test_fifo_with_reader_is_rejected_and_owned_descriptor_is_closed(self):
-        lock = self.state / 'run.lock'
+        lock = self.state / "run.lock"
         os.mkfifo(lock, 0o600)
         native_open, native_close = os.open, os.close
         reader = native_open(lock, os.O_RDONLY | os.O_NONBLOCK)
@@ -421,13 +514,18 @@ raise SystemExit(h.main())
             return fd
 
         try:
-            with patch.object(h.os, 'open', side_effect=open_fd), patch.object(h.os, 'fdopen') as wrap, \
-                    patch.object(h, 'PrivateRotatingFileHandler') as logging_factory, patch.object(h, 'config') as config, \
-                    patch.object(h, 'api_client') as api, patch.object(h, 'run_with_attempt') as run:
+            with (
+                patch.object(hg_std_os, "open", side_effect=open_fd),
+                patch.object(hg_std_os, "fdopen") as wrap,
+                patch.object(hg_file_io, "PrivateRotatingFileHandler") as logging_factory,
+                patch.object(hg_runtime, "config") as config,
+                patch.object(hg_garmin, "api_client") as api,
+                patch.object(hg_sync, "run_with_attempt") as run,
+            ):
                 code, errors = self.invoke()
             self.assertEqual(code, 2)
-            self.assertIn('普通文件', errors)
-            self.assertNotIn('Traceback', errors)
+            self.assertIn("普通文件", errors)
+            self.assertNotIn("Traceback", errors)
             for boundary in (wrap, logging_factory, config, api, run):
                 boundary.assert_not_called()
             self.assertEqual(len(opened), 1)
@@ -439,8 +537,11 @@ raise SystemExit(h.main())
 
     def test_fdopen_failure_closes_descriptor_and_keeps_primary_exception(self):
         native_open, native_close = os.open, os.close
-        for primary, close_failure in ((OSError('private-secret'), False),
-                                       (OSError('private-secret'), True), (KeyboardInterrupt(), True)):
+        for primary, close_failure in (
+            (OSError("private-secret"), False),
+            (OSError("private-secret"), True),
+            (KeyboardInterrupt(), True),
+        ):
             with self.subTest(primary=type(primary).__name__, close_failure=close_failure):
                 opened = []
 
@@ -452,23 +553,27 @@ raise SystemExit(h.main())
                 def close(fd):
                     native_close(fd)
                     if close_failure:
-                        raise OSError('private-secret')
+                        raise OSError("private-secret")
 
                 errors = io.StringIO()
-                with patch.object(h.os, 'open', side_effect=open_fd), patch.object(h.os, 'fdopen', side_effect=primary), \
-                        patch.object(h.os, 'close', side_effect=close) as cleanup, contextlib.redirect_stderr(errors), \
-                        self.assertRaises(type(primary)) as raised:
-                    h.open_run_lock(self.state / 'run.lock')
+                with (
+                    patch.object(hg_std_os, "open", side_effect=open_fd),
+                    patch.object(hg_std_os, "fdopen", side_effect=primary),
+                    patch.object(hg_std_os, "close", side_effect=close) as cleanup,
+                    contextlib.redirect_stderr(errors),
+                    self.assertRaises(type(primary)) as raised,
+                ):
+                    hg_file_io.open_run_lock(self.state / "run.lock")
                 self.assertIs(raised.exception, primary)
                 self.assertEqual(len(opened), 1)
                 cleanup.assert_called_once_with(opened[0])
                 with self.assertRaises(OSError):
                     os.fstat(opened[0])
-                self.assertNotIn('private-secret', errors.getvalue())
-                self.assertNotIn('Traceback', errors.getvalue())
+                self.assertNotIn("private-secret", errors.getvalue())
+                self.assertNotIn("Traceback", errors.getvalue())
 
     def test_lock_close_failure_preserves_primary_error_and_interruption_codes(self):
-        original_open = h.open_run_lock
+        original_open = hg_file_io.open_run_lock
 
         class CloseFailure:
             def __init__(self, stream):
@@ -479,35 +584,43 @@ raise SystemExit(h.main())
 
             def __exit__(self, *args):
                 self.stream.close()
-                raise OSError('private-secret')
+                raise OSError("private-secret")
 
         def open_with_close_failure(path):
             return CloseFailure(original_open(path))
 
-        for primary, expected in ((None, 2), (h.SafeError('controlled'), 2), (KeyboardInterrupt(), 130)):
+        for primary, expected in (
+            (None, 2),
+            (hg_domain.SafeError("controlled"), 2),
+            (KeyboardInterrupt(), 130),
+        ):
             with self.subTest(expected=expected, primary=type(primary).__name__):
-                with patch.object(h, 'open_run_lock', side_effect=open_with_close_failure), \
-                        patch.object(h, 'run_with_attempt', side_effect=primary):
+                with (
+                    patch.object(hg_file_io, "open_run_lock", side_effect=open_with_close_failure),
+                    patch.object(hg_sync, "run_with_attempt", side_effect=primary),
+                ):
                     code, errors = self.invoke()
                 self.assertEqual(code, expected)
-                self.assertIn('OSError', errors)
-                self.assertNotIn('private-secret', errors)
-                self.assertNotIn('Traceback', errors)
+                self.assertIn("OSError", errors)
+                self.assertNotIn("private-secret", errors)
+                self.assertNotIn("Traceback", errors)
                 self.assertEqual(self.root_logger.handlers, [])
-                with (self.state / 'run.lock').open('r') as probe:
+                with (self.state / "run.lock").open("r") as probe:
                     fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
 
     def test_repeated_commands_close_real_owned_handlers(self):
         handlers = []
-        factory = h.PrivateRotatingFileHandler
+        factory = hg_file_io.PrivateRotatingFileHandler
 
         def create(*args, **kwargs):
             handler = factory(*args, **kwargs)
             handlers.append(handler)
             return handler
 
-        with patch.object(h, "PrivateRotatingFileHandler", side_effect=create), \
-                patch.object(h, "run_with_attempt"):
+        with (
+            patch.object(hg_file_io, "PrivateRotatingFileHandler", side_effect=create),
+            patch.object(hg_sync, "run_with_attempt"),
+        ):
             for _ in range(3):
                 self.assertEqual(self.invoke(), (0, ""))
                 self.assertEqual(self.root_logger.handlers, [])
@@ -518,10 +631,12 @@ raise SystemExit(h.main())
         existing = logging.FileHandler(self.root / "caller.log")
         self.addCleanup(existing.close)
         self.root_logger.addHandler(existing)
-        factory = h.PrivateRotatingFileHandler
+        factory = hg_file_io.PrivateRotatingFileHandler
         owned = factory(self.state / "owned.log")
-        with patch.object(h, "PrivateRotatingFileHandler", return_value=owned), \
-                patch.object(h, "run_with_attempt"):
+        with (
+            patch.object(hg_file_io, "PrivateRotatingFileHandler", return_value=owned),
+            patch.object(hg_sync, "run_with_attempt"),
+        ):
             self.assertEqual(self.invoke(), (0, ""))
         self.assertEqual(self.root_logger.handlers, [existing])
         self.assertFalse(existing.stream.closed)
@@ -530,10 +645,13 @@ raise SystemExit(h.main())
         self.assertIn("still open", (self.root / "caller.log").read_text())
 
     def test_logging_initialization_failure_is_safe_and_closes_owned_handler(self):
-        owned = h.RotatingFileHandler(self.state / "owned.log")
-        with patch.object(h, "PrivateRotatingFileHandler", return_value=owned), \
-                patch.object(h.logging, "basicConfig", side_effect=OSError("private-secret")), \
-                patch.object(h.LOG, "error"), patch.object(h, "run_with_attempt") as run:
+        owned = hg_std_RotatingFileHandler(self.state / "owned.log")
+        with (
+            patch.object(hg_file_io, "PrivateRotatingFileHandler", return_value=owned),
+            patch.object(hg_std_logging, "basicConfig", side_effect=OSError("private-secret")),
+            patch.object(hg_runtime.LOG, "error"),
+            patch.object(hg_sync, "run_with_attempt") as run,
+        ):
             result, errors = self.invoke()
         self.assertEqual(result, 2)
         self.assertIn("OSError", errors)
@@ -543,18 +661,20 @@ raise SystemExit(h.main())
         self.assertEqual(self.root_logger.handlers, [])
 
     def test_close_failure_preserves_error_and_interruption_results(self):
-        for exc, expected in ((h.SafeError("controlled"), 2), (KeyboardInterrupt(), 130)):
+        for exc, expected in ((hg_domain.SafeError("controlled"), 2), (KeyboardInterrupt(), 130)):
             with self.subTest(expected=expected):
-                owned = h.RotatingFileHandler(self.state / "owned.log")
+                owned = hg_std_RotatingFileHandler(self.state / "owned.log")
                 close = owned.close
 
                 def failing_close():
                     close()
                     raise OSError("private-secret")
 
-                with patch.object(h, "PrivateRotatingFileHandler", return_value=owned), \
-                        patch.object(owned, "close", side_effect=failing_close), \
-                        patch.object(h, "run_with_attempt", side_effect=exc):
+                with (
+                    patch.object(hg_file_io, "PrivateRotatingFileHandler", return_value=owned),
+                    patch.object(owned, "close", side_effect=failing_close),
+                    patch.object(hg_sync, "run_with_attempt", side_effect=exc),
+                ):
                     result, errors = self.invoke()
                 self.assertEqual(result, expected)
                 self.assertIn("同步日志未保存： OSError", errors)
