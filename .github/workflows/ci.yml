@@ -38,9 +38,11 @@ jobs:
         run: make test PYTHON=python
 
   apple-health:
-    name: Apple Health bridge
-    runs-on: macos-latest
+    name: Apple Health bridge / Xcode 16.4
+    runs-on: macos-15
     timeout-minutes: 20
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -61,3 +63,14 @@ jobs:
           name: health-bridge-simulator
           path: .build/ios/simulator-start.png
           retention-days: 7
+
+  apple-health-sdk:
+    name: Apple Health / latest SDK
+    runs-on: macos-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Build with the current Apple SDK
+        run: make build-ios

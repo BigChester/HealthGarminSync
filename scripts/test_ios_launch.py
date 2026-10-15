@@ -28,17 +28,25 @@ def simctl(*arguments: str, timeout: int = 60) -> str:
         raise
 
 
+def runtime_version(identifier: str) -> tuple[int, ...]:
+    return (tuple(int(part) for part in identifier.split(".iOS-")[1].split("-")) + (0, 0, 0))[:3]
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--app", type=Path, required=True)
     parser.add_argument("--screenshot", type=Path, required=True)
     args = parser.parse_args()
     app = args.app.resolve(strict=True)
+    sdk = subprocess.check_output(
+        ["xcrun", "--sdk", "iphonesimulator", "--show-sdk-version"], text=True, timeout=30
+    ).strip()
+    sdk_version = (tuple(int(part) for part in sdk.split(".")) + (0, 0, 0))[:3]
     devices = json.loads(simctl("list", "devices", "available", "--json"))["devices"]
     candidates = [
         (runtime, device)
         for runtime, entries in devices.items()
-        if ".iOS-" in runtime
+        if ".iOS-" in runtime and (17, 0, 0) <= runtime_version(runtime) <= sdk_version
         for device in entries
         if device.get("isAvailable", True)
         and device["name"].startswith("iPhone")
@@ -46,7 +54,7 @@ def main() -> None:
     ]
     if not candidates:
         raise RuntimeError("Install an iOS Simulator runtime before the launch check")
-    runtime, device = sorted(candidates, key=lambda item: item[0], reverse=True)[0]
+    runtime, device = max(candidates, key=lambda item: runtime_version(item[0]))
     identifier = simctl(
         "create", "HealthGarminSync-CI", device["deviceTypeIdentifier"], runtime
     ).strip()
@@ -71,8 +79,16 @@ def main() -> None:
         assert args.screenshot.stat().st_size > 1000
         print("iOS Simulator app launch remained active; first-screen screenshot saved.")
     finally:
-        subprocess.run(["xcrun", "simctl", "shutdown", identifier], capture_output=True, timeout=30)
-        subprocess.run(["xcrun", "simctl", "delete", identifier], capture_output=True, timeout=30)
+        for action in ("shutdown", "delete"):
+            try:
+                subprocess.run(
+                    ["xcrun", "simctl", action, identifier],
+                    capture_output=True,
+                    timeout=30,
+                    check=True,
+                )
+            except (subprocess.TimeoutExpired, subprocess.CalledProcessError) as error:
+                print(f"Simulator {action} cleanup: {type(error).__name__}", flush=True)
 
 
 if __name__ == "__main__":
