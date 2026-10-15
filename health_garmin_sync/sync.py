@@ -75,12 +75,7 @@ def run_with_attempt(*, check_logging=None) -> None:
         cfg = hg_runtime.config()
         attempt["stage"] = "sync"
         hg_file_io.write_json(hg_runtime.STATE / "last_attempt.json", attempt)
-        if cfg["enabled"] or not cfg.get("health_export_enabled", False):
-            run_sync(cfg)
-        if cfg.get("health_export_enabled", False):
-            from . import health_bridge
-
-            health_bridge.run_configured(cfg)
+        run_sync(cfg)
         if check_logging is not None:
             check_logging()
     except KeyboardInterrupt as exc:
@@ -92,9 +87,7 @@ def run_with_attempt(*, check_logging=None) -> None:
         finish_run_attempt(attempt, preserve_error=True)
         raise
     else:
-        attempt["outcome"] = (
-            "completed" if cfg["enabled"] or cfg.get("health_export_enabled", False) else "preview"
-        )
+        attempt["outcome"] = "completed" if cfg["enabled"] else "preview"
         finish_run_attempt(attempt)
 
 

@@ -26,15 +26,3 @@
 
 - [Homebrew](https://brew.sh/)
 - [Homebrew Python 3.12](https://formulae.brew.sh/formula/python@3.12)
-
-## Garmin → Apple 健康
-
-查阅日期：2026-10-15。
-
-- [Garmin 官方 Apple 健康共享说明](https://support.garmin.com/en-HK/?faq=lK5FPB9iPF5PXFkIpFlFPA)
-- [Garmin 论坛：Index BPM 用户实测与血压授权](https://forums.garmin.com/sports-fitness/healthandwellness/f/index-bpm/309460/does-the-index-bpm-sync-blood-pressure-to-apple-health)
-- [Index BPM 指标与单位](https://www8.garmin.com/manuals/webhelp/GUID-EA605CDE-EED7-4FD7-A41F-7907A02E4062/EN-US/GUID-040EDA2B-12E9-41EC-8874-51E8B4C16AE1.html)
-- [HealthKit 血压关联样本](https://developer.apple.com/documentation/healthkit/hkcorrelationtypeidentifier/bloodpressure)
-- [HealthKit 同步标识](https://developer.apple.com/documentation/healthkit/hkmetadatakeysyncidentifier)
-
-中国区只读查询已确认血压明细含 `version`、`systolic`、`diastolic`、`pulse`、`sourceType` 和 GMT / Local 时间。SDK 读取血压使用独立接口并传 `includeAll=True`；单次脉搏可为空。官方设备范围与 SDK 写入校验区间不同，读取解析不应沿用写入限制。

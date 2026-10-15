@@ -4,13 +4,6 @@
 
 ## [Unreleased]
 
-## [0.2.0] - 2026-10-15
-
-### Added
-
-- Garmin 血压与测量脉搏到 Apple 健康的历史回填、独立定时导出与 iPhone 导入端。
-- 本地响应归档、有界云端批次、回执确认与版本恢复。
-
 ## [0.1.0] - 2026-10-15
 
 ### Added
@@ -22,5 +15,4 @@
 - 模块化 Python 实现、Ruff / mdformat 格式检查、离线 CI 与贡献说明。
 
 [0.1.0]: https://github.com/BigChester/HealthGarminSync/releases/tag/v0.1.0
-[0.2.0]: https://github.com/BigChester/HealthGarminSync/compare/v0.1.0...v0.2.0
-[unreleased]: https://github.com/BigChester/HealthGarminSync/compare/v0.2.0...develop
+[unreleased]: https://github.com/BigChester/HealthGarminSync/compare/v0.1.0...develop

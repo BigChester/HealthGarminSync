@@ -113,7 +113,7 @@ else:
                 timeout=5,
             )
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(result.stdout, "health-garmin-sync 0.2.0\n")
+            self.assertEqual(result.stdout, "health-garmin-sync 0.1.0\n")
             self.assertEqual(set(project.rglob("*")), before)
 
     def test_canonical_help_entry_works_in_an_isolated_project(self):

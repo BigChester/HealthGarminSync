@@ -12,8 +12,3 @@ __pycache__/
 .coverage
 htmlcov/
 .ruff_cache/
-.build/
-.swiftpm/
-DerivedData/
-xcuserdata/
-*.xcuserstate

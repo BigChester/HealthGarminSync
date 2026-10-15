@@ -22,17 +22,6 @@ make test
 
 本地钩子调用 `make check`。CI 在 Python 3.12 与较新稳定版执行检查和离线测试；以工作流实际结果为准。
 
-iPhone 导入端使用 Swift 6 / Xcode 16+；Swift 源码格式由内置 `swift format` 统一：
-
-```bash
-make format-bridge
-make check-bridge
-make test-bridge
-make build-ios
-```
-
-`test-bridge` 运行 Swift Testing 和 Python → Swift → 回执集成，健康存储均为模拟。`build-ios` 使用 Apple iOS Simulator SDK 构建 App；真实设备运行时在 Xcode 选择签名 Team。CI 对 `feat/*` 分支也执行这些检查，在 Xcode 16.4 对应的模拟器中验证启动，并独立验证最新 Apple SDK 构建。
-
 直接复核：
 
 ```bash
