@@ -11,9 +11,21 @@ from pathlib import Path
 
 
 def simctl(*arguments: str, timeout: int = 60) -> str:
-    return subprocess.run(
-        ["xcrun", "simctl", *arguments], check=True, capture_output=True, text=True, timeout=timeout
-    ).stdout
+    try:
+        return subprocess.run(
+            ["xcrun", "simctl", *arguments],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        ).stdout
+    except (subprocess.TimeoutExpired, subprocess.CalledProcessError) as error:
+        for output in (error.stdout, error.stderr):
+            if output:
+                if isinstance(output, bytes):
+                    output = output.decode(errors="replace")
+                print(output[-10000:], flush=True)
+        raise
 
 
 def main() -> None:
@@ -38,9 +50,10 @@ def main() -> None:
     identifier = simctl(
         "create", "HealthGarminSync-CI", device["deviceTypeIdentifier"], runtime
     ).strip()
+    print(f"Booting {device['name']} / {runtime} / {identifier}", flush=True)
     try:
         simctl("boot", identifier)
-        simctl("bootstatus", identifier, "-b", timeout=180)
+        print(simctl("bootstatus", identifier, "-b", timeout=420), flush=True)
         simctl("install", identifier, str(app))
         bundle = "org.healthgarminsync.bridge"
         result = simctl("launch", "--terminate-running-process", identifier, bundle)

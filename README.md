@@ -4,7 +4,7 @@ iPhone 快捷指令把 Apple 健康中的 PICOOC 测量导出到 iCloud Drive，
 
 可选的反向链路读取 Garmin 血压与测量脉搏，经 iCloud 批次交给 iPhone App 保存到 Apple 健康。血压成对保存，脉搏映射为测量时的心率；原始 API 响应永久保存在 Mac 本地数据库。原生 Connect 授权检查、App 安装、历史回填与定时导出见 [血压同步](docs/OPERATIONS.md#garmin-%E8%A1%80%E5%8E%8B%E4%B8%8E-apple-%E5%81%A5%E5%BA%B7)。
 
-当前版本为 **0.1.0**；运行 `./health-garmin-sync --version` 查看版本。
+当前版本为 **0.2.0**；运行 `./health-garmin-sync --version` 查看版本。
 
 ## 安装与手机准备
 
